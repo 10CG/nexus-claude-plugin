@@ -1,0 +1,77 @@
+# GitHub mirror — TASK-024, US-037 Wave 3.
+#
+# One-way force-push of this Forgejo repo's `main` (+ tags) to the GitHub
+# mirror `simonfishgit/nexus-claude-plugin`. Bus-factor mitigation
+# (proposal §A2-D-3): Forgejo is primary; GitHub mirror exists so external
+# Anthropic marketplace reviewers / contributors can reach the plugin source
+# even if the 10CG Forgejo instance is unreachable.
+#
+# Direction is strictly one-way: never mirror GitHub → Forgejo. The mirror
+# is a read-only public window.
+#
+# Trigger:
+#   - on push to main → fast-path mirror
+#   - hourly cron → safety net catches missed pushes
+#     (e.g. workflow-disabled window, Forgejo Actions runner downtime)
+#
+# Secret: `GH_PAT` (configured on this Forgejo repo, NOT `GITHUB_PAT` — the
+# `GITHUB_*` prefix is reserved by Forgejo/Gitea Actions for system tokens
+# and cannot be used for user secrets).
+
+name: mirror-to-github
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  schedule:
+    # Hourly catch-up in case a push event missed the runner.
+    # */60 minutes; UTC.
+    - cron: '17 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-bookworm  # has git pre-installed
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # We need tags too for the v* trigger to push tag refs.
+          fetch-tags: true
+
+      - name: Verify GH_PAT is set
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT secret is not configured on this repo. Set it at:"
+            echo "::error::  https://forgejo.10cg.pub/10CG/nexus-claude-plugin/settings/actions/secrets"
+            echo "::error::Use name 'GH_PAT' (not GITHUB_PAT — reserved prefix)."
+            exit 1
+          fi
+          echo "GH_PAT present (length=${#GH_PAT})"
+
+      - name: Push to GitHub mirror
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          # Identity for any local merge-commit creation (none expected for force-push).
+          git config user.email "ci-mirror@10cg.internal"
+          git config user.name "10CG Forgejo Mirror Bot"
+
+          # x-access-token:<PAT>@github.com pattern — GitHub-supported HTTPS
+          # auth that doesn't require git-credential helper.
+          git remote add github \
+            "https://x-access-token:${GH_PAT}@github.com/simonfishgit/nexus-claude-plugin.git"
+
+          # Force-push main branch (mirror is downstream-only).
+          git push github main --force
+
+          # Force-push all tags (semver releases).
+          git push github --tags --force
+```
