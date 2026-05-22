@@ -56,7 +56,7 @@ Add to your `.mcp.json` (or equivalent):
 ## Distribution
 
 - **Primary**: [Forgejo (`10CG/nexus-claude-plugin`)](https://forgejo.10cg.pub/10CG/nexus-claude-plugin)
-- **Mirror**: [GitHub (`simonfishgit/nexus-claude-plugin`)](https://github.com/simonfishgit/nexus-claude-plugin) — auto-synced via Forgejo Actions (TASK-024, Wave 3); bus-factor mitigation (A2-D-3)
+- **Mirror**: [GitHub (`10CG/nexus-claude-plugin`)](https://github.com/10CG/nexus-claude-plugin) — auto-synced via Forgejo Actions (TASK-024, Wave 3); bus-factor mitigation (A2-D-3)
 
 ## License
 

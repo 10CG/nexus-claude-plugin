@@ -1,7 +1,7 @@
 # GitHub mirror — TASK-024, US-037 Wave 3.
 #
 # One-way force-push of this Forgejo repo's `main` (+ tags) to the GitHub
-# mirror `simonfishgit/nexus-claude-plugin`. Bus-factor mitigation
+# mirror `10CG/nexus-claude-plugin`. Bus-factor mitigation
 # (proposal §A2-D-3): Forgejo is primary; GitHub mirror exists so external
 # Anthropic marketplace reviewers / contributors can reach the plugin source
 # even if the 10CG Forgejo instance is unreachable.
@@ -67,7 +67,7 @@ jobs:
           # x-access-token:<PAT>@github.com pattern — GitHub-supported HTTPS
           # auth that doesn't require git-credential helper.
           git remote add github \
-            "https://x-access-token:${GH_PAT}@github.com/simonfishgit/nexus-claude-plugin.git"
+            "https://x-access-token:${GH_PAT}@github.com/10CG/nexus-claude-plugin.git"
 
           # Force-push main branch (mirror is downstream-only).
           git push github main --force
