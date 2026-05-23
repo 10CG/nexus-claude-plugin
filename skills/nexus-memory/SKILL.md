@@ -37,7 +37,8 @@ When two paths look applicable:
 1. **`CLAUDE.md` > nexus** for project-static instructions (anything that's true for every user of the same repo).
 2. **Built-in within-session tools > nexus** when the answer is in the active conversation or the working tree.
 3. **claude-mem (local) > nexus** *if and only if* all three hold: machine-local use only AND no Console / dashboard visibility needed AND no cross-session ranking of results needed.
-4. **Otherwise: nexus.** Cross-session + multi-device + ranked + auditable → that's what Nexus is for.
+4. **Anthropic's built-in `Save memory` / auto-memory** is for **meta-collaboration** with Claude itself — how Claude should work for this user (preferred coding style, tools they like, communication habits, past collaboration feedback, project context that helps Claude help them). **nexus** is for the user's own **domain facts, knowledge, and decisions** they want to recall across sessions (e.g., "we use Postgres 15", "the auth bug is fixed by patching X", "remember my customer's preferences"). The two MUST NOT overlap: if the user is teaching Claude how to behave → built-in memory; if the user is asking Claude to remember a fact about *their* world → `nexus.memory_create`. When in doubt, prefer nexus for cross-session domain facts.
+5. **Otherwise: nexus.** Cross-session + multi-device + ranked + auditable → that's what Nexus is for.
 
 ## Cross-tenant handling
 
