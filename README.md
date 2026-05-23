@@ -89,18 +89,20 @@ If you're installing for the first time:
 
 ```bash
 curl -sI -H "Authorization: Bearer $NEXUS_API_TOKEN" \
-     "$NEXUS_API_URL/healthz" | head -1
+     "$NEXUS_API_URL/health" | head -1
 ```
 
-Expected: `HTTP/2 200`. If you get `401` → token wrong. If you get `404` → URL wrong. If you get connect error → network/firewall.
+Expected: `HTTP/2 200`. If you get `401` → token wrong. If you get `404` → URL or path wrong (the Nexusm health endpoint is `/health`, not `/healthz`). If you get connect error → network/firewall.
 
 ### 2. Verify npm can fetch `@nexusm/mcp-server`
 
 ```bash
-npx -y @nexusm/mcp-server@0.1.0 --version
+npm view @nexusm/mcp-server@0.1.0 version
 ```
 
-Expected: prints the version (e.g., `nexusm-mcp-server 0.1.0`). If you get an npm 404 → the package isn't published yet (currently expected; see [Status](#status)). If you get auth errors → npm registry is misconfigured.
+Expected: prints `0.1.0`. If you get an npm 404 → the package isn't published yet (currently expected; see [Status](#status)). If you get auth errors → npm registry is misconfigured.
+
+> Don't use `npx -y @nexusm/mcp-server@0.1.0 --version` here — the server has no `--version` flag (it starts on stdio and blocks on stdin). `npm view` is the right verification command.
 
 ### 3. First tool call (smoke test in your client)
 
@@ -168,11 +170,12 @@ LLM: → nexus.context_retrieve({
 
 You: "good, rate that 5"
 LLM: → nexus.memory_feedback({
+        user_id: "alice",
         retrieve_id: "uuid-2",
         rating: 5,
         item_feedback: [{ memory_id: "uuid-1", useful: true }]
       })
-     ← { feedback_id: "uuid-3", status: "accepted", created_at: "2026-05-23T..." }
+     ← { feedback_id: "uuid-3", retrieve_id: "uuid-2", status: "accepted", created_at: "2026-05-23T..." }
      "Thanks, recorded. Future retrievals will weight that memory higher for you."
 ```
 
