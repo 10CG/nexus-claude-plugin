@@ -74,4 +74,3 @@ jobs:
 
           # Force-push all tags (semver releases).
           git push github --tags --force
-```
