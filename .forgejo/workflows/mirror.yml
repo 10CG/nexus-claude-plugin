@@ -56,6 +56,10 @@ jobs:
           echo "GH_PAT present (length=${#GH_PAT})"
 
       - name: Push to GitHub mirror
+        # bash explicitly because `set -o pipefail` is bash-only (Forgejo
+        # runner via `act` defaults to POSIX `sh -e {0}` which rejects
+        # `pipefail`). Run #1 (4157, 2026-05-23) failed at this line.
+        shell: bash
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
