@@ -5,8 +5,8 @@
   "description": "Nexusm MCP server packaged as a Claude Code plugin — exposes Nexusm memory / conversation / knowledge / feedback / context services to Claude via 4 MCP tools (nexus.context_retrieve, nexus.memory_search, nexus.memory_create, nexus.memory_feedback).",
   "author": "10CG",
   "license": "MIT",
-  "repository": "https://forgejo.10cg.pub/10CG/nexus-claude-plugin",
-  "homepage": "https://forgejo.10cg.pub/10CG/nexus-claude-plugin",
+  "repository": "https://github.com/10CG/nexus-claude-plugin",
+  "homepage": "https://github.com/10CG/nexus-claude-plugin#readme",
   "keywords": [
     "nexus",
     "nexusm",
