@@ -18,12 +18,18 @@ Exposes 4 MCP tools that wire your LLM into Nexusm's cognitive services platform
 ### Claude Code
 
 ```bash
-claude plugin install nexus-memory
+# Add this marketplace source (one-time):
+/plugin marketplace add 10CG/nexus-claude-plugin
+
+# Then install the plugin:
+/plugin install nexus-memory@10CG-nexus-claude-plugin
 ```
 
 That's it. The plugin installs the `@nexusm/mcp-server` npm package on demand via `npx` and registers the 4 tools.
 
 You still need to set 3 env vars (see [Required environment](#required-environment) below).
+
+> **Anthropic marketplace status**: `nexus-memory` is also being submitted to Anthropic's official plugin marketplace — once accepted, the install command will simplify to `/plugin install nexus-memory`. Status tracked in [`MARKETPLACE.md`](./MARKETPLACE.md). The GitHub-source path above always works regardless of marketplace acceptance.
 
 ### Cursor
 
