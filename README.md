@@ -40,7 +40,7 @@ Cursor reads `~/.cursor/mcp.json`. Add:
   "mcpServers": {
     "nexus": {
       "command": "npx",
-      "args": ["-y", "@nexusm/mcp-server@0.1.0"],
+      "args": ["-y", "@nexusm/mcp-server@0.1.1"],
       "env": {
         "NEXUS_API_URL": "https://your-nexus-api.example.com",
         "NEXUS_API_TOKEN": "your-bearer-token",
@@ -70,7 +70,7 @@ Reload the VS Code window after editing.
 The plugin ships an `.mcp.json` at the repo root with the canonical config. Adapt the format to your client's MCP config convention; the key parts are:
 
 - `command: npx`
-- `args: ["-y", "@nexusm/mcp-server@0.1.0"]` (pin the version — don't use floating)
+- `args: ["-y", "@nexusm/mcp-server@0.1.1"]` (pin the version — don't use floating)
 - 3 env vars: `NEXUS_API_URL`, `NEXUS_API_TOKEN`, `NEXUS_TENANT_ID`
 
 ---
@@ -103,12 +103,12 @@ Expected: `HTTP/2 200`. If you get `401` → token wrong. If you get `404` → U
 ### 2. Verify npm can fetch `@nexusm/mcp-server`
 
 ```bash
-npm view @nexusm/mcp-server@0.1.0 version
+npm view @nexusm/mcp-server@0.1.1 version
 ```
 
-Expected: prints `0.1.0`. If you get an npm 404 → the package isn't published yet (currently expected; see [Status](#status)). If you get auth errors → npm registry is misconfigured.
+Expected: prints `0.1.1`. If you get an npm 404 → unusual; package is currently live as of 2026-05-27. If you get auth errors → npm registry is misconfigured.
 
-> Don't use `npx -y @nexusm/mcp-server@0.1.0 --version` here — the server has no `--version` flag (it starts on stdio and blocks on stdin). `npm view` is the right verification command.
+> Don't use `npx -y @nexusm/mcp-server@0.1.1 --version` here — the server has no `--version` flag (it starts on stdio and blocks on stdin). `npm view` is the right verification command.
 
 ### 3. First tool call (smoke test in your client)
 
@@ -191,9 +191,14 @@ A real GIF/video walking through this in Claude Code is planned for Wave 4 (post
 
 ## Status
 
-**Wave 3 in progress (2026-05-23)** — plugin scaffold + SKILL.md (R1+R1.5 audited) + GitHub mirror shipped. **Wave 4** will publish `@nexusm/sdk@1.3.0` + `@nexusm/mcp-server@0.1.0` to npm and submit to Anthropic marketplace.
+**Wave 4 in progress (2026-05-27)** — plugin + 2 npm packages all live:
 
-Until Wave 4 ships, `npx -y @nexusm/mcp-server@0.1.0` will return 404 — the plugin is **not yet end-to-end usable**. The plugin scaffold + SKILL.md + setup wizard exist now so that as soon as the npm publishes land, install is one command.
+- `@nexusm/sdk@1.3.0` (2026-05-24) — https://www.npmjs.com/package/@nexusm/sdk
+- `@nexusm/mcp-server@0.1.0` (2026-05-25, has known npx packaging bug — use 0.1.1+)
+- **`@nexusm/mcp-server@0.1.1` (2026-05-27)** — chmod fix; this is the version `.mcp.json` pins
+- Plugin Forgejo + GitHub mirror in sync (commit `844590c`+); marketplace submission pending (see [`MARKETPLACE.md`](./MARKETPLACE.md))
+
+The plugin is **end-to-end usable today** via the GitHub-source install path — see [Quick install](#quick-install). Anthropic marketplace acceptance still pending (Path A in MARKETPLACE.md), but doesn't block use (Path B works).
 
 ---
 
