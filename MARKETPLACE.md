@@ -12,7 +12,7 @@
 |-------|-------|
 | **Plugin name** | `nexus-memory` (per `.claude-plugin/plugin.json` `name` field) |
 | **Plugin version** | `0.1.0` |
-| **Backing npm package** | [`@nexusm/mcp-server@0.1.0`](https://www.npmjs.com/package/@nexusm/mcp-server) (live since 2026-05-25) |
+| **Backing npm package** | [`@nexusm/mcp-server@0.1.1`](https://www.npmjs.com/package/@nexusm/mcp-server) (0.1.0 published 2026-05-25 with known npx bug; 0.1.1 chmod fix published 2026-05-27 — current `.mcp.json` pin) |
 | **Canonical source** | GitHub mirror at https://github.com/10CG/nexus-claude-plugin (auto-synced from Forgejo `10CG/nexus-claude-plugin`) |
 | **Forgejo origin** | https://forgejo.10cg.pub/10CG/nexus-claude-plugin (issues/PRs land here; GitHub is mirror only) |
 | **Submission status** | ⏳ **Not yet submitted** |
@@ -26,7 +26,7 @@ Items the plugin must satisfy **before** submission. Tick when verified.
 
 ### Hard requirements
 
-- [x] `@nexusm/mcp-server@0.1.0` live on npm public registry — verified `HTTP 200 on registry.npmjs.org/@nexusm/mcp-server/0.1.0` (2026-05-25)
+- [x] `@nexusm/mcp-server@0.1.1` live on npm public registry — verified `HTTP 200 on registry.npmjs.org/@nexusm/mcp-server/0.1.1` (2026-05-27); 0.1.0 also live (HTTP 200) but has known npx packaging bug, so plugin pins 0.1.1
 - [x] `@nexusm/sdk@1.3.0` live on npm — transitive dep of mcp-server, required for `npx -y` install
 - [x] `.claude-plugin/plugin.json` valid against Anthropic plugin schema
 - [x] `.mcp.json` points at the published npm package (not a local file path)
