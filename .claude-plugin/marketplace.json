@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "10CG-nexus-claude-plugin",
+  "description": "Nexusm MCP server packaged for Claude Code — memory / conversation / knowledge / feedback / context tools via @nexusm/mcp-server.",
+  "owner": {
+    "name": "10CG",
+    "email": "help@10cg.pub"
+  },
+  "metadata": {
+    "homepage": "https://github.com/10CG/nexus-claude-plugin"
+  },
+  "plugins": [
+    {
+      "name": "nexus-memory",
+      "version": "0.1.0",
+      "source": ".",
+      "description": "Nexusm MCP server packaged as a Claude Code plugin — exposes Nexusm memory / conversation / knowledge / feedback / context services to Claude via 4 MCP tools (nexus.context_retrieve, nexus.memory_search, nexus.memory_create, nexus.memory_feedback). Installs @nexusm/mcp-server on demand via npx.",
+      "author": {
+        "name": "10CG"
+      },
+      "category": "mcp",
+      "keywords": ["nexus", "nexusm", "mcp", "memory", "claude-code"]
+    }
+  ]
+}
