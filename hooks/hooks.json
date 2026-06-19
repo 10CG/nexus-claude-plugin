@@ -1,0 +1,15 @@
+{
+  "description": "UserPromptSubmit nudge hook: deterministically steers Claude toward the nexus.memory_create MCP tool on cross-session memory-write intent (lifetime-axis rules shared with skills/nexus-memory/SKILL.md via hooks/rules.json). Advisory only — never blocks the prompt; fail-open exit 0.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/memory_capture.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
