@@ -2,7 +2,7 @@
   "mcpServers": {
     "nexus": {
       "command": "npx",
-      "args": ["-y", "@nexusm/mcp-server@0.1.1"],
+      "args": ["-y", "@nexusm/mcp-server@0.1.2"],
       "env": {
         "NEXUS_API_URL": "${NEXUS_API_URL}",
         "NEXUS_API_TOKEN": "${NEXUS_API_TOKEN}",
