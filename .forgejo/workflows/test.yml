@@ -1,0 +1,39 @@
+# Hook unit tests — mcp-memory-capture-hook (T4, US-037 / FU-MCP-MEMORY-CAPTURE-HOOK)
+#
+# Runs on push and pull_request when any of the hook's OWN INPUTS change.
+# The paths filter MUST cover all three inputs (rules.json, memory_capture.py,
+# test_memory_capture.py) so that editing any one of them triggers the gate.
+# Omitting an input from paths means silent escape: a bad rules.json edit
+# would not rerun the parity tests (project lesson: feedback_ci_gate_trigger_must_cover_own_inputs).
+#
+# No bashisms used in any step — Forgejo runner defaults to POSIX sh -e {0}.
+# If bashisms are ever needed, add `shell: bash` on that specific step.
+
+name: hook-tests
+
+on:
+  push:
+    paths:
+      - hooks/rules.json
+      - hooks/memory_capture.py
+      - hooks/test_memory_capture.py
+  pull_request:
+    paths:
+      - hooks/rules.json
+      - hooks/memory_capture.py
+      - hooks/test_memory_capture.py
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      # node:20-bookworm (not python:*-slim): slim images lack git + node, so
+      # the JS-based actions/checkout@v4 fails before tests run. This image has
+      # git + node + python3 (3.11) — same proven image family as mirror.yml.
+      image: node:20-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run hook unit tests
+        run: python3 hooks/test_memory_capture.py

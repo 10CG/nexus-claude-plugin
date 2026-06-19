@@ -1,0 +1,3 @@
+# Python bytecode cache (hook is stdlib Python, no build artifacts tracked)
+__pycache__/
+*.py[cod]
