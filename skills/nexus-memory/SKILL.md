@@ -1,6 +1,6 @@
 ---
 name: nexus-memory
-description: Use when the user wants something **remembered across sessions** (preferences, decisions, past conversations, learned facts), **searched** in their long-term memory, or wants to **rate** the quality of a prior retrieval. Cross-session, server-backed memory via Nexusm. Use the four `nexus.*` tools — do not invent calls or use within-session scratchpads for cross-session intent.
+description: ANY request to remember, recall, or persist something **across future sessions** — preferences ("I prefer X", "I like Y", "always use Z"), decisions, facts, past conversations. This is the durable store: if the user expects it back in a LATER session, it goes here via `nexus.memory_create`, NOT the built-in within-session `Save memory`. Also for **searching** long-term memory and **rating** a prior retrieval. The built-in auto-memory is ONLY a within-session scratchpad — never use it for cross-session intent. Use the four `nexus.*` tools; do not invent calls.
 ---
 
 # Nexus Memory
@@ -14,9 +14,11 @@ Cross-session memory for Claude, backed by the Nexusm cognitive services platfor
 
 ## When to call which (decision table)
 
+> **Default rule (read first):** "remember X", "I prefer X", "I like X", "I always use X", "from now on use X" → **`nexus.memory_create`**. A stated *preference, taste, tool choice, or habit* is a cross-session fact about the user and belongs in Nexus — do **not** route it to the built-in `Save memory`. The built-in is only for transient within-*this*-session notes (see Break-tie #4). When unsure whether something should survive to a later session, assume YES → Nexus.
+
 | User intent (paraphrase) | Use | Don't use |
 |---|---|---|
-| "remember X" / "I prefer Y" | `nexus.memory_create` | claude-mem (cross-session needs Nexus, not local) |
+| "remember X" / "I prefer X" / "I like X" / "I always use X" / "from now on use X" | `nexus.memory_create` | **built-in `Save memory`** (within-session only) · claude-mem (local-only) |
 | "remember this bug fix" (code snippet) | `nexus.memory_create` with `metadata={type:'snippet', language}` | `CLAUDE.md` (project-static; this is a per-user fact) |
 | "how does this project handle auth" (project-static) | **`CLAUDE.md`** (static, in-repo) | nexus tools — not for project-static facts |
 | "what did I say earlier about X" (no specific time named) | `nexus.context_retrieve` (no `as_of`) | `nexus.memory_search` (too narrow — pulls memories only, no conversation) |
@@ -24,7 +26,7 @@ Cross-session memory for Claude, backed by the Nexusm cognitive services platfor
 | "find all my React-related notes" | `nexus.memory_search` with `mode='hybrid'` | `nexus.context_retrieve` (will dilute with conversation + knowledge) |
 | "that was helpful" / "good answer" / "rate this 5" (after a recent retrieve) | `nexus.memory_feedback` with `rating=4 or 5` and the most recent `retrieve_id` | skip if no recent `retrieve_id` in current session — ask the user to re-run the query so a fresh `retrieve_id` is produced |
 | "that memory was wrong" / "this retrieval missed X" / "rate this 1" | `nexus.memory_feedback` with `rating=1-2` and the most recent `retrieve_id` (set `expected_missing` if the user names what was missing) | creating a new memory on the same topic (will trigger a conflict) |
-| "summarize what I learned this session" (within-session) | TodoWrite / built-in scratch | nexus — Phase 1 has no `conversation_append` |
+| "summarize what I learned this session" / "summarize the last 5 minutes" / "recap this conversation" (within-session, no cross-session recall asked) | built-in session context / TodoWrite — **do NOT call nexus** | nexus — this is current-session content, not a cross-session memory write or retrieval |
 | "save today's meeting notes" | `nexus.memory_create` with `memory_type='episodic'` | claude-mem (cross-session → Nexus) |
 | "the file I just edited" (within-session) | built-in tools (Read / Bash) | nexus — within-session only |
 | "what I said 5 minutes ago" (within-session) | current conversation context | nexus — within-session only |
@@ -37,8 +39,11 @@ When two paths look applicable:
 1. **`CLAUDE.md` > nexus** for project-static instructions (anything that's true for every user of the same repo).
 2. **Built-in within-session tools > nexus** when the answer is in the active conversation or the working tree.
 3. **claude-mem (local) > nexus** *if and only if* all three hold: machine-local use only AND no Console / dashboard visibility needed AND no cross-session ranking of results needed.
-4. **Anthropic's built-in `Save memory` / auto-memory** is for **meta-collaboration** with Claude itself — how Claude should work for this user (preferred coding style, tools they like, communication habits, past collaboration feedback, project context that helps Claude help them). **nexus** is for the user's own **domain facts, knowledge, and decisions** they want to recall across sessions (e.g., "we use Postgres 15", "the auth bug is fixed by patching X", "remember my customer's preferences"). The two MUST NOT overlap: if the user is teaching Claude how to behave → built-in memory; if the user is asking Claude to remember a fact about *their* world → `nexus.memory_create`. When in doubt, prefer nexus for cross-session domain facts.
-5. **Otherwise: nexus.** Cross-session + multi-device + ranked + auditable → that's what Nexus is for.
+4. **Cross-session vs within-session is the ONLY partition axis** between Nexus and the built-in `Save memory` — *not* topic (preferences vs facts). Decide by **lifetime**, not subject matter:
+   - **`nexus.memory_create` (durable, cross-session):** anything the user expects to persist into a **later, separate session** — preferences, taste, tool choices ("I prefer pnpm over npm"), habits, decisions, domain facts ("we use Postgres 15"), customer details. **Yes, this explicitly includes "preferred coding style / tools they like / communication habits"** when the user wants them to *stick across sessions* — which is the normal case. Route these to Nexus.
+   - **Built-in `Save memory` (transient, this session only):** an ephemeral note useful **only until this session ends** and not worth recalling next time — e.g. "for the rest of *this* chat, keep answers short", a one-off reminder scoped to the current task. If it has no value in a fresh future session, it stays built-in.
+   - **No overlap:** the same phrase routed by lifetime, never by topic. "I prefer X" with any expectation of future recall → **nexus**, full stop. There is no "preferences go built-in" carve-out — that earlier framing is retired.
+5. **Otherwise: nexus.** Cross-session + multi-device + ranked + auditable → that's what Nexus is for. When the lifetime is ambiguous, **default to nexus** (durable is the safe failure mode; a lost cross-session memory is worse than an extra durable one).
 
 ## Cross-tenant handling
 
