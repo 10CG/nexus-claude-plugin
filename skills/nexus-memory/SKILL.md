@@ -1,6 +1,6 @@
 ---
 name: nexus-memory
-description: ANY request to remember, recall, or persist something **across future sessions** — preferences ("I prefer X", "I like Y", "always use Z"), decisions, facts, past conversations. This is the durable store: if the user expects it back in a LATER session, it goes here via `nexus.memory_create`, NOT the built-in within-session `Save memory`. Also for **searching** long-term memory and **rating** a prior retrieval. The built-in auto-memory is ONLY a within-session scratchpad — never use it for cross-session intent. Use the four `nexus.*` tools; do not invent calls.
+description: Cross-session memory via Nexusm. Use the `nexus.*` tools for ANY request to remember, recall, persist, search, or rate something across future sessions — stated preferences ("I prefer X", "always use Y"), decisions, facts, past conversations. The built-in Save memory is a within-this-session scratchpad ONLY — never use it for cross-session intent.
 ---
 
 # Nexus Memory
@@ -14,7 +14,7 @@ Cross-session memory for Claude, backed by the Nexusm cognitive services platfor
 
 ## When to call which (decision table)
 
-> **Default rule (read first):** "remember X", "I prefer X", "I like X", "I always use X", "from now on use X" → **`nexus.memory_create`**. A stated *preference, taste, tool choice, or habit* is a cross-session fact about the user and belongs in Nexus — do **not** route it to the built-in `Save memory`. The built-in is only for transient within-*this*-session notes (see Break-tie #4). When unsure whether something should survive to a later session, assume YES → Nexus.
+> **Default rule (read first):** "remember X", "I prefer X", "I like X", "I always use X", "from now on use X" → **`nexus.memory_create`**. A stated *preference, taste, tool choice, or habit* is a cross-session fact about the user and belongs in Nexus — do **not** route it to the built-in `Save memory`. The built-in is only for transient within-*this*-session notes (see Break-tie #4). **Bounding (avoid over-capture):** default-to-Nexus applies only when the user is *stating a first-person fact, preference, or decision about themselves or their world*. It does **not** mean capture everything — phrasing scoped to the current chat/session/task ("for now…", "for the rest of this chat…", a one-off reminder) stays built-in and is never written to Nexus. Each `nexus.memory_create` is a durable server-side row (visible in the Console, and a ConflictResolver entry point), so only persist genuine cross-session facts, not session noise.
 
 | User intent (paraphrase) | Use | Don't use |
 |---|---|---|
@@ -41,9 +41,9 @@ When two paths look applicable:
 3. **claude-mem (local) > nexus** *if and only if* all three hold: machine-local use only AND no Console / dashboard visibility needed AND no cross-session ranking of results needed.
 4. **Cross-session vs within-session is the ONLY partition axis** between Nexus and the built-in `Save memory` — *not* topic (preferences vs facts). Decide by **lifetime**, not subject matter:
    - **`nexus.memory_create` (durable, cross-session):** anything the user expects to persist into a **later, separate session** — preferences, taste, tool choices ("I prefer pnpm over npm"), habits, decisions, domain facts ("we use Postgres 15"), customer details. **Yes, this explicitly includes "preferred coding style / tools they like / communication habits"** when the user wants them to *stick across sessions* — which is the normal case. Route these to Nexus.
-   - **Built-in `Save memory` (transient, this session only):** an ephemeral note useful **only until this session ends** and not worth recalling next time — e.g. "for the rest of *this* chat, keep answers short", a one-off reminder scoped to the current task. If it has no value in a fresh future session, it stays built-in.
+   - **Built-in `Save memory` (transient, this session only):** an ephemeral note useful **only until this session ends** and not worth recalling next time — e.g. "for the rest of *this* chat, keep answers short", "remind me to commit before I close this", "note that for now we're skipping tests", a one-off reminder scoped to the current task. If it has no value in a fresh future session, it stays built-in — **do NOT write these to Nexus.**
    - **No overlap:** the same phrase routed by lifetime, never by topic. "I prefer X" with any expectation of future recall → **nexus**, full stop. There is no "preferences go built-in" carve-out — that earlier framing is retired.
-5. **Otherwise: nexus.** Cross-session + multi-device + ranked + auditable → that's what Nexus is for. When the lifetime is ambiguous, **default to nexus** (durable is the safe failure mode; a lost cross-session memory is worse than an extra durable one).
+5. **Otherwise: nexus — but only for stated cross-session facts.** Cross-session + multi-device + ranked + auditable → that's what Nexus is for. When the user is stating a first-person fact/preference/decision and only the *lifetime* is ambiguous, **default to nexus** (a lost cross-session memory is worse than an extra durable one). This default does **not** extend to transient/meta phrasing scoped to the current session (those stay built-in) — every `memory_create` is a durable server row + ConflictResolver entry, so don't over-capture session noise.
 
 ## Cross-tenant handling
 
