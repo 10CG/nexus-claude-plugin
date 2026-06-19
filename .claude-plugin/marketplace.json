@@ -12,7 +12,7 @@
   "plugins": [
     {
       "name": "nexus-memory",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": ".",
       "description": "Nexusm MCP server packaged as a Claude Code plugin — exposes Nexusm memory / conversation / knowledge / feedback / context services to Claude via 4 MCP tools (nexus.context_retrieve, nexus.memory_search, nexus.memory_create, nexus.memory_feedback). Installs @nexusm/mcp-server on demand via npx.",
       "author": {
