@@ -83,7 +83,7 @@ If you don't have a recent `retrieve_id` (e.g., the user is rating something fro
 
 The MCP server requires three env vars (set in the launcher / `.mcp.json`):
 
-- `NEXUS_API_URL`
+- `NEXUS_API_URL` — base URL of the Nexus REST API. Canonical form includes the `/v1` API-version path (e.g. `https://your-host/v1`). If you point it at a bare origin or a local proxy without `/v1`, the server (≥ 0.1.3) auto-appends `/v1`, so both forms work.
 - `NEXUS_API_TOKEN`
 - `NEXUS_TENANT_ID`
 

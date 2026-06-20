@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/schemas/plugin.schema.json",
   "name": "nexus-memory",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Nexusm MCP server packaged as a Claude Code plugin — exposes Nexusm memory / conversation / knowledge / feedback / context services to Claude via 4 MCP tools (nexus.context_retrieve, nexus.memory_search, nexus.memory_create, nexus.memory_feedback).",
   "author": {
     "name": "10CG",
