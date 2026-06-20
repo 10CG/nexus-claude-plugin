@@ -7,11 +7,17 @@ Drives the hook as a real subprocess (echo JSON | python3 memory_capture.py)
 so tests assert on actual stdout + exit code — not on rule re-evaluation.
 
 Coverage mapping to T4 acceptance criteria (detailed-tasks.yaml):
-  AC-Parity   (D5/AC2)  : Class 1 — parity_* tests
-  AC-Recall   (D7)      : Class 2 — recall_floor_* tests
+  AC-Parity   (D5/AC2)  : Class 1 — parity_* tests (3-state: capture/recall/ignore)
+  AC-Recall   (D7)      : Class 2 — recall_floor_* tests (write-path positives)
   AC-Precision          : Class 3 — precision_no_fire_* tests
   AC-Contract (D6)      : Class 4 — output_contract_* tests
   AC-FailOpen (D3/AC3)  : Class 5 — failopen_* tests
+  AC-ReadParity (D1)    : Class 8  — read_parity_* tests (read_examples parity)
+  AC-ReadRecall (D1)    : Class 9  — read_recall_floor_* tests
+  AC-OverFire (AC1/D4)  : Class 10 — over_fire_gate_* tests (held-out corpus ≥12)
+  AC-ReadContract (D5)  : Class 11 — read_output_contract_* tests
+  AC-MutualExcl (D3)    : Class 12 — mutual_exclusion_* tests
+  AC-ReadNonVacuity     : Class 13 — read_non_vacuity_* tests
 """
 
 import json
@@ -51,29 +57,78 @@ def _load_examples():
     return rules.get("examples", [])
 
 
+def _load_read_examples():
+    with open(_RULES_PATH, encoding="utf-8") as fh:
+        rules = json.load(fh)
+    return rules.get("read_examples", [])
+
+
+def _nudge_intent(stdout_bytes):
+    """Classify which intent a hook output belongs to, or None if silent."""
+    if not stdout_bytes:
+        return None
+    try:
+        parsed = json.loads(stdout_bytes)
+        ctx = parsed["hookSpecificOutput"]["additionalContext"]
+    except (json.JSONDecodeError, KeyError):
+        return "PARSE_ERROR"
+    if "nexus.memory_create" in ctx:
+        return "write"
+    if "nexus.context_retrieve" in ctx:
+        # timetravel nudge contains 'as_of' instruction; recall nudge does not
+        if "as_of" in ctx and "90 days" in ctx:
+            return "timetravel"
+        return "recall"
+    return "UNKNOWN"
+
+
 _EXAMPLES = _load_examples()
 _CAPTURE_EXAMPLES = [e for e in _EXAMPLES if e["expected"] == "capture"]
 _IGNORE_EXAMPLES  = [e for e in _EXAMPLES if e["expected"] == "ignore"]
+_READ_EXAMPLES    = _load_read_examples()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Class 1 — Parity (D5/AC2): hook runtime output == rules.json examples verbatim
+#
+# examples[] uses a 3-state label system after the read-path refactor:
+#   "capture"   → hook must produce a WRITE nudge (nexus.memory_create)
+#   "recall"    → hook must produce a READ nudge (nexus.context_retrieve)
+#   "ignore"    → hook must produce empty stdout (no nudge of any kind)
+#
+# Note: the old examples[] only had "capture"/"ignore" labels. After the read-path
+# was added, some prompts that were "ignore" (no write nudge) now correctly route
+# to the read path ("recall"). The labels in examples[] were updated to reflect
+# the new 3-state contract. The parity test here enforces that the hook's actual
+# behavior matches each label — not a static re-read of the rules.
 # ════════════════════════════════════════════════════════════════════════════════
 
 class TestParitySingleRuleSet(unittest.TestCase):
-    """For EVERY example in rules.json, assert the hook's live subprocess output
-    matches the declared expected classification.  If hook logic and rules.json
-    ever diverge, these tests fail — enforcing the single-rule-set invariant (D2/D5).
-    This is the 'honored-by-convention' guard: a vacuous test that only re-reads
-    rules.json without running the hook would give false assurance."""
+    """For EVERY example in rules.json examples[], assert the hook's live subprocess
+    output matches the declared expected classification (3-state: capture/recall/ignore).
+    If hook logic and rules.json ever diverge, these tests fail — enforcing the
+    single-rule-set invariant (D2/D5).  This is the 'honored-by-convention' guard:
+    a vacuous test that only re-reads rules.json without running the hook would give
+    false assurance."""
 
     def _assert_capture(self, prompt, note=""):
         stdin = _hook_json(prompt)
         stdout, code = _run_hook(stdin)
         self.assertEqual(code, 0, f"Non-zero exit for capture prompt: {prompt!r}")
-        self.assertTrue(
-            len(stdout) > 0,
-            f"Expected nudge output (capture) but got empty stdout for: {prompt!r} {note}",
+        intent = _nudge_intent(stdout)
+        self.assertEqual(
+            intent, "write",
+            f"Expected WRITE nudge (capture) but got intent={intent!r} for: {prompt!r} {note}",
+        )
+
+    def _assert_recall(self, prompt, note=""):
+        stdin = _hook_json(prompt)
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0, f"Non-zero exit for recall prompt: {prompt!r}")
+        intent = _nudge_intent(stdout)
+        self.assertIn(
+            intent, ("recall", "timetravel"),
+            f"Expected READ nudge (recall or timetravel) but got intent={intent!r} for: {prompt!r} {note}",
         )
 
     def _assert_ignore(self, prompt, note=""):
@@ -86,7 +141,8 @@ class TestParitySingleRuleSet(unittest.TestCase):
         )
 
     def test_all_examples_parity(self):
-        """Each example in rules.json must match the hook's live classification."""
+        """Each example in rules.json examples[] must match the hook's live classification.
+        3-state: capture->write nudge, recall->read nudge, ignore->empty stdout."""
         failures = []
         for ex in _EXAMPLES:
             prompt = ex["prompt"]
@@ -97,11 +153,13 @@ class TestParitySingleRuleSet(unittest.TestCase):
             if code != 0:
                 failures.append(f"NON-ZERO EXIT [{expected}] {prompt!r}")
                 continue
-            has_output = len(stdout) > 0
-            if expected == "capture" and not has_output:
-                failures.append(f"MISS (expected capture, got silent) | {note!r} | {prompt!r}")
-            elif expected == "ignore" and has_output:
-                failures.append(f"OVER-FIRE (expected ignore, got nudge) | {note!r} | {prompt!r}")
+            intent = _nudge_intent(stdout)
+            if expected == "capture" and intent != "write":
+                failures.append(f"MISS (expected write nudge, got intent={intent!r}) | {note!r} | {prompt!r}")
+            elif expected == "recall" and intent not in ("recall", "timetravel"):
+                failures.append(f"MISS (expected read nudge, got intent={intent!r}) | {note!r} | {prompt!r}")
+            elif expected == "ignore" and stdout != b"":
+                failures.append(f"OVER-FIRE (expected ignore, got intent={intent!r}) | {note!r} | {prompt!r}")
         if failures:
             self.fail(
                 f"Parity failures ({len(failures)}/{len(_EXAMPLES)} examples):\n"
@@ -238,10 +296,24 @@ class TestPrecisionNoOverFire(unittest.TestCase):
         )
 
     def test_dogfood_scenario2_recall_query(self):
-        """Read/recall queries must never fire the write nudge."""
-        self._assert_silent(
-            "What did I say about TypeScript tooling preferences?",
-            label="dogfood-scenario-2",
+        """Dogfood scenario 2: cross-session recall query must fire a READ nudge
+        (nexus.context_retrieve), NOT a write nudge (nexus.memory_create).
+        Previously asserted silence, but with the read path added this prompt
+        correctly routes to recall — updated assertion to match new contract."""
+        stdin = _hook_json("What did I say about TypeScript tooling preferences?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0, "Non-zero exit (dogfood-scenario-2)")
+        intent = _nudge_intent(stdout)
+        # Must fire a READ nudge, not a write nudge, not silence
+        self.assertIn(
+            intent, ("recall", "timetravel"),
+            f"Expected READ nudge for cross-session recall query, got intent={intent!r} | "
+            f"stdout={stdout!r}",
+        )
+        # Explicitly guard: must NOT be a write nudge
+        self.assertNotEqual(
+            intent, "write",
+            "Recall query must never produce a WRITE nudge (nexus.memory_create)",
         )
 
     def test_dogfood_scenario3_feedback(self):
@@ -276,8 +348,21 @@ class TestPrecisionNoOverFire(unittest.TestCase):
         self._assert_silent("Recap what we covered so far.")
 
     def test_question_about_preference(self):
-        """A question about a preference is a read (context_retrieve), not a write."""
-        self._assert_silent("What is my preferred package manager?")
+        """A question about a preference is a READ (context_retrieve), not a write.
+        With the read path added, this prompt correctly fires a RECALL nudge.
+        The test now asserts READ routing (not silence) — ensuring no WRITE nudge fires."""
+        stdin = _hook_json("What is my preferred package manager?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0, "Non-zero exit for preference question")
+        intent = _nudge_intent(stdout)
+        self.assertIn(
+            intent, ("recall", "timetravel"),
+            f"Expected READ nudge for preference question, got intent={intent!r}",
+        )
+        self.assertNotEqual(
+            intent, "write",
+            "Preference question must never produce a WRITE nudge",
+        )
 
     def test_do_you_remember(self):
         self._assert_silent("Do you remember what I told you earlier?")
@@ -604,6 +689,729 @@ class TestNonVacuityProof(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Class 8 — Read parity (D1/AC1): hook runtime matches read_examples[] verbatim
+#
+# For EVERY entry in rules.json read_examples[], run the hook as a subprocess
+# and assert:
+#   expected=="recall"      → stdout names nexus.context_retrieve WITHOUT as_of
+#   expected=="timetravel"  → stdout names nexus.context_retrieve WITH as_of
+#   expected=="ignore"      → stdout is empty
+#
+# This is the single-source enforcement for the read partition: the hook's
+# runtime classification must match the shared rules.json artifact (D1).
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestReadParitySingleRuleSet(unittest.TestCase):
+    """Parity check: every read_examples[] entry must match hook's live classification.
+    Enforces the single-rule-set invariant (D1) for the read partition."""
+
+    def test_all_read_examples_parity(self):
+        """Drive the hook for every read_examples[] entry; assert live output matches label."""
+        failures = []
+        for ex in _READ_EXAMPLES:
+            prompt = ex["prompt"]
+            expected = ex["expected"]
+            note = ex.get("_note", "")
+            stdin = _hook_json(prompt)
+            stdout, code = _run_hook(stdin)
+            if code != 0:
+                failures.append(f"NON-ZERO EXIT [{expected}] {prompt!r}")
+                continue
+            intent = _nudge_intent(stdout)
+            if expected == "recall":
+                # Must produce a READ nudge — not a write nudge, not silence
+                if intent not in ("recall", "timetravel"):
+                    failures.append(
+                        f"MISS (expected recall nudge, got intent={intent!r}) | {note!r} | {prompt!r}"
+                    )
+                # Specifically: recall expected means no as_of instruction
+                if intent == "recall":
+                    try:
+                        ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+                    except (KeyError, json.JSONDecodeError):
+                        ctx = ""
+                    if "Do NOT pass an as_of" not in ctx and "as_of" in ctx and "90 days" in ctx:
+                        failures.append(
+                            f"RECALL expected but got timetravel (as_of+90d present) | {note!r} | {prompt!r}"
+                        )
+            elif expected == "timetravel":
+                if intent != "timetravel":
+                    failures.append(
+                        f"MISS (expected timetravel nudge, got intent={intent!r}) | {note!r} | {prompt!r}"
+                    )
+            elif expected == "ignore":
+                if stdout != b"":
+                    failures.append(
+                        f"OVER-FIRE (expected ignore, got intent={intent!r}) | {note!r} | {prompt!r}"
+                    )
+            else:
+                failures.append(f"UNKNOWN expected label {expected!r} | {prompt!r}")
+
+        if failures:
+            total = len(_READ_EXAMPLES)
+            self.fail(
+                f"Read parity failures ({len(failures)}/{total} read_examples):\n"
+                + "\n".join(f"  {f}" for f in failures)
+            )
+
+    def test_dogfood_s2_recall_no_as_of(self):
+        """S2 (dogfood rewrite): 'What's my preferred unit-testing framework?' →
+        recall nudge naming nexus.context_retrieve WITHOUT an as_of instruction."""
+        prompt = "What's my preferred unit-testing framework?"
+        stdin = _hook_json(prompt)
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        intent = _nudge_intent(stdout)
+        self.assertEqual(
+            intent, "recall",
+            f"S2 must route to recall, got intent={intent!r} | stdout={stdout!r}",
+        )
+        ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("nexus.context_retrieve", ctx, "Recall nudge must name nexus.context_retrieve")
+        # Strict: recall must NOT have as_of+90d instruction (that is timetravel territory)
+        self.assertIn(
+            "Do NOT pass an as_of", ctx,
+            "Recall nudge must instruct model NOT to pass an as_of (no past time named)",
+        )
+
+    def test_dogfood_s5_timetravel_has_as_of(self):
+        """S5 (dogfood rewrite): 'A few weeks ago I set a preference about testing tools —
+        what was it?' → timetravel nudge naming nexus.context_retrieve WITH as_of."""
+        prompt = "A few weeks ago I set a preference about testing tools — what was it?"
+        stdin = _hook_json(prompt)
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        intent = _nudge_intent(stdout)
+        self.assertEqual(
+            intent, "timetravel",
+            f"S5 must route to timetravel, got intent={intent!r} | stdout={stdout!r}",
+        )
+        ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("nexus.context_retrieve", ctx, "Timetravel nudge must name nexus.context_retrieve")
+        self.assertIn("as_of", ctx, "Timetravel nudge must mention as_of")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class 9 — Read recall floor (D1/AC1)
+# ALL recall + timetravel positives in read_examples[] must produce the correct nudge.
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestReadRecallFloor(unittest.TestCase):
+    """Recall floor for the read path: every read_examples[] positive (recall or
+    timetravel) must produce a nudge.  A miss here means the hook would silently
+    skip routing cross-session recall to nexus.context_retrieve."""
+
+    def test_all_recall_positives_produce_nudge(self):
+        """Every read_examples[] entry with expected recall or timetravel must produce output."""
+        positives = [e for e in _READ_EXAMPLES if e["expected"] in ("recall", "timetravel")]
+        failures = []
+        for ex in positives:
+            prompt = ex["prompt"]
+            note = ex.get("_note", "")
+            expected = ex["expected"]
+            stdin = _hook_json(prompt)
+            stdout, code = _run_hook(stdin)
+            if code != 0:
+                failures.append(f"NON-ZERO EXIT | {note} | {prompt!r}")
+            elif not stdout:
+                failures.append(f"SILENT (no nudge, expected {expected}) | {note} | {prompt!r}")
+            else:
+                intent = _nudge_intent(stdout)
+                if intent not in ("recall", "timetravel"):
+                    failures.append(f"WRONG INTENT={intent!r} expected {expected} | {note} | {prompt!r}")
+        if failures:
+            self.fail(
+                f"Read recall floor FAILED ({len(failures)}/{len(positives)} positives):\n"
+                + "\n".join(f"  {f}" for f in failures)
+            )
+
+    def test_dogfood_s2_recall_fires(self):
+        """Dogfood S2 'What's my preferred unit-testing framework?' must fire recall."""
+        stdin = _hook_json("What's my preferred unit-testing framework?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIn(_nudge_intent(stdout), ("recall", "timetravel"))
+
+    def test_dogfood_s5_timetravel_fires(self):
+        """Dogfood S5 'A few weeks ago I set a preference...' must fire timetravel."""
+        stdin = _hook_json(
+            "A few weeks ago I set a preference about testing tools — what was it?"
+        )
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertEqual(_nudge_intent(stdout), "timetravel")
+
+    def test_cross_session_recall_fires(self):
+        """Direct cross-session recall pattern must fire."""
+        stdin = _hook_json("What's my usual database for new services?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIn(_nudge_intent(stdout), ("recall", "timetravel"))
+
+    def test_we_decided_recall_fires(self):
+        """Team decision recall must fire."""
+        stdin = _hook_json("What did we decide about the API versioning scheme?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIn(_nudge_intent(stdout), ("recall", "timetravel"))
+
+    def test_last_week_timetravel_fires(self):
+        """Named 'last week' must fire timetravel nudge."""
+        stdin = _hook_json("Last week I set a preference about my editor — what was it?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertEqual(_nudge_intent(stdout), "timetravel")
+
+    def test_date_timetravel_fires(self):
+        """Explicit ISO date must fire timetravel nudge."""
+        stdin = _hook_json("On 2026-05-30 I mentioned a tooling preference — what was it?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertEqual(_nudge_intent(stdout), "timetravel")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class 10 — Numeric over-fire gate (AC1/D4)
+#
+# HELD-OUT paraphrases NOT present in rules.json read_examples[] (D4 requirement:
+# anti teaching-to-the-test). The corpus must have ≥ 12 entries. Each must produce
+# ZERO read nudges.  If someone broadens read_allowlist to over-fire, these go red.
+#
+# Categories covered (T4 spec):
+#   A. Imperative coding tasks
+#   B. Third-person / general knowledge questions
+#   C. Project-static lookups
+#   D. Within-session referents
+#   E. Ambiguous-but-blocklisted by read_blocklist
+#
+# Held-out = paraphrase not verbatim in read_examples[]. Verified below.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# The held-out negative corpus — D4: must NOT be verbatim in read_examples[]
+_OVER_FIRE_CORPUS = [
+    # A. Imperative coding (4 prompts) — read_blocklist matches (write|fix|refactor|...)
+    ("rename this variable to user_id",
+     "imperative-coding: rename"),
+    ("add a docstring to this function",
+     "imperative-coding: add docstring"),
+    ("refactor this class to use dependency injection",
+     "imperative-coding: refactor"),
+    ("generate a migration for the users table",
+     "imperative-coding: generate migration"),
+
+    # B. Third-person / general knowledge (4 prompts) — no first-person recall
+    ("what's the difference between a list and a tuple in Python",
+     "general-knowledge: list vs tuple"),
+    ("when was Python 3.12 released",
+     "general-knowledge: Python 3.12 release date"),
+    ("what are the main features of PostgreSQL 16",
+     "general-knowledge: postgres features"),
+    ("how does garbage collection work in CPython",
+     "general-knowledge: cpython gc"),
+
+    # C. Project-static lookups (2 prompts) — project facts, no personal recall
+    ("which port does the dev server run on",
+     "project-static: dev server port"),
+    ("what does this regex match",
+     "project-static: regex explanation"),
+
+    # D. Within-session referents (4 prompts) — read_blocklist within-session patterns
+    ("summarize what you just told me",
+     "within-session: summarize you just told me"),
+    ("what did you say two messages ago",
+     "within-session: two messages ago"),
+    ("can you repeat what you explained earlier in this chat",
+     "within-session: earlier in this chat"),
+    ("what were we discussing five minutes ago",
+     "within-session: five minutes ago"),
+]
+
+_OVER_FIRE_CORPUS_SIZE = len(_OVER_FIRE_CORPUS)
+
+
+class TestOverFireGate(unittest.TestCase):
+    """AC1 (T4 spec): numeric over-fire gate on held-out paraphrases (D4).
+
+    Corpus size: _OVER_FIRE_CORPUS_SIZE prompts (must be ≥ 12).
+    Every entry must produce ZERO nudge output.  These are held-out paraphrases
+    that do NOT appear verbatim in rules.json read_examples[] — anti teaching-to-
+    the-test (D4).  If read_allowlist is broadened to over-fire, these go red.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Enforce corpus size ≥ 12 at class setup, not inside test methods,
+        so the constraint appears as a setup error (not a hidden test pass)."""
+        assert _OVER_FIRE_CORPUS_SIZE >= 12, (
+            f"Over-fire corpus must have ≥ 12 entries (AC1), got {_OVER_FIRE_CORPUS_SIZE}"
+        )
+        # Verify D4: none of the held-out corpus prompts appear verbatim in read_examples[]
+        read_prompt_set = {ex["prompt"] for ex in _READ_EXAMPLES}
+        verbatim_hits = [
+            (p, label) for p, label in _OVER_FIRE_CORPUS if p in read_prompt_set
+        ]
+        if verbatim_hits:
+            raise AssertionError(
+                f"D4 violated: {len(verbatim_hits)} held-out corpus entries are verbatim in "
+                f"read_examples[] (teaching-to-the-test): "
+                + ", ".join(f"{p!r}" for p, _ in verbatim_hits)
+            )
+
+    def test_corpus_size_at_least_12(self):
+        """Assert corpus size ≥ 12 explicitly so it appears in test output."""
+        self.assertGreaterEqual(
+            _OVER_FIRE_CORPUS_SIZE, 12,
+            f"Over-fire corpus must have ≥ 12 entries for AC1, got {_OVER_FIRE_CORPUS_SIZE}",
+        )
+
+    def test_d4_no_verbatim_in_read_examples(self):
+        """Verify no held-out corpus entry appears verbatim in read_examples[] (D4)."""
+        read_prompt_set = {ex["prompt"] for ex in _READ_EXAMPLES}
+        verbatim = [p for p, _ in _OVER_FIRE_CORPUS if p in read_prompt_set]
+        self.assertEqual(
+            verbatim, [],
+            f"D4 violation: these held-out prompts appear verbatim in read_examples[]: {verbatim!r}",
+        )
+
+    def test_zero_read_nudges_on_held_out_corpus(self):
+        """ALL corpus entries must produce ZERO nudge output (recall or timetravel).
+        Over-fires are reported collectively so the full failure set is visible."""
+        failures = []
+        for prompt, label in _OVER_FIRE_CORPUS:
+            stdin = _hook_json(prompt)
+            stdout, code = _run_hook(stdin)
+            if code != 0:
+                failures.append(f"NON-ZERO EXIT | {label} | {prompt!r}")
+                continue
+            intent = _nudge_intent(stdout)
+            if intent is not None:
+                failures.append(
+                    f"OVER-FIRE (intent={intent!r}) | {label} | {prompt!r}"
+                )
+        if failures:
+            self.fail(
+                f"Over-fire gate FAILED: {len(failures)}/{_OVER_FIRE_CORPUS_SIZE} corpus "
+                f"entries produced a nudge (ZERO expected):\n"
+                + "\n".join(f"  {f}" for f in failures)
+            )
+
+    # Individual named tests for the T4 spec-cited categories (more actionable CI output)
+
+    def test_imperative_rename_no_nudge(self):
+        """Imperative 'rename this variable' must produce no nudge."""
+        stdin = _hook_json("rename this variable to user_id")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout), "Imperative coding must not fire read nudge")
+
+    def test_imperative_add_docstring_no_nudge(self):
+        stdin = _hook_json("add a docstring to this function")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+    def test_general_knowledge_list_tuple_no_nudge(self):
+        """Third-person general knowledge must produce no nudge."""
+        stdin = _hook_json("what's the difference between a list and a tuple in Python")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+    def test_general_knowledge_python_release_no_nudge(self):
+        stdin = _hook_json("when was Python 3.12 released")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+    def test_project_static_port_no_nudge(self):
+        """Project-static lookup must produce no nudge."""
+        stdin = _hook_json("which port does the dev server run on")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+    def test_project_static_regex_no_nudge(self):
+        stdin = _hook_json("what does this regex match")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+    def test_within_session_you_just_told_me_no_nudge(self):
+        """Within-session referent must produce no nudge."""
+        stdin = _hook_json("summarize what you just told me")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+    def test_within_session_earlier_in_this_chat_no_nudge(self):
+        stdin = _hook_json("can you repeat what you explained earlier in this chat")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+    def test_within_session_minutes_ago_no_nudge(self):
+        stdin = _hook_json("what were we discussing five minutes ago")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertIsNone(_nudge_intent(stdout))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class 11 — Read output contract (D5)
+# On a timetravel hit, the nudge must:
+#   (a) name nexus.context_retrieve
+#   (b) instruct a RELATIVE as_of (NOT a hardcoded literal YYYY-MM-DD date)
+#   (c) mention the 90-day cap
+# On a recall hit, assert it does NOT instruct an as_of.
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestReadOutputContract(unittest.TestCase):
+    """D5 output contract: timetravel nudge uses relative as_of instruction,
+    recall nudge explicitly instructs NOT to pass as_of."""
+
+    _RECALL_PROMPT = "What's my preferred unit-testing framework?"
+    _TIMETRAVEL_PROMPT = "A few weeks ago I set a preference about testing tools — what was it?"
+
+    def _get_ctx(self, prompt):
+        """Run hook and return additionalContext string (fails test if no output)."""
+        stdin = _hook_json(prompt)
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        self.assertGreater(len(stdout), 0, f"Expected nudge for {prompt!r}, got empty stdout")
+        parsed = json.loads(stdout)
+        return parsed["hookSpecificOutput"]["additionalContext"]
+
+    # — Timetravel contract —
+
+    def test_timetravel_names_context_retrieve(self):
+        """Timetravel nudge (a): must name nexus.context_retrieve."""
+        ctx = self._get_ctx(self._TIMETRAVEL_PROMPT)
+        self.assertIn(
+            "nexus.context_retrieve", ctx,
+            "Timetravel nudge must explicitly name 'nexus.context_retrieve'",
+        )
+
+    def test_timetravel_no_hardcoded_date(self):
+        """Timetravel nudge (b): must NOT contain a literal YYYY-MM-DD date.
+        The hook must instruct the MODEL to compute the concrete RFC3339 date,
+        not embed a hardcoded value (D5 — relative as_of)."""
+        import re as _re
+        ctx = self._get_ctx(self._TIMETRAVEL_PROMPT)
+        hardcoded = _re.search(r"\b\d{4}-\d{2}-\d{2}\b", ctx)
+        self.assertIsNone(
+            hardcoded,
+            f"Timetravel nudge must NOT contain a hardcoded YYYY-MM-DD date (D5: Claude computes it). "
+            f"Found {hardcoded.group()!r} in: {ctx!r}" if hardcoded else "",
+        )
+
+    def test_timetravel_mentions_90_day_cap(self):
+        """Timetravel nudge (c): must mention the 90-day cap."""
+        ctx = self._get_ctx(self._TIMETRAVEL_PROMPT)
+        self.assertIn(
+            "90", ctx,
+            "Timetravel nudge must mention the 90-day cap (backend rejects older with HTTP 422)",
+        )
+        self.assertIn(
+            "days", ctx,
+            "Timetravel nudge must mention 'days' as part of the 90-day cap instruction",
+        )
+
+    def test_timetravel_instructs_as_of(self):
+        """Timetravel nudge must mention as_of in an instructional context."""
+        ctx = self._get_ctx(self._TIMETRAVEL_PROMPT)
+        self.assertIn(
+            "as_of", ctx,
+            "Timetravel nudge must mention 'as_of' argument",
+        )
+
+    def test_timetravel_instructs_relative_resolution(self):
+        """Timetravel nudge must instruct Claude to COMPUTE the date (relative resolution).
+        The phrase 'you compute' or 'resolve' must appear — confirming it's a model instruction,
+        not a pre-computed literal."""
+        ctx = self._get_ctx(self._TIMETRAVEL_PROMPT)
+        has_relative_instruction = "you compute" in ctx.lower() or "resolve" in ctx.lower()
+        self.assertTrue(
+            has_relative_instruction,
+            f"Timetravel nudge must instruct Claude to compute the date (not embed it). "
+            f"Expected 'you compute' or 'resolve' in: {ctx!r}",
+        )
+
+    # — Recall contract (no as_of) —
+
+    def test_recall_names_context_retrieve(self):
+        """Recall nudge must name nexus.context_retrieve."""
+        ctx = self._get_ctx(self._RECALL_PROMPT)
+        self.assertIn("nexus.context_retrieve", ctx)
+
+    def test_recall_instructs_no_as_of(self):
+        """Recall nudge must explicitly instruct the model NOT to pass an as_of.
+        (User did not name a past time — no as_of should be computed.)"""
+        ctx = self._get_ctx(self._RECALL_PROMPT)
+        self.assertIn(
+            "Do NOT pass an as_of", ctx,
+            f"Recall nudge must instruct model to skip as_of. Got: {ctx!r}",
+        )
+
+    def test_recall_valid_json_structure(self):
+        """Recall nudge must be valid JSON with correct hookSpecificOutput structure."""
+        stdin = _hook_json(self._RECALL_PROMPT)
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f"Recall output is not valid JSON: {exc}")
+        hso = parsed.get("hookSpecificOutput", {})
+        self.assertEqual(hso.get("hookEventName"), "UserPromptSubmit")
+        self.assertIsInstance(hso.get("additionalContext"), str)
+
+    def test_timetravel_surfaces_retrieve_id(self):
+        """Timetravel nudge must mention retrieve_id (so the chain to S3/memory_feedback is set up)."""
+        ctx = self._get_ctx(self._TIMETRAVEL_PROMPT)
+        self.assertIn(
+            "retrieve_id", ctx,
+            "Timetravel nudge must instruct surfacing retrieve_id (needed for S3 feedback chain)",
+        )
+
+    def test_recall_surfaces_retrieve_id(self):
+        """Recall nudge must mention retrieve_id (so the chain to S3/memory_feedback is set up)."""
+        ctx = self._get_ctx(self._RECALL_PROMPT)
+        self.assertIn(
+            "retrieve_id", ctx,
+            "Recall nudge must instruct surfacing retrieve_id (needed for S3 feedback chain)",
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class 12 — Write/read mutual exclusion (D3)
+# A pure write prompt → write nudge only; a pure recall prompt → recall nudge only.
+# Write-first precedence when both signals might apply.
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestMutualExclusion(unittest.TestCase):
+    """D3: write and read paths are mutually exclusive — the hook dispatches
+    write FIRST, then read.  A prompt that fires write must NEVER also fire read.
+    A prompt that fires read must NEVER also fire write."""
+
+    def test_pure_write_prompt_fires_write_only(self):
+        """A canonical durable-preference write prompt must fire write nudge, not read."""
+        stdin = _hook_json("Remember that I prefer pnpm over npm for new TypeScript projects.")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        intent = _nudge_intent(stdout)
+        self.assertEqual(
+            intent, "write",
+            f"Pure write prompt must fire write nudge, got intent={intent!r}",
+        )
+
+    def test_pure_recall_prompt_fires_recall_only(self):
+        """A canonical cross-session recall query must fire recall nudge, not write."""
+        stdin = _hook_json("What did we decide about the API versioning scheme?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        intent = _nudge_intent(stdout)
+        self.assertIn(
+            intent, ("recall", "timetravel"),
+            f"Pure recall prompt must fire read nudge, got intent={intent!r}",
+        )
+        self.assertNotEqual(
+            intent, "write",
+            "Recall prompt must never produce a write nudge",
+        )
+
+    def test_pure_timetravel_prompt_fires_timetravel_only(self):
+        """A canonical time-named recall must fire timetravel nudge, not write."""
+        stdin = _hook_json("Last week I set a preference about my editor — what was it?")
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        intent = _nudge_intent(stdout)
+        self.assertEqual(
+            intent, "timetravel",
+            f"Time-named recall must fire timetravel nudge, got intent={intent!r}",
+        )
+
+    def test_write_first_precedence_over_recall_shape(self):
+        """D3 mutual-exclusion: write and read are mutually exclusive dispatches.
+        A prompt with a write signal (capture_positive) that is also suppressed by
+        transient_negative falls through to the read path — showing the paths are
+        mutually exclusive and not both emitted.
+
+        The design: transient_negative patterns include recall-shape phrases ('what did we',
+        '?') so that ambiguous prompts cannot fire BOTH paths. A prompt with 'i prefer'
+        (write) + 'what did we decide?' (read_allowlist) ALSO has 'what did we' in
+        transient_negative → write is suppressed → read fires. Only ONE path wins.
+
+        This test confirms the mutual exclusion: the hook emits exactly ONE nudge type."""
+        # 'I prefer pytest — what did we decide about test frameworks?'
+        # capture_positive: 'i prefer' matches
+        # transient_negative: 'what did we' matches + '?' at end matches → write suppressed
+        # read_allowlist: 'what did we decide' matches → read fires
+        # BOTH paths are considered but only ONE wins (read wins here because write suppressed)
+        prompt = "I prefer pytest — what did we decide about test frameworks?"
+        stdin = _hook_json(prompt)
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        intent = _nudge_intent(stdout)
+        # Must produce exactly one nudge type — not both, not none (since read fires)
+        self.assertIn(
+            intent, ("recall", "timetravel", "write"),
+            f"Mutual exclusion (D3): must produce exactly one nudge type, got {intent!r}",
+        )
+        # Additional invariant: if write was suppressed, recall should fire
+        # (transient_negative suppresses write + read_allowlist matches → recall)
+        self.assertIn(
+            intent, ("recall", "timetravel"),
+            f"With 'what did we' in transient_negative (suppressing write), "
+            f"read path should win, got intent={intent!r}",
+        )
+
+    def test_pure_write_is_not_also_recall(self):
+        """A pure write prompt (no recall shape) must fire write ONLY — not recall.
+        Confirms mutually-exclusive dispatch: write-path win never leaks into read."""
+        # 'From now on, always use pytest as our test runner'
+        # capture_positive: 'always use' matches; transient_negative: no match;
+        # read_allowlist: no match → pure write, no read path considered
+        prompt = "From now on, always use pytest as our test runner."
+        stdin = _hook_json(prompt)
+        stdout, code = _run_hook(stdin)
+        self.assertEqual(code, 0)
+        intent = _nudge_intent(stdout)
+        self.assertEqual(
+            intent, "write",
+            f"Pure write prompt must fire write nudge only, got intent={intent!r}",
+        )
+
+    def test_no_double_nudge_on_any_example(self):
+        """Paranoia check: the hook must never emit two JSON objects (double-nudge).
+        The output must be exactly one valid JSON object or empty bytes."""
+        all_examples = list(_EXAMPLES) + list(_READ_EXAMPLES)
+        for ex in all_examples:
+            prompt = ex["prompt"]
+            stdin = _hook_json(prompt)
+            stdout, _ = _run_hook(stdin)
+            if not stdout:
+                continue  # silent is fine
+            with self.subTest(prompt=prompt):
+                # If there were double output, json.loads would fail or produce first object only.
+                # A stricter check: the bytes must contain exactly ONE JSON object.
+                decoded = stdout.decode("utf-8")
+                try:
+                    json.loads(decoded)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"Invalid JSON output for {prompt!r}: {exc}")
+                # Attempt to parse remainder after the first object
+                decoder = json.JSONDecoder()
+                _, end_idx = decoder.raw_decode(decoded)
+                remainder = decoded[end_idx:].strip()
+                self.assertEqual(
+                    remainder, "",
+                    f"Double-nudge detected for {prompt!r}: extra content after first JSON: {remainder!r}",
+                )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class 13 — Read non-vacuity self-check
+# Prove the READ suite can go red: feed a known recall prompt, assert the WRONG
+# expectation, confirm AssertionError fires; restore.
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestReadNonVacuity(unittest.TestCase):
+    """Non-vacuity proof for the READ test suite.  The suite is useless if it
+    cannot fail.  These tests deliberately inject the WRONG expectation and assert
+    that AssertionError is raised — proving the assertions are live."""
+
+    _RECALL_PROMPT = "What's my preferred unit-testing framework?"
+    _TIMETRAVEL_PROMPT = "A few weeks ago I set a preference about testing tools — what was it?"
+    _IGNORE_PROMPT = "rename this variable to user_id"
+
+    def test_read_suite_can_go_red_on_recall_miss(self):
+        """Feed a known recall prompt, assert INCORRECTLY that it should be silent.
+        Catch the AssertionError — proving the suite is non-vacuous for recall."""
+        stdin = _hook_json(self._RECALL_PROMPT)
+        stdout, _ = _run_hook(stdin)
+
+        # First: confirm the hook actually fired (otherwise the defect is in the hook)
+        if not stdout:
+            self.fail(
+                f"NON-VACUITY PROOF FAILED: hook was silent for known-recall prompt "
+                f"{self._RECALL_PROMPT!r} — this is a real defect, not a test infrastructure issue."
+            )
+
+        # Now assert the WRONG thing deliberately
+        intentionally_wrong_fired = False
+        try:
+            self.assertEqual(stdout, b"", "Deliberately wrong assertion to prove suite can go red.")
+        except AssertionError:
+            intentionally_wrong_fired = True
+
+        self.assertTrue(
+            intentionally_wrong_fired,
+            "Non-vacuity self-check failed: deliberately wrong assertion did not raise AssertionError.",
+        )
+
+    def test_read_suite_can_go_red_on_timetravel_miss(self):
+        """Feed a known timetravel prompt, assert INCORRECTLY it should be silent.
+        Catch the AssertionError — proving the suite is non-vacuous for timetravel."""
+        stdin = _hook_json(self._TIMETRAVEL_PROMPT)
+        stdout, _ = _run_hook(stdin)
+
+        if not stdout:
+            self.fail(
+                f"NON-VACUITY PROOF FAILED: hook was silent for known-timetravel prompt "
+                f"{self._TIMETRAVEL_PROMPT!r} — real defect, not test infrastructure."
+            )
+
+        intentionally_wrong_fired = False
+        try:
+            self.assertEqual(stdout, b"", "Deliberately wrong assertion.")
+        except AssertionError:
+            intentionally_wrong_fired = True
+
+        self.assertTrue(
+            intentionally_wrong_fired,
+            "Non-vacuity self-check failed: deliberately wrong assertion did not raise AssertionError.",
+        )
+
+    def test_read_suite_can_go_red_on_over_fire(self):
+        """Feed a known held-out negative prompt (should be silent), assert INCORRECTLY
+        that it should produce a nudge.  Catch AssertionError to prove over-fire gate
+        is falsifiable."""
+        stdin = _hook_json(self._IGNORE_PROMPT)
+        stdout, _ = _run_hook(stdin)
+
+        if stdout:
+            self.fail(
+                f"NON-VACUITY PROOF FAILED: hook fired for held-out negative prompt "
+                f"{self._IGNORE_PROMPT!r} — this is a real over-fire defect."
+            )
+
+        intentionally_wrong_fired = False
+        try:
+            self.assertGreater(len(stdout), 0, "Deliberately wrong assertion.")
+        except AssertionError:
+            intentionally_wrong_fired = True
+
+        self.assertTrue(
+            intentionally_wrong_fired,
+            "Non-vacuity self-check failed: deliberately wrong assertion did not raise AssertionError.",
+        )
+
+    def test_s3_scope_note(self):
+        """S3 (retrieve_id → memory_feedback) is a dogfood-level (T6) behavior, NOT
+        hook-unit-testable.  This test records that fact explicitly — a vacuous pass
+        is intentional here.
+
+        The hook's job is to ROUTE recall → nexus.context_retrieve so a retrieve_id
+        EXISTS to chain to memory_feedback.  Whether the model then calls memory_feedback
+        correctly is observable only in a live dogfood session (T6), not from hook stdout.
+        Asserting the hook calls memory_feedback internally would be a false unit test."""
+        # S3 chain is asserted at T6 (user-led dogfood), not T4 (hook unit tests).
+        # The hook's contribution (routing recall→context_retrieve so retrieve_id exists)
+        # is covered by test_recall_surfaces_retrieve_id in TestReadOutputContract.
+        pass  # intentionally vacuous — see docstring
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -620,6 +1428,13 @@ if __name__ == "__main__":
         TestFailOpen,
         TestPromptKeyVariants,
         TestNonVacuityProof,
+        # T4 read-path classes (mcp-read-path-routing FU)
+        TestReadParitySingleRuleSet,
+        TestReadRecallFloor,
+        TestOverFireGate,
+        TestReadOutputContract,
+        TestMutualExclusion,
+        TestReadNonVacuity,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

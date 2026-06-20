@@ -1,6 +1,6 @@
 {
-  "version": "1.0.0",
-  "_doc": "Single source of truth for the Nexus memory lifetime-axis capture partition. This machine-readable artifact encodes the same rule set that skills/nexus-memory/SKILL.md describes in prose (the 'Default rule' + Break-tie #4/#5). BOTH consume this ONE artifact: hooks/memory_capture.py loads it at runtime to decide whether to nudge nexus.memory_create, and SKILL.md references it by path. Do NOT duplicate or diverge these rules in either consumer (single-rule-set invariant, proposal D2/D5; parity enforced by the T4 test). Classification is by LIFETIME (durable cross-session vs transient within-session), never by topic. Capture iff a capture_positive pattern matches AND no transient_negative pattern matches (negative overrides — D7 / over-capture bound). All patterns are lowercase Python `re` regex evaluated against the lowercased prompt. CALIBRATION NOTES (deferred to T5 measured dogfood per D7, not blind-tightened): (a) broad reaction verbs 'i like'/'i love'/'i work' can over-fire on transient usage ('I like that approach for this file') — kept because they also carry genuine durable preferences; tighten only if T5 measures real over-capture. (b) trailing '?' is a HARD ignore (questions are usually recalls) — it will silence the occasional question-framed durable write by design. The nudge is advisory + self-bounded (it tells Claude to skip if transient), so false positives cannot force a write.",
+  "version": "1.1.0",
+  "_doc": "Single source of truth for the Nexus memory routing rules. This machine-readable artifact encodes the same rule sets that skills/nexus-memory/SKILL.md describes in prose. BOTH consume this ONE artifact: hooks/memory_capture.py loads it at runtime to decide whether/how to nudge, and SKILL.md references it by path. Do NOT duplicate or diverge these rules in either consumer (single-rule-set invariant, proposal D2/D5/D3; parity enforced by the T4 test). TWO rule families share this one file: (1) the WRITE/lifetime-axis capture partition (capture_positive / transient_negative) → nudges nexus.memory_create; (2) the READ-intent partition (read_allowlist / read_timetravel_markers / read_blocklist) → nudges nexus.context_retrieve on cross-session recall (mcp-read-path-routing FU, proposal D1/D5). The single hook checks WRITE intent first, then READ — mutually-exclusive dispatch (D3). All patterns are lowercase Python `re` regex evaluated against the lowercased prompt. WRITE classification is by LIFETIME (durable cross-session vs transient within-session), never by topic. Capture iff a capture_positive pattern matches AND no transient_negative pattern matches (negative overrides — D7 / over-capture bound). READ classification is LEXICAL not semantic (proposal D1, precision-first): fire ONLY on the explicit first-person recall allowlist AND no read_blocklist override (imperative coding / third-person general knowledge / project-static / within-session referents must NOT fire). If a read_timetravel_marker also matches → time-travel route (context_retrieve + relative as_of within 90 days, D5). CALIBRATION NOTES (deferred to measured dogfood, not blind-tightened): (a) broad WRITE reaction verbs 'i like'/'i love'/'i work' can over-fire on transient usage ('I like that approach for this file') — kept because they also carry genuine durable preferences; tighten only if measured. (b) trailing '?' is a HARD ignore for the WRITE path (questions are usually recalls) — it will silence the occasional question-framed durable write by design; questions are instead the READ path's domain. The nudge is advisory + self-bounded, so false positives cannot force a tool call.",
   "match_mode": "regex",
   "case_sensitive": false,
   "capture_positive": [
@@ -74,6 +74,7 @@
     "\\bat the moment\\b",
     "\\btemporarily\\b",
     "\\bremind me to\\b",
+    "\\bremind me what\\b",
     "\\bsummari[sz]e\\b",
     "\\brecap\\b",
     "\\bwhat we (just )?(discussed|talked about|covered)\\b",
@@ -103,7 +104,7 @@
   ],
   "examples": [
     {"prompt": "Remember that I prefer pnpm over npm for new TypeScript projects.", "expected": "capture", "_note": "dogfood scenario 1 — durable first-person preference write"},
-    {"prompt": "What did I say about TypeScript tooling preferences?", "expected": "ignore", "_note": "dogfood scenario 2 — RECALL/read, route to context_retrieve not memory_create"},
+    {"prompt": "What did I say about TypeScript tooling preferences?", "expected": "recall", "_note": "dogfood scenario 2 — RECALL/read, route to context_retrieve not memory_create (write-path parity only ever checked capture vs ignore; this prompt now routes read-path recall, label updated to match hook contract)"},
     {"prompt": "That was helpful, thanks. Rate that retrieval 5 stars.", "expected": "ignore", "_note": "dogfood scenario 3 — feedback, route to memory_feedback"},
     {"prompt": "Summarize what we discussed in the last 5 minutes of this conversation.", "expected": "ignore", "_note": "dogfood scenario 4 — within-session summary, built-in"},
     {"prompt": "Three months ago I had a customer requirement about export formats. What was it?", "expected": "ignore", "_note": "dogfood scenario 5 — recall (named time), not a write"},
@@ -126,7 +127,7 @@
     {"prompt": "Remind me to commit before I close this.", "expected": "ignore"},
     {"prompt": "Just for today, skip the tests.", "expected": "ignore"},
     {"prompt": "Recap what we covered so far.", "expected": "ignore"},
-    {"prompt": "What is my preferred package manager?", "expected": "ignore"},
+    {"prompt": "What is my preferred package manager?", "expected": "recall", "_note": "cross-session recall: read_allowlist fires, no blocklist hit, no write intent — correctly routes to read-path RECALL (label updated from ignore)"},
     {"prompt": "Do you remember what I told you earlier?", "expected": "ignore"},
     {"prompt": "Fix the bug in the file I just edited.", "expected": "ignore"},
     {"prompt": "What did we talk about 10 minutes ago?", "expected": "ignore"},
@@ -136,5 +137,98 @@
     {"prompt": "My question is about decorators.", "expected": "ignore", "_note": "R1 review #1 over-fire lock — generic 'my X is' must not capture transient interrogatives"},
     {"prompt": "My code is broken, can you help?", "expected": "ignore", "_note": "R1 review #1 over-fire lock"},
     {"prompt": "My understanding is that this already works.", "expected": "ignore", "_note": "R1 review #1 over-fire lock"}
+  ],
+
+  "_read_doc": "READ-intent partition (mcp-read-path-routing FU, proposal D1/D5). Consumed by the SAME hook (hooks/memory_capture.py) as the WRITE rules above — one hook, two rule sections (D3). Dispatch order: WRITE intent (capture_positive AND not transient_negative) is checked FIRST; only if that does not fire does the hook evaluate READ. READ fires ONLY when a read_allowlist pattern matches AND NO read_blocklist pattern matches (blocklist OVERRIDES allowlist — precision-first, D1). On a read hit: if a read_timetravel_markers pattern ALSO matches → 'timetravel' route (nudge nexus.context_retrieve WITH a relative as_of inside the last 90 days, D5); else → 'recall' route (nudge nexus.context_retrieve, NO as_of). The authority assertion in the nudge is scoped to recall hits ONLY — never a blanket 'always prefer Nexus' (max over-fire, D1). Classification is LEXICAL, not semantic: only explicit first-person cross-session recall fires. All patterns are lowercase Python `re` regex against the lowercased prompt. READ CALIBRATION NOTES (deferred to measured T6 dogfood, not blind-tightened — code-review 2026-06-20): (a) WRITE-FIRST SHADOWING: a time-named recall that ALSO contains a possessive-preference write phrase ('last week i told you my preferred X', 'back in May i decided my favourite Y') currently routes WRITE, because past-time markers (last week/last month/back in <month>) are NOT in transient_negative so the write check fires first. Fix from measured data: add those past-time markers to transient_negative, OR evaluate read_timetravel_markers before committing to WRITE (time-named ⇒ recall-dominant). The dogfood S5 prompt ('set a preference … what was it') does not hit this; T6 should probe 'last week i … my preferred …'. (b) BROAD-VERB RECALL SUPPRESSION: read_blocklist's verb list (make/add/build/update/change…) silently suppresses legitimate recalls containing those common verbs ('what's my default make target') — a deliberate precision-first false-negative; widen only if measured recall is poor.",
+
+  "read_allowlist": [
+    "\\bwhat did i (say|tell you|mention)\\b",
+    "\\bwhat'?ve i (told|said to) you\\b",
+    "\\bwhat have i (told|said to) you\\b",
+    "\\bwhat'?s my (preferred|usual|favou?rite|go-to|default|preference)\\b",
+    "\\bwhat is my (preferred|usual|favou?rite|go-to|default|preference)\\b",
+    "\\bwhat are my (preferred|usual|favou?rite|preferences)\\b",
+    "\\bwhat did we (decide|agree|choose|settle on)\\b",
+    "\\bwhat have we (decided|agreed|chosen)\\b",
+    "\\bdo you remember (when|what|that) i\\b",
+    "\\bdo you remember my\\b",
+    "\\bremind me what (i|we) (said|decided|chose|preferred)\\b",
+    "\\bwhat preference did i (set|state|express)\\b",
+    "\\bwhat (was|were) my (preference|preferences|choice|decision)\\b",
+    "\\blast week i\\b",
+    "\\blast month i\\b",
+    "\\blast week i (set|told|said|mentioned|decided)\\b",
+    "\\ba few weeks ago i\\b",
+    "\\ba couple (of )?weeks ago i\\b",
+    "\\bweeks? ago i (set|told|said|mentioned|decided|chose|expressed)\\b",
+    "\\bback in (january|february|march|april|may|june|july|august|september|october|november|december)\\b",
+    "\\bon (jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* \\d",
+    "\\bon \\d{4}-\\d{2}-\\d{2}\\b",
+    "\\bearlier this (month|week) i (set|told|said|mentioned|decided)\\b"
+  ],
+
+  "read_timetravel_markers": [
+    "\\blast week\\b",
+    "\\blast month\\b",
+    "\\ba few weeks ago\\b",
+    "\\ba couple (of )?weeks ago\\b",
+    "\\bweeks? ago\\b",
+    "\\bback in (january|february|march|april|may|june|july|august|september|october|november|december)\\b",
+    "\\bon (jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* \\d",
+    "\\bon \\d{4}-\\d{2}-\\d{2}\\b",
+    "\\bearlier this (month|week)\\b"
+  ],
+
+  "read_blocklist": [
+    "\\b(write|fix|refactor|implement|add|create|build|generate|make|update|change|delete|remove|rename|move)\\b",
+    "\\bhow do(es)?\\b",
+    "\\bhow can i\\b",
+    "\\bhow to\\b",
+    "\\bwhat is (a|an|the)\\b",
+    "\\bwhat are (the|some)\\b",
+    "\\bwhat does (a|an|the|this)\\b",
+    "\\bexplain\\b",
+    "\\bwhere is\\b",
+    "\\bwhere'?s the\\b",
+    "\\bwhat does this (function|file|code|class|method|module)\\b",
+    "\\byou just\\b",
+    "\\bjust said\\b",
+    "\\bjust told me\\b",
+    "\\btold you earlier\\b",
+    "\\bearlier in this (chat|session|conversation)\\b",
+    "\\bthe file i just\\b",
+    "\\bin this (chat|session|conversation)\\b",
+    "\\bwe (just )?(discussed|talked about|covered)\\b",
+    "\\b\\d+ minutes? ago\\b",
+    "\\blast \\d+ minutes?\\b"
+  ],
+
+  "read_examples": [
+    {"prompt": "What's my preferred unit-testing framework?", "expected": "recall", "_note": "dogfood S2 (rewritten, two-session priming-free) — cross-session recall, no time named"},
+    {"prompt": "A few weeks ago I set a preference about testing tools — what was it?", "expected": "timetravel", "_note": "dogfood S5 (rewritten, within-90-day) — time-named recall → context_retrieve + relative as_of"},
+
+    {"prompt": "What did I say about TypeScript tooling preferences?", "expected": "recall"},
+    {"prompt": "What's my usual database for new services?", "expected": "recall"},
+    {"prompt": "Do you remember when I told you about my deployment workflow?", "expected": "recall"},
+    {"prompt": "What did we decide about the API versioning scheme?", "expected": "recall"},
+    {"prompt": "What was my preference for commit message style?", "expected": "recall"},
+    {"prompt": "Remind me what I said I preferred for state management.", "expected": "recall"},
+
+    {"prompt": "Last week I set a preference about my editor — what was it?", "expected": "timetravel"},
+    {"prompt": "What did I say I preferred a couple of weeks ago about linters?", "expected": "timetravel"},
+    {"prompt": "Back in May I told you my favourite test runner — remind me what it was.", "expected": "timetravel"},
+    {"prompt": "On 2026-05-30 I mentioned a tooling preference — what was it?", "expected": "timetravel"},
+
+    {"prompt": "How does Python asyncio work?", "expected": "ignore", "_note": "third-person general knowledge — blocklist override"},
+    {"prompt": "What is a closure in JavaScript?", "expected": "ignore", "_note": "general-knowledge definition"},
+    {"prompt": "Explain how decorators work.", "expected": "ignore", "_note": "general-knowledge"},
+    {"prompt": "Fix the bug in auth.py", "expected": "ignore", "_note": "imperative coding"},
+    {"prompt": "Write a function to reverse a linked list.", "expected": "ignore", "_note": "imperative coding"},
+    {"prompt": "Refactor the file I just edited.", "expected": "ignore", "_note": "imperative coding + within-session referent"},
+    {"prompt": "What did you just say about the schema?", "expected": "ignore", "_note": "within-session referent (you just)"},
+    {"prompt": "What did we discuss earlier in this session?", "expected": "ignore", "_note": "within-session referent"},
+    {"prompt": "Where is the config file?", "expected": "ignore", "_note": "project-static lookup"},
+    {"prompt": "What does this function do?", "expected": "ignore", "_note": "project-static code lookup"},
+    {"prompt": "What did we talk about 10 minutes ago?", "expected": "ignore", "_note": "within-session, minutes-ago"}
   ]
 }
