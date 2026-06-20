@@ -44,6 +44,7 @@ When two paths look applicable:
    - **Built-in `Save memory` (transient, this session only):** an ephemeral note useful **only until this session ends** and not worth recalling next time — e.g. "for the rest of *this* chat, keep answers short", "remind me to commit before I close this", "note that for now we're skipping tests", a one-off reminder scoped to the current task. If it has no value in a fresh future session, it stays built-in — **do NOT write these to Nexus.**
    - **No overlap:** the same phrase routed by lifetime, never by topic. "I prefer X" with any expectation of future recall → **nexus**, full stop. There is no "preferences go built-in" carve-out — that earlier framing is retired.
    - **Machine-readable mirror (single source of truth):** this lifetime-axis partition is *also* encoded machine-readably in [`hooks/rules.json`](../../hooks/rules.json) (`capture_positive` / `transient_negative` pattern sets). A `UserPromptSubmit` hook (`hooks/memory_capture.py`) loads that artifact at runtime to deterministically nudge `nexus.memory_create` when a prompt states cross-session write intent. The hook and this SKILL.md **share that one rule source** — do not duplicate or diverge the rules here; if the partition changes, edit `hooks/rules.json` and these rows stay descriptive of it.
+   - **Read-routing rules live in the same artifact:** the *same* `hooks/rules.json` also carries a `read` section (`read_allowlist` / `read_timetravel_markers` / `read_blocklist` + `read_examples`), consumed by the *same* hook to nudge `nexus.context_retrieve` on cross-session **recall** ("what's my preferred X", "what did I say about Y") and `nexus.context_retrieve` + a relative `as_of` (within 90 days) on **time-named recall** ("a few weeks ago I…"). The hook checks write intent first, then read intent (mutually exclusive). One shared artifact backs both the write and read decision rows above — do not duplicate or diverge the read rules here either.
 5. **Otherwise: nexus — but only for stated cross-session facts.** Cross-session + multi-device + ranked + auditable → that's what Nexus is for. When the user is stating a first-person fact/preference/decision and only the *lifetime* is ambiguous, **default to nexus** (a lost cross-session memory is worse than an extra durable one). This default does **not** extend to transient/meta phrasing scoped to the current session (those stay built-in) — every `memory_create` is a durable server row + ConflictResolver entry, so don't over-capture session noise.
 
 ## Cross-tenant handling
@@ -88,6 +89,13 @@ The MCP server requires three env vars (set in the launcher / `.mcp.json`):
 - `NEXUS_TENANT_ID`
 
 `user_id` is **per-call** — pass it on every tool invocation based on whoever the active user of the Claude session is. Do not invent or carry over `user_id` between unrelated users.
+
+### `user_id` stability (cross-session recall depends on this)
+
+Cross-session recall only works if the `user_id` you read under **matches the `user_id` it was written under**. Because `user_id` is supplied per-call (and is *not* loaded from any server env), an inconsistent value across sessions means a recall can silently miss its own prior writes. Follow this convention:
+
+- **Single-user-per-server deployments** (the common case — one operator, one Claude Code instance): use a **stable `user_id` on every single call**, identical across all sessions. Recommended literal: **`default`** — or a fixed id of the user's choice that the operator documents (e.g. via an optional **`NEXUS_DEFAULT_USER_ID`** env the launcher sets; if present, use its value verbatim as `user_id` on every call). The exact value does not matter; *consistency* does. **Do NOT derive `user_id` from `NEXUS_TENANT_ID`** — that collapses the compound id to `tenant::tenant`, which is semantically wrong and migration-hostile.
+- **Multi-user deployments** (one server instance serving several distinct real users): you **MUST** pass an explicit per-call `user_id` for each real user. Do **not** fall back to the single-user `default` here — that would write everyone's memories under one id and leak them across users on recall (a privacy/correctness defect, not just a miss).
 
 ## Limits worth knowing
 
