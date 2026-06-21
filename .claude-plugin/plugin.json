@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/schemas/plugin.schema.json",
   "name": "nexus-memory",
-  "version": "0.2.4",
-  "description": "Nexusm MCP server packaged as a Claude Code plugin — exposes Nexusm memory / conversation / knowledge / feedback / context services to Claude via 4 MCP tools (nexus.context_retrieve, nexus.memory_search, nexus.memory_create, nexus.memory_feedback).",
+  "version": "0.2.5",
+  "description": "Nexus 跨会话记忆插件 - 4个 MCP 工具 (context_retrieve / memory_search / memory_create / memory_feedback) + UserPromptSubmit Hook (确定性写/读路由) + 服务器端 user_id pin (可靠跨会话召回); 聚合上下文 + 时间旅行 as_of 查询 + v5 反馈重排序, 由 @nexusm/mcp-server (npx) 驱动",
   "author": {
     "name": "10CG",
     "email": "help@10cg.pub"

@@ -11,7 +11,7 @@
 | Field | Value |
 |-------|-------|
 | **Plugin name** | `nexus-memory` (per `.claude-plugin/plugin.json` `name` field) |
-| **Plugin version** | `0.2.4` |
+| **Plugin version** | `0.2.5` |
 | **Backing npm package** | [`@nexusm/mcp-server@0.1.4`](https://www.npmjs.com/package/@nexusm/mcp-server) (`.mcp.json` pin; 0.1.4 = NEXUS_API_URL `/v1` auto-normalize + opt-in `NEXUS_DEFAULT_USER_ID` server-side user_id pin) |
 | **Capabilities** | 4 MCP tools (`nexus.context_retrieve` / `memory_search` / `memory_create` / `memory_feedback`) **+ a `UserPromptSubmit` hook** that deterministically routes write intent → `memory_create` and cross-session recall → `context_retrieve` (the SKILL.md discrimination layer is now hook-backed, not prose-only) |
 | **Canonical source** | GitHub mirror at https://github.com/10CG/nexus-claude-plugin (auto-synced from Forgejo `10CG/nexus-claude-plugin`; HEAD `2b4d6fe`) |
@@ -116,6 +116,11 @@ This is the **documented install path** and the fallback if the community listin
 - 🗒️ Submission channel resolved (was "TBD"): **community marketplace** via https://clau.de/plugin-directory-submission (decentralized GitHub install needs no approval).
 - 🗒️ Only Demo GIF remains (non-blocking, user-led recording).
 - 📝 Next: maintainer submits via **Path A** form and records the entry below. Until then, **Path B** is fully functional and is the documented install path.
+
+#### 2026-06-21 — marketplace.json aligned to 10CG plugin pattern (aria/aether)
+
+- 🗒️ Matched the proven 10CG marketplace pattern (same as `10CG/aria-plugin` + `10CG/aether-plugin`): `plugins[].source` changed `"."` → `{"source":"url","url":"https://github.com/10CG/nexus-claude-plugin.git"}` (explicit GitHub source, not local-relative); clean marketplace.json (`name`/`owner`/`plugins` only, dropped `$schema`/top-level `description`/`metadata`); capability-led description; `category` `mcp` → `memory`. Plugin bumped 0.2.4 → **0.2.5** (both `plugin.json` + `marketplace.json`).
+- This makes `/plugin marketplace add 10CG/nexus-claude-plugin` resolve via the GitHub source exactly like the other 10CG plugins.
 
 #### [TIMESTAMP — submitted] (TBD)
 
