@@ -9,6 +9,76 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-21
+
+### Added
+- **`SessionEnd` activity-capture hook** (`hooks/session_capture.py`, P1 /
+  workflow C): on session end, reads the session transcript, distills it into a
+  bounded activity list, and POSTs to `POST {NEXUS_API_URL}/activities/stream`.
+  The backend Arq worker (`activity_processor.process_activity`) extracts those
+  activities into episodic Memory rows keyed `user_id == agent_id` — the **write
+  side** of the claude-mem "auto-capture (feature a)" replacement, paired with
+  the read-side `session_inject.py` (P2). Live against dev's
+  `/v1/activities/stream` as of **migration 024**.
+  - **Action mapping** (assistant `tool_use` + user text → `ActivityItem.action`
+    enum): `Edit`→`edit_file`, `Write`→`create_file`, `Read`→`read_file`,
+    `Bash 'git commit'`→`commit`, `Bash pytest|jest|'go test'|'npm test'|vitest`
+    →`run_test`, other `Bash`→`command_run`, `Grep`/`Glob`/`Task`/…→`agent_action`,
+    user text→`user_message`. `activity_data` carries `{tool, summary}` (file path
+    or command head ≤200 chars) / `{text}` (≤500 chars).
+  - **agent_id = project slug**: `NEXUS_DEFAULT_USER_ID` else normalized lowercase
+    git-toplevel/cwd basename — IDENTICAL derivation to `session_inject.py` so the
+    captured episodic memory lands on the same `user_id=project` the read side
+    queries.
+  - **Provenance**: every `activity_data` is augmented with `container_id`
+    (`NEXUS_CONTAINER_ID` else hostname) + `branch`
+    (`git -C cwd rev-parse --abbrev-ref HEAD`, omitted on failure) + `session_id`.
+  - **Bounded**: keeps the most-recent `_MAX_ACTIVITIES` (200) extracted
+    activities, well under the `ActivityStreamRequest` 1000 cap.
+  - Mandatory `User-Agent` header (CF 1010 Bot Fight Mode) + `X-API-Key` +
+    `X-Nexus-Source: session-capture-hook`; ~8s timeout. FAIL-OPEN on every path
+    — missing config / no transcript / unreadable file / unreachable backend /
+    timeout / malformed transcript line → exit 0 with no stdout, never blocking
+    teardown. Empty activity list → no request sent. Transcript parsed
+    line-by-line **defensively** (bad/blank/non-dict line skipped, never fatal).
+  - Registered as a `SessionEnd` hook alongside the existing `UserPromptSubmit` +
+    `SessionStart` hooks in `hooks/hooks.json`.
+  - 22 deterministic unit tests (`hooks/test_session_capture.py`): subprocess
+    fail-open coverage + in-process urllib monkeypatch for action-mapping /
+    provenance / agent_id-slug / bad-line-skip / empty→no-POST / cap / non-vacuity
+    (no real backend).
+
+## [0.3.0] — 2026-06-21
+
+### Added
+- **`SessionStart` warm-start injection hook** (`hooks/session_inject.py`, P2 /
+  workflow A): on a new Claude Code session, calls `POST {NEXUS_API_URL}/context/retrieve`
+  and injects the project's recent **settled** summaries as
+  `hookSpecificOutput.additionalContext` — the cross-container warm-start that
+  replaces claude-mem "feature c".
+  - Prefers `metadata.layer == "summary"` rows to guard the brief from
+    half-finished observations (§6). **Forward-looking**: the write side that
+    emits `metadata.layer` is workflow B (migration) / P1 (capture); until those
+    populate it, no row carries `layer` and the hook gracefully falls back to all
+    rows. Each line carries a `[<container_id> · <age> · <branch>]` provenance
+    annotation so cross-container origin is legible.
+  - Branch-scoped recall with a two-tier fallback (§6 same-branch-first →
+    project-level): tier 1 sends `metadata_filter={branch, container_id}` (backed
+    by backend workflow G's allowlist); if the profile is empty, tier 2 re-requests
+    without `metadata_filter`. **Forward-looking**: tier 1 only narrows once the
+    write side populates `branch`/`container_id` on memory metadata (B/P1); until
+    then tier 1 is empty and tier 2 carries the brief — correct, just one extra
+    short request. Per-request timeouts are 6s (tier 1) + 4s (tier 2) so a slow
+    backend never stalls startup beyond ~10s.
+  - Uses `profile_limit` (NOT `limit` — `ContextRequest` has no `limit` field) and
+    a mandatory `User-Agent` header (CF 1010 Bot Fight Mode blocks UA-less
+    requests). FAIL-OPEN on every path — missing config / unreachable backend /
+    timeout / malformed stdin → exit 0 with no stdout, never blocking startup.
+  - Registered alongside the existing `UserPromptSubmit` hook in `hooks/hooks.json`.
+  - 18 deterministic unit tests (`hooks/test_session_inject.py`): subprocess
+    fail-open coverage + in-process urllib monkeypatch for request-body / header /
+    two-tier-fallback / provenance assertions (no real backend).
+
 ## [0.2.5] — 2026-06-21
 
 ### Changed
