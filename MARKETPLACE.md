@@ -16,8 +16,8 @@
 | **Capabilities** | 4 MCP tools (`nexus.context_retrieve` / `memory_search` / `memory_create` / `memory_feedback`) **+ a `UserPromptSubmit` hook** that deterministically routes write intent → `memory_create` and cross-session recall → `context_retrieve` (the SKILL.md discrimination layer is now hook-backed, not prose-only) |
 | **Canonical source** | GitHub mirror at https://github.com/10CG/nexus-claude-plugin (auto-synced from Forgejo `10CG/nexus-claude-plugin`; HEAD `2b4d6fe`) |
 | **Forgejo origin** | https://forgejo.10cg.pub/10CG/nexus-claude-plugin (issues/PRs land here; GitHub is mirror only) |
-| **Submission status** | ⏳ **Not yet submitted** (prerequisites cleared; submission is user-led) |
-| **Last update** | 2026-06-21 — dogfood 5/5 passed, prerequisites cleared |
+| **Submission status** | ✅ **Shipped** via the GitHub marketplace model (same as 10CG aria/aether) — install: `/plugin marketplace add 10CG/nexus-claude-plugin`. No Anthropic form/approval. Optional community-catalog listing not pursued. |
+| **Last update** | 2026-06-21 — dogfood 5/5; marketplace.json aligned to 10CG pattern (0.2.5) |
 
 ---
 
@@ -54,28 +54,11 @@ Items the plugin must satisfy **before** submission. Tick when verified.
 
 ## Submission process
 
-> **Key fact (researched 2026-06-21):** Claude Code plugin marketplaces are **decentralized** — a public GitHub repo with valid `.claude-plugin/marketplace.json` + `plugin.json` IS a marketplace, installable immediately with **no Anthropic approval** (Path B below). There is **no approval gate to "ship"**. Anthropic's curated catalogs exist only for **discoverability**: the **community marketplace** (`anthropics/claude-plugins-community`, public submission via form) and the **official marketplace** (`claude-plugins-official`, Anthropic discretion, no public submission). Docs: https://code.claude.com/docs/en/plugin-marketplaces
+> **Key fact (verified against 10CG's existing plugins, 2026-06-21):** Claude Code plugin marketplaces are **decentralized** — a public GitHub repo with valid `.claude-plugin/marketplace.json` + `plugin.json` IS a marketplace, installable immediately with **no Anthropic approval and no submission form**. This is exactly how 10CG's other plugins ship: `10CG/aria-plugin` and `10CG/aether-plugin` are self-hosted GitHub marketplaces, not listed in any Anthropic catalog. `nexus-claude-plugin` now follows the **same pattern** (marketplace.json aligned 2026-06-21). So "shipping" = the GitHub repo is public + pattern-aligned, which is **done**.
 
-### Path A — Anthropic community marketplace (for discoverability)
+### Path A — GitHub marketplace (the actual 10CG model — DONE)
 
-This is the real "submission" — it gets `nexus-memory` listed in Anthropic's vetted **community** catalog so users can find it in the `/plugin` **Discover** tab.
-
-1. **Submit** via the plugin directory form: **https://clau.de/plugin-directory-submission**
-2. Provide:
-   - GitHub repo URL: `https://github.com/10CG/nexus-claude-plugin`
-   - Plugin name: `nexus-memory`
-   - Marketplace name: `10CG-nexus-claude-plugin`
-   - Description (use the `description` field from `plugin.json` verbatim)
-   - Keywords: `nexus`, `nexusm`, `mcp`, `memory`, `claude-code`, `anthropic`
-   - Category: Memory / Knowledge management
-3. Anthropic runs automated validation + safety screening, then pins your plugin to a specific commit SHA in `anthropics/claude-plugins-community`.
-4. Once listed, users install via: `/plugin marketplace add anthropics/claude-plugins-community` → `/plugin install nexus-memory@claude-community`.
-
-> The **official** marketplace (`claude-plugins-official`) has no public submission — it's Anthropic-curated only; don't wait on it.
-
-### Path B — Direct GitHub marketplace add (works NOW, no Anthropic approval needed)
-
-Users can install today without waiting for community-catalog listing:
+Identical to how users add `10CG/aria-plugin` / `10CG/aether-plugin`:
 
 ```bash
 # In Claude Code:
@@ -83,9 +66,19 @@ Users can install today without waiting for community-catalog listing:
 /plugin install nexus-memory@10CG-nexus-claude-plugin
 ```
 
-This is the **documented install path** and the fallback if the community listing is delayed/rejected.
+No form, no approval, no waiting. The repo is public and `marketplace.json` `plugins[].source` points at the GitHub URL (same form as aria/aether). This is the documented, supported install path.
 
-> **Single-user tip (recommended in the listing):** set `NEXUS_DEFAULT_USER_ID` (e.g. `default`) so the server pins a stable `user_id` across sessions — cross-session recall is unreliable without it because the model picks an inconsistent id per call. Multi-user servers leave it unset and pass an explicit per-call `user_id`.
+### Path B — Anthropic community catalog (OPTIONAL discoverability — unverified, not used by 10CG)
+
+For extra discoverability one *could* try to get listed in Anthropic's curated **community** catalog (`anthropics/claude-plugins-community`) so it appears in the `/plugin` **Discover** tab. **Caveat: the public submission mechanism is unverified** — a previously-cited form URL (`clau.de/plugin-directory-submission`) could not be confirmed, and **10CG has not used this path for aria/aether**. If pursued, check current docs at https://code.claude.com/docs/en/plugin-marketplaces for the live submission process. This is optional and not required to ship.
+
+> The **official** marketplace (`claude-plugins-official`) has no public submission — Anthropic-curated only.
+
+### Legacy note
+
+Earlier revisions of this file framed the (unverified) community-catalog form as the primary "submission". Corrected 2026-06-21: the 10CG model is the decentralized GitHub repo above (Path A), matching aria/aether.
+
+> **Single-user setup tip:** set `NEXUS_DEFAULT_USER_ID` (e.g. `default`) so the server pins a stable `user_id` across sessions — cross-session recall is unreliable without it because the model picks an inconsistent id per call. Multi-user servers leave it unset and pass an explicit per-call `user_id`.
 
 ---
 
@@ -113,22 +106,21 @@ This is the **documented install path** and the fallback if the community listin
 
 - ✅ **R2 dogfood 5/5** in a clean Claude Code session (the last hard/soft blocker). Routing and cross-session recall validated end-to-end after the read-path nudge (plugin 0.2.3) + server-side `user_id` pin (mcp-server 0.1.4). Record: `dogfood-run-2026-06-21.md`.
 - ✅ Plugin bumped 0.1.0 → **0.2.4**; mcp-server pin 0.1.1 → **0.1.4**; GitHub mirror current (`2b4d6fe`); public install path (Path B) verified working.
-- 🗒️ Submission channel resolved (was "TBD"): **community marketplace** via https://clau.de/plugin-directory-submission (decentralized GitHub install needs no approval).
+- 🗒️ "Submission channel" question resolved: 10CG ships plugins as **self-hosted GitHub marketplaces** (aria/aether), **no form / no Anthropic approval**. So shipping = the public GitHub repo (Path A). The earlier-cited community-catalog form is unverified and unused by 10CG (see Submission process Path B).
 - 🗒️ Only Demo GIF remains (non-blocking, user-led recording).
-- 📝 Next: maintainer submits via **Path A** form and records the entry below. Until then, **Path B** is fully functional and is the documented install path.
+- 📝 No "submission" action needed to ship — the plugin is installable now via `/plugin marketplace add 10CG/nexus-claude-plugin`. Optional community-catalog listing can be pursued later if discoverability is wanted.
 
 #### 2026-06-21 — marketplace.json aligned to 10CG plugin pattern (aria/aether)
 
 - 🗒️ Matched the proven 10CG marketplace pattern (same as `10CG/aria-plugin` + `10CG/aether-plugin`): `plugins[].source` changed `"."` → `{"source":"url","url":"https://github.com/10CG/nexus-claude-plugin.git"}` (explicit GitHub source, not local-relative); clean marketplace.json (`name`/`owner`/`plugins` only, dropped `$schema`/top-level `description`/`metadata`); capability-led description; `category` `mcp` → `memory`. Plugin bumped 0.2.4 → **0.2.5** (both `plugin.json` + `marketplace.json`).
 - This makes `/plugin marketplace add 10CG/nexus-claude-plugin` resolve via the GitHub source exactly like the other 10CG plugins.
 
-#### [TIMESTAMP — submitted] (TBD)
+#### [TIMESTAMP — optional community-catalog listing] (only if pursued)
 
-Template for the actual submission entry:
+Template (shipping does NOT require this — the GitHub repo is already the marketplace):
 ```
-- ✅ Submitted via https://clau.de/plugin-directory-submission
+- ✅ Submitted to anthropics/claude-plugins-community via [verified current channel]
 - Submission URL / reference: [...]
-- Reviewer ETA: per Anthropic
 ```
 
 #### [TIMESTAMP — outcome] (TBD)
