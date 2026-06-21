@@ -2,11 +2,12 @@
   "mcpServers": {
     "nexus": {
       "command": "npx",
-      "args": ["-y", "@nexusm/mcp-server@0.1.3"],
+      "args": ["-y", "@nexusm/mcp-server@0.1.4"],
       "env": {
         "NEXUS_API_URL": "${NEXUS_API_URL}",
         "NEXUS_API_TOKEN": "${NEXUS_API_TOKEN}",
-        "NEXUS_TENANT_ID": "${NEXUS_TENANT_ID}"
+        "NEXUS_TENANT_ID": "${NEXUS_TENANT_ID}",
+        "NEXUS_DEFAULT_USER_ID": "${NEXUS_DEFAULT_USER_ID}"
       }
     }
   }
