@@ -1,5 +1,5 @@
 {
-  "description": "Two fail-open advisory hooks: (1) UserPromptSubmit nudge deterministically steers Claude toward the nexus.memory_create / nexus.context_retrieve MCP tools on cross-session memory write/read intent (lifetime-axis rules shared with skills/nexus-memory/SKILL.md via hooks/rules.json); (2) SessionStart injection warm-starts a fresh session with the project's recent settled summaries (cross-container, provenance-annotated) via context/retrieve. Both are advisory only — never block the prompt or session startup; fail-open exit 0.",
+  "description": "Three fail-open advisory hooks: (1) UserPromptSubmit nudge deterministically steers Claude toward the nexus.memory_create / nexus.context_retrieve MCP tools on cross-session memory write/read intent (lifetime-axis rules shared with skills/nexus-memory/SKILL.md via hooks/rules.json); (2) SessionStart injection warm-starts a fresh session with the project's recent settled summaries (cross-container, provenance-annotated) via context/retrieve; (3) SessionEnd capture distills the session transcript into bounded activities and POSTs them to /activities/stream (P1 write side; backend worker extracts episodic memory keyed user_id=project). All are advisory only — never block the prompt, session startup, or teardown; fail-open exit 0.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -17,6 +17,16 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_inject.py\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_capture.py\""
           }
         ]
       }

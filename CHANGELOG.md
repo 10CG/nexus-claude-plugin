@@ -9,6 +9,45 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-21
+
+### Added
+- **`SessionEnd` activity-capture hook** (`hooks/session_capture.py`, P1 /
+  workflow C): on session end, reads the session transcript, distills it into a
+  bounded activity list, and POSTs to `POST {NEXUS_API_URL}/activities/stream`.
+  The backend Arq worker (`activity_processor.process_activity`) extracts those
+  activities into episodic Memory rows keyed `user_id == agent_id` — the **write
+  side** of the claude-mem "auto-capture (feature a)" replacement, paired with
+  the read-side `session_inject.py` (P2). Live against dev's
+  `/v1/activities/stream` as of **migration 024**.
+  - **Action mapping** (assistant `tool_use` + user text → `ActivityItem.action`
+    enum): `Edit`→`edit_file`, `Write`→`create_file`, `Read`→`read_file`,
+    `Bash 'git commit'`→`commit`, `Bash pytest|jest|'go test'|'npm test'|vitest`
+    →`run_test`, other `Bash`→`command_run`, `Grep`/`Glob`/`Task`/…→`agent_action`,
+    user text→`user_message`. `activity_data` carries `{tool, summary}` (file path
+    or command head ≤200 chars) / `{text}` (≤500 chars).
+  - **agent_id = project slug**: `NEXUS_DEFAULT_USER_ID` else normalized lowercase
+    git-toplevel/cwd basename — IDENTICAL derivation to `session_inject.py` so the
+    captured episodic memory lands on the same `user_id=project` the read side
+    queries.
+  - **Provenance**: every `activity_data` is augmented with `container_id`
+    (`NEXUS_CONTAINER_ID` else hostname) + `branch`
+    (`git -C cwd rev-parse --abbrev-ref HEAD`, omitted on failure) + `session_id`.
+  - **Bounded**: keeps the most-recent `_MAX_ACTIVITIES` (200) extracted
+    activities, well under the `ActivityStreamRequest` 1000 cap.
+  - Mandatory `User-Agent` header (CF 1010 Bot Fight Mode) + `X-API-Key` +
+    `X-Nexus-Source: session-capture-hook`; ~8s timeout. FAIL-OPEN on every path
+    — missing config / no transcript / unreadable file / unreachable backend /
+    timeout / malformed transcript line → exit 0 with no stdout, never blocking
+    teardown. Empty activity list → no request sent. Transcript parsed
+    line-by-line **defensively** (bad/blank/non-dict line skipped, never fatal).
+  - Registered as a `SessionEnd` hook alongside the existing `UserPromptSubmit` +
+    `SessionStart` hooks in `hooks/hooks.json`.
+  - 22 deterministic unit tests (`hooks/test_session_capture.py`): subprocess
+    fail-open coverage + in-process urllib monkeypatch for action-mapping /
+    provenance / agent_id-slug / bad-line-skip / empty→no-POST / cap / non-vacuity
+    (no real backend).
+
 ## [0.3.0] — 2026-06-21
 
 ### Added
