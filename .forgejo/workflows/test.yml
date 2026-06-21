@@ -1,10 +1,14 @@
-# Hook unit tests — mcp-memory-capture-hook (T4, US-037 / FU-MCP-MEMORY-CAPTURE-HOOK)
+# Hook unit tests — nexus-memory plugin hooks
 #
-# Runs on push and pull_request when any of the hook's OWN INPUTS change.
-# The paths filter MUST cover all three inputs (rules.json, memory_capture.py,
-# test_memory_capture.py) so that editing any one of them triggers the gate.
-# Omitting an input from paths means silent escape: a bad rules.json edit
-# would not rerun the parity tests (project lesson: feedback_ci_gate_trigger_must_cover_own_inputs).
+# Covers ALL THREE hooks and their tests:
+#   - memory_capture.py   (UserPromptSubmit nudge, rules.json-driven)
+#   - session_inject.py   (SessionStart warm-start injection, P2 / workflow A)
+#   - session_capture.py  (SessionEnd activity capture, P1 / workflow C)
+#
+# The paths filter MUST cover every hook + its test + shared inputs so that
+# editing any one of them triggers the gate. Omitting an input means silent
+# escape: a bad edit would not rerun its tests
+# (project lesson: feedback_ci_gate_trigger_must_cover_own_inputs).
 #
 # No bashisms used in any step — Forgejo runner defaults to POSIX sh -e {0}.
 # If bashisms are ever needed, add `shell: bash` on that specific step.
@@ -15,13 +19,25 @@ on:
   push:
     paths:
       - hooks/rules.json
+      - hooks/hooks.json
       - hooks/memory_capture.py
       - hooks/test_memory_capture.py
+      - hooks/session_inject.py
+      - hooks/test_session_inject.py
+      - hooks/session_capture.py
+      - hooks/test_session_capture.py
+      - .forgejo/workflows/test.yml
   pull_request:
     paths:
       - hooks/rules.json
+      - hooks/hooks.json
       - hooks/memory_capture.py
       - hooks/test_memory_capture.py
+      - hooks/session_inject.py
+      - hooks/test_session_inject.py
+      - hooks/session_capture.py
+      - hooks/test_session_capture.py
+      - .forgejo/workflows/test.yml
 
 jobs:
   test:
@@ -36,4 +52,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run hook unit tests
-        run: python3 hooks/test_memory_capture.py
+        run: |
+          python3 hooks/test_memory_capture.py
+          python3 hooks/test_session_inject.py
+          python3 hooks/test_session_capture.py
