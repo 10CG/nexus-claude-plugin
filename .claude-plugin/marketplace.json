@@ -8,7 +8,7 @@
     {
       "name": "nexus-memory",
       "description": "Nexus 跨会话记忆插件 - 4个 MCP 工具 (context_retrieve / memory_search / memory_create / memory_feedback) + UserPromptSubmit Hook (确定性写/读路由) + 服务器端 user_id pin (可靠跨会话召回); 聚合上下文 + 时间旅行 as_of 查询 + v5 反馈重排序, 由 @nexusm/mcp-server (npx) 驱动",
-      "version": "0.2.5",
+      "version": "0.3.0",
       "author": {
         "name": "10CG"
       },
