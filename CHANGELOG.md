@@ -9,6 +9,39 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-22
+
+### Changed
+- **`SessionEnd` capture hook — P0 low-signal source filter**
+  (`hooks/session_capture.py`, `_is_low_signal`): low-signal activities are now
+  **SKIPPED before extraction** so the backend LLM extractor never sees
+  navigation/search/read-only noise. C0d evaluation
+  (`docs/qa/nexus-replace-claude-mem-c0c-extraction-quality.md`) measured **88%
+  hallucination** when low-signal activities (bare `Read` / `Grep` / `ls` /
+  `git status`) were fed to the extractor — `glm-4-flash` invented content —
+  dragging the whole extraction quality gate below threshold, while high-signal
+  segments scored **4.45 / 4.73 with 0 hallucination**. Filtering at the source
+  (before `POST /v1/activities/stream`) is the highest-ROI fix and is expected to
+  flip the quality gate to **PASS**.
+  - **Dropped (low-signal)**: `read_file` / `agent_action` (Read / Grep / Glob /
+    Task — pure navigation/search), and read-only `command_run` whose command
+    head is one of `ls cat pwd which echo head tail tree less stat file wc`
+    or `git status|log|diff|show|branch|remote|rev-parse`.
+  - **Kept (high-signal)**: `user_message` / `commit` / `run_test` / `edit_file`
+    / `create_file` / `delete_file` / non-read-only `command_run`
+    (build / deploy / migration, e.g. `alembic upgrade head`).
+  - **Boundary**: any write redirection (`>`, `>>`), pipe (`|`), command
+    chaining/control op (`&&`, `||`, `;`, background `&`), or command
+    substitution (`` ` ``, `$(`) — e.g. `cat > out.txt`, `tee`, `ls | tee log`,
+    `ls && rm -rf dist`, `cat a; alembic upgrade head` — is conservatively
+    treated as NOT read-only and is **kept** (a whitelisted head says nothing
+    about a chained second command; never mis-skip a write disguised as a read).
+    `find` is excluded from the read-only head whitelist entirely because
+    `find . -delete` / `find . -exec rm {} +` mutate the filesystem.
+  - **fail-open**: a predicate error keeps the activity rather than aborting
+    capture; an all-low-signal session yields zero activities → **no POST**
+    (unchanged empty-batch behavior). Provenance / cap / agent_id logic unchanged.
+
 ## [0.4.0] — 2026-06-21
 
 ### Added

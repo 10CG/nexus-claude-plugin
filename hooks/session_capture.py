@@ -20,6 +20,24 @@ Design contract (proposal nexus-replace-claude-mem workflow C):
   - Transcript is JSONL — one message per line. Parsed DEFENSIVELY line-by-line;
     a bad/blank/non-dict line is skipped, never fatal (transcripts can be
     partially written or contain tool-result noise).
+  - P0 LOW-SIGNAL SOURCE FILTER (``_is_low_signal``): low-signal activities are
+    SKIPPED before extraction so the backend LLM extractor never sees them. C0d
+    (``docs/qa/nexus-replace-claude-mem-c0c-extraction-quality.md``) measured 88%
+    hallucination when low-signal activities (bare Read / Grep / ls / git status)
+    were extracted — glm-4-flash invented content — dragging the whole quality
+    gate below threshold while high-signal segments scored 4.45/4.73 with 0
+    hallucination. Dropped: ``read_file`` / ``agent_action`` (Read/Grep/Glob/Task)
+    and read-only ``command_run`` (ls/cat/pwd/which/echo/head/tail/tree/less/
+    stat/file/wc + ``git status|log|diff|show|branch|remote|rev-parse``). Any
+    write redirection (``>``/``>>``), pipe (``|``), command chaining/control op
+    (``&&``/``||``/``;``/``&``), or command substitution (`` ` ``/``$(``) — e.g.
+    ``cat > out.txt`` / ``tee`` / ``ls && rm -rf dist`` — is conservatively NOT
+    read-only and is kept (a whitelisted head says nothing about a chained
+    second command); ``find`` is excluded from the head whitelist entirely
+    (``find . -delete`` mutates). High-signal kept:
+    user_message / commit / run_test / edit_file / create_file / delete_file /
+    non-read-only command_run (build/deploy/migration). The filter is fail-open:
+    a predicate error keeps the activity rather than aborting capture.
   - Activity extraction (bounded — most-recent ``_MAX_ACTIVITIES`` kept, and the
     ActivityStreamRequest schema caps at 1000):
       * assistant message tool_use block -> mapped action via _classify_tool:
@@ -68,9 +86,94 @@ _USER_TEXT_CAP = 500  # max chars of a captured user message
 _TEST_MARKERS = ("pytest", "jest", "go test", "npm test", "vitest")
 
 # Non-mutating / generic tools that collapse to a single coarse action.
+# NOTE: NotebookEdit is deliberately NOT here — it MUTATES a notebook (real
+# work), so it maps to edit_file (high-signal, kept), not agent_action (dropped).
 _AGENT_ACTION_TOOLS = frozenset(
-    {"Grep", "Glob", "Task", "WebFetch", "WebSearch", "TodoWrite", "NotebookEdit"}
+    {"Grep", "Glob", "Task", "WebFetch", "WebSearch", "TodoWrite"}
 )
+
+# ── P0 low-signal source filter (C0d evidence) ──────────────────────────────────
+# C0d (docs/qa/nexus-replace-claude-mem-c0c-extraction-quality.md) measured 88%
+# hallucination when low-signal (navigation/search/read-only) activities were fed
+# to the LLM extractor (glm-4-flash invented content for bare read_file/ls/grep),
+# dragging the whole quality gate below threshold while high-signal segments
+# scored 4.45/4.73 with 0 hallucination. P0 root-cause fix: SKIP low-signal
+# activities at the source — before they ever reach POST /v1/activities/stream
+# (and thus the extractor) — so only high-signal work is captured.
+
+# Actions that are pure navigation / search -> always low-signal (drop).
+_LOW_SIGNAL_ACTIONS = frozenset({"read_file", "agent_action"})
+
+# Read-only command first-words: running these mutates nothing.
+# NOTE: `find` is intentionally NOT in this set — `find . -delete` /
+# `find . -exec rm {} +` mutate the filesystem, and gating it on flag inspection
+# is fragile; dropping `find` entirely is the safe choice (it is low-value
+# navigation, not worth the false-drop-a-write risk). See _is_readonly_command.
+_READONLY_CMD_HEADS = frozenset(
+    {"ls", "cat", "pwd", "which", "echo", "head", "tail",
+     "tree", "less", "stat", "file", "wc"}
+)
+
+# Read-only `git <sub>` subcommands.
+_READONLY_GIT_SUBS = frozenset(
+    {"status", "log", "diff", "show", "branch", "remote", "rev-parse"}
+)
+
+# Shell metacharacters that can chain / substitute / background a SECOND command.
+# A read-only head says nothing about what follows `ls && rm -rf dist` — the
+# mutating half would be silently dropped. Any of these disqualifies the whole
+# command from being treated as read-only (conservative: keep it).
+_CHAIN_OR_REDIRECT_OPS = (">", "|", "&", ";", "`", "$(", "\n")
+
+
+def _is_readonly_command(command):
+    """True iff `command` is a read-only shell command (mutates nothing).
+
+    Conservative on every axis — we would rather over-capture (keep) than drop a
+    command with a write side-effect:
+
+      * Any write redirection (`>`, `>>`), pipe (`|`), command chaining/control
+        operator (`&&`, `||`, `;`, background `&`), command substitution
+        (backtick, `$(`), or embedded newline disqualifies the command. A
+        whitelisted head says NOTHING about a chained second command —
+        `ls && rm -rf dist` / `cat a; alembic upgrade head` must be KEPT, not
+        skipped on the strength of the read-only head alone.
+      * `tee` writes its stdin to a file -> not read-only.
+      * Unknown heads default to NOT read-only (kept).
+    """
+    if not isinstance(command, str):
+        return False
+    # Any chaining / redirection / substitution could hide a write -> not read-only.
+    if any(op in command for op in _CHAIN_OR_REDIRECT_OPS):
+        return False
+    tokens = command.split()
+    if not tokens:
+        return False
+    head = tokens[0]
+    if head == "git":
+        # `git <sub> ...` — read-only only for the whitelisted subcommands.
+        sub = tokens[1] if len(tokens) > 1 else ""
+        return sub in _READONLY_GIT_SUBS
+    if head == "tee":  # `tee` writes its stdin to a file -> not read-only.
+        return False
+    return head in _READONLY_CMD_HEADS
+
+
+def _is_low_signal(action, activity_data):
+    """True iff an activity is low-signal and should be SKIPPED before capture.
+
+    Low-signal (C0d-confirmed extractor noise):
+      - read_file / agent_action (Read / Grep / Glob / Task: pure nav/search).
+      - command_run whose command is read-only (see _is_readonly_command).
+    High-signal (kept): user_message / commit / run_test / edit_file /
+    create_file / delete_file / non-read-only command_run (build/deploy/migration).
+    """
+    if action in _LOW_SIGNAL_ACTIONS:
+        return True
+    if action == "command_run":
+        ad = activity_data if isinstance(activity_data, dict) else {}
+        return _is_readonly_command(ad.get("summary", ""))
+    return False
 
 
 def _normalize_slug(text):
@@ -139,6 +242,8 @@ def _classify_tool(tool, tool_input):
     ti = tool_input if isinstance(tool_input, dict) else {}
     if tool == "Edit":
         return "edit_file", _truncate(ti.get("file_path", ""), _SUMMARY_CAP)
+    if tool == "NotebookEdit":  # mutates a notebook → edit_file (high-signal, kept)
+        return "edit_file", _truncate(ti.get("notebook_path", ""), _SUMMARY_CAP)
     if tool == "Write":
         return "create_file", _truncate(ti.get("file_path", ""), _SUMMARY_CAP)
     if tool == "Read":
@@ -240,6 +345,15 @@ def _parse_transcript(path):
             except Exception:
                 continue  # malformed line -> skip
             for action, ad in _extract_from_entry(entry):
+                # P0: drop low-signal activities at the source so the LLM
+                # extractor never sees navigation/search/read-only noise (C0d:
+                # 88% hallucination on low-signal). fail-open: a buggy predicate
+                # must not abort capture -> on error, KEEP the activity.
+                try:
+                    if _is_low_signal(action, ad):
+                        continue
+                except Exception:
+                    pass
                 extracted.append((action, ad))
     # Bound to the most-recent activities (tail of the session).
     if len(extracted) > _MAX_ACTIVITIES:

@@ -243,11 +243,15 @@ class TestActionMapping(unittest.TestCase):
 
     def test_full_mapping_and_provenance(self):
         """Mixed transcript: Edit / Bash 'git commit' / Read / user text ->
-        edit_file / commit / read_file / user_message, each carrying provenance."""
+        edit_file / commit / user_message, each carrying provenance.
+
+        Note: the Read (read_file) is LOW-SIGNAL (P0 source filter, C0d) and is
+        dropped before the POST — the remaining high-signal activities keep their
+        mapping and provenance."""
         lines = [
             _assistant_tool_use("Edit", {"file_path": "/repo/src/foo.py"}),
             _assistant_tool_use("Bash", {"command": "git commit -m 'feat: x'"}),
-            _assistant_tool_use("Read", {"file_path": "/repo/README.md"}),
+            _assistant_tool_use("Read", {"file_path": "/repo/README.md"}),  # filtered
             _user_text("please refactor the parser to be stricter"),
         ]
         cap = self._capture_activities(lines)
@@ -262,8 +266,8 @@ class TestActionMapping(unittest.TestCase):
         self.assertEqual(body["agent_id"], "nexus")
 
         actions = [a["action"] for a in body["activities"]]
-        self.assertEqual(actions, ["edit_file", "commit", "read_file", "user_message"],
-                         f"action mapping wrong: {actions!r}")
+        self.assertEqual(actions, ["edit_file", "commit", "user_message"],
+                         f"action mapping wrong (read_file should be filtered): {actions!r}")
 
         # Every activity_data carries provenance: container_id + branch + session_id.
         for a in body["activities"]:
@@ -291,8 +295,10 @@ class TestActionMapping(unittest.TestCase):
         self.assertEqual(cap.requests[0][1]["activities"][0]["action"], "run_test")
 
     def test_bash_other_maps_command_run(self):
+        # Use a MUTATING command: `ls -la` is now low-signal (filtered), but the
+        # Bash-other -> command_run classification must still hold for real work.
         cap = self._capture_activities(
-            [_assistant_tool_use("Bash", {"command": "ls -la /tmp"})])
+            [_assistant_tool_use("Bash", {"command": "alembic upgrade head"})])
         self.assertEqual(cap.requests[0][1]["activities"][0]["action"], "command_run")
 
     def test_write_maps_create_file(self):
@@ -301,14 +307,15 @@ class TestActionMapping(unittest.TestCase):
         self.assertEqual(cap.requests[0][1]["activities"][0]["action"], "create_file")
 
     def test_grep_maps_agent_action(self):
-        cap = self._capture_activities(
-            [_assistant_tool_use("Grep", {"pattern": "foo"})])
-        self.assertEqual(cap.requests[0][1]["activities"][0]["action"], "agent_action")
+        # Grep -> agent_action is the correct classification; agent_action is
+        # LOW-SIGNAL (P0 filter) so it never reaches the POST. Assert the
+        # classifier directly (mapping intent) — filtering is covered separately.
+        action, _ = _MOD._classify_tool("Grep", {"pattern": "foo"})
+        self.assertEqual(action, "agent_action")
 
     def test_task_maps_agent_action(self):
-        cap = self._capture_activities(
-            [_assistant_tool_use("Task", {"description": "do a thing"})])
-        self.assertEqual(cap.requests[0][1]["activities"][0]["action"], "agent_action")
+        action, _ = _MOD._classify_tool("Task", {"description": "do a thing"})
+        self.assertEqual(action, "agent_action")
 
     def test_activity_data_carries_tool_and_summary(self):
         cap = self._capture_activities(
@@ -460,6 +467,154 @@ class TestCap(unittest.TestCase):
         n = len(cap.requests[0][1]["activities"])
         self.assertLessEqual(n, 1000, "must not exceed ActivityStreamRequest max_length")
         self.assertLessEqual(n, _MOD._MAX_ACTIVITIES, "must honor the local cap")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class LowSignalFilter — P0: source-filter low-signal activities BEFORE extraction
+# so the LLM extractor never sees navigation/search noise (C0d: 88% hallucination
+# on low-signal activities; see docs/qa/nexus-replace-claude-mem-c0c-extraction-
+# quality.md). High-signal activities are fully preserved.
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestLowSignalHelper(unittest.TestCase):
+    """Unit-test the _is_low_signal predicate directly."""
+
+    def _low(self, action, ad=None):
+        return _MOD._is_low_signal(action, ad or {})
+
+    # ── low-signal (skip) ────────────────────────────────────────────────────
+    def test_read_file_is_low_signal(self):
+        self.assertTrue(self._low("read_file", {"tool": "Read", "summary": "/a/b.py"}))
+
+    def test_agent_action_is_low_signal(self):
+        self.assertTrue(self._low("agent_action", {"tool": "Grep"}))
+        self.assertTrue(self._low("agent_action", {"tool": "Glob"}))
+        self.assertTrue(self._low("agent_action", {"tool": "Task"}))
+
+    def test_readonly_command_run_is_low_signal(self):
+        for cmd in ("ls -la /tmp", "cat foo.py", "pwd",
+                    "which python3", "echo hi", "head -5 f", "tail f",
+                    "tree src", "stat f", "wc -l f", "less f", "file f"):
+            self.assertTrue(self._low("command_run", {"summary": cmd}),
+                            f"{cmd!r} should be low-signal (read-only)")
+
+    def test_readonly_git_subcommand_is_low_signal(self):
+        for cmd in ("git status", "git log --oneline", "git diff HEAD",
+                    "git show abc123", "git branch -a", "git remote -v",
+                    "git rev-parse HEAD"):
+            self.assertTrue(self._low("command_run", {"summary": cmd}),
+                            f"{cmd!r} should be low-signal (read-only git)")
+
+    # ── high-signal (keep) ───────────────────────────────────────────────────
+    def test_high_signal_actions_preserved(self):
+        for action in ("user_message", "commit", "run_test", "edit_file",
+                       "create_file", "delete_file"):
+            self.assertFalse(self._low(action, {"summary": "x"}),
+                             f"{action!r} must be high-signal (keep)")
+
+    def test_mutating_command_run_preserved(self):
+        for cmd in ("alembic upgrade head", "docker-compose up -d",
+                    "make build", "npm run build", "rm -rf dist",
+                    "uv sync"):
+            self.assertFalse(self._low("command_run", {"summary": cmd}),
+                             f"{cmd!r} must be high-signal (mutating)")
+
+    # ── boundary: write redirections / pipes are NOT read-only ───────────────
+    def test_write_redirect_not_low_signal(self):
+        for cmd in ("cat > out.txt", "cat >> out.txt", "echo hi > f",
+                    "tee f", "ls | tee log", "cat a | sort > b"):
+            self.assertFalse(self._low("command_run", {"summary": cmd}),
+                             f"{cmd!r} has write redirect/pipe -> must be kept")
+
+    # ── boundary: command chaining / substitution hides a mutating 2nd command ─
+    # A read-only HEAD says nothing about what a `&&`/`;`/`&`/backtick/$()
+    # chained command does — those must be KEPT, never dropped on the head alone.
+    def test_command_chaining_not_low_signal(self):
+        for cmd in ("ls && rm -rf dist", "ls -la && rm x",
+                    "cat a; alembic upgrade head", "git status; git commit -m x",
+                    "echo hi || make build", "ls & sleep 1",
+                    "echo `rm -rf x`", "cat $(rm -rf x)",
+                    "git log\nrm -rf dist"):
+            self.assertFalse(self._low("command_run", {"summary": cmd}),
+                             f"{cmd!r} chains a 2nd command -> must be kept")
+
+    # ── boundary: read-only head with a MUTATING flag (find -delete/-exec) ────
+    # `find` is excluded from the head whitelist entirely (its destructive flags
+    # `-delete`/`-exec rm` make head-only inspection unsound), so any `find ...`
+    # is high-signal and kept.
+    def test_find_not_low_signal(self):
+        for cmd in ("find . -name x", "find . -delete",
+                    "find . -exec rm {} +", "find /tmp -type f"):
+            self.assertFalse(self._low("command_run", {"summary": cmd}),
+                             f"{cmd!r} (find) must be kept — head whitelist excludes find")
+
+
+class TestLowSignalFiltering(unittest.TestCase):
+    """End-to-end: low-signal activities are filtered from the POST body."""
+
+    def setUp(self):
+        os.environ["NEXUS_API_URL"] = "https://nexus.example/v1"
+        os.environ["NEXUS_DEFAULT_USER_ID"] = "nexus"
+        os.environ["NEXUS_CONTAINER_ID"] = "dev-claude-308"
+
+    def tearDown(self):
+        for k in ("NEXUS_API_URL", "NEXUS_DEFAULT_USER_ID", "NEXUS_CONTAINER_ID"):
+            os.environ.pop(k, None)
+
+    def _capture(self, lines, cwd=None):
+        path = _write_transcript(lines)
+        try:
+            cap, _ = _run_main_capturing(
+                _MOD, {"transcript_path": path, "cwd": cwd or _HOOKS_DIR,
+                       "session_id": "sess-low"})
+        finally:
+            os.unlink(path)
+        return cap
+
+    def test_low_signal_filtered_high_signal_kept(self):
+        """Mixed transcript: low-signal (Read/Grep/ls/git status) dropped;
+        high-signal (user text / git commit / pytest / Edit / alembic) kept."""
+        lines = [
+            _user_text("please refactor the parser"),       # keep
+            _assistant_tool_use("Read", {"file_path": "/r/a.py"}),       # drop
+            _assistant_tool_use("Grep", {"pattern": "foo"}),            # drop
+            _assistant_tool_use("Bash", {"command": "ls -la"}),        # drop
+            _assistant_tool_use("Bash", {"command": "git status"}),    # drop
+            _assistant_tool_use("Bash", {"command": "git commit -m x"}),  # keep
+            _assistant_tool_use("Bash", {"command": "uv run pytest"}),  # keep
+            _assistant_tool_use("Edit", {"file_path": "/r/a.py"}),      # keep
+            _assistant_tool_use("Bash", {"command": "alembic upgrade head"}),  # keep
+        ]
+        cap = self._capture(lines)
+        self.assertEqual(len(cap.requests), 1)
+        actions = [a["action"] for a in cap.requests[0][1]["activities"]]
+        self.assertEqual(
+            actions,
+            ["user_message", "commit", "run_test", "edit_file", "command_run"],
+            f"low-signal must be dropped, high-signal kept: {actions!r}")
+
+    def test_write_redirect_command_kept(self):
+        """Boundary: `cat > out.txt` is a write -> must NOT be filtered out."""
+        cap = self._capture(
+            [_assistant_tool_use("Bash", {"command": "cat > out.txt"})])
+        self.assertEqual(len(cap.requests), 1)
+        actions = [a["action"] for a in cap.requests[0][1]["activities"]]
+        self.assertEqual(actions, ["command_run"],
+                         "write-redirect command_run must be kept")
+
+    def test_all_low_signal_session_no_post(self):
+        """A session of only navigation/search/read-only -> zero activities -> NO POST."""
+        lines = [
+            _assistant_tool_use("Read", {"file_path": "/r/a.py"}),
+            _assistant_tool_use("Grep", {"pattern": "foo"}),
+            _assistant_tool_use("Glob", {"pattern": "*.py"}),
+            _assistant_tool_use("Bash", {"command": "ls -la"}),
+            _assistant_tool_use("Bash", {"command": "git status"}),
+            _assistant_tool_use("Bash", {"command": "cat README.md"}),
+        ]
+        cap = self._capture(lines)
+        self.assertEqual(len(cap.requests), 0,
+                         "all-low-signal session must NOT POST")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
