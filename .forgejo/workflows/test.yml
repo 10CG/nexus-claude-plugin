@@ -1,14 +1,32 @@
 # Hook unit tests — nexus-memory plugin hooks
 #
-# Covers ALL THREE hooks and their tests:
-#   - memory_capture.py   (UserPromptSubmit nudge, rules.json-driven)
-#   - session_inject.py   (SessionStart warm-start injection, P2 / workflow A)
-#   - session_capture.py  (SessionEnd activity capture, P1 / workflow C)
+# Both the trigger and the test run are GLOBS, deliberately. They used to be
+# two hand-maintained enumerations — nine `paths:` entries and three
+# `python3 hooks/test_X.py` lines — and a hand-maintained list of inputs is a
+# gate that silently stops covering whatever you add next: the file lands, CI
+# stays green, and its tests never ran. That has already happened in this repo
+# once: session_capture.py and its 34 tests were added in a498c88 / 4bca7a4
+# and did not trigger this workflow, because the enumeration had not been
+# extended yet. (Same shape as 10CG/nexus#442; project lesson
+# feedback_ci_gate_trigger_must_cover_own_inputs.)
 #
-# The paths filter MUST cover every hook + its test + shared inputs so that
-# editing any one of them triggers the gate. Omitting an input means silent
-# escape: a bad edit would not rerun its tests
-# (project lesson: feedback_ci_gate_trigger_must_cover_own_inputs).
+# Everything the tests read lives under hooks/ — every path in hooks/*.py is
+# anchored on __file__, none escapes the directory — so `hooks/**` is the
+# complete input set, plus this workflow itself.
+#
+# ⚠️ The hard part is not globbing, it is that `unittest discover` REPORTS
+# SUCCESS WHILE SKIPPING FILES. It does that in at least three ways, each of
+# which leaves a test file sitting in the repo that never runs:
+#   - a test file in a subdirectory that has no __init__.py (not recursed into)
+#   - a filename that is not a valid module name, e.g. test_foo-bar.py
+#   - a file whose tests were renamed, commented out, or no longer subclass
+#     TestCase ("Ran 0 tests" still exits 0)
+# Counting files on disk does not catch any of these — the count is right and
+# the tests still did not run. So the gate below compares the two sets
+# directly: every test_*.py on disk must contribute at least one test (or an
+# import error) to the loaded suite, or the job fails and names the file.
+# Verified by injection: all three forms above exit 0 under a bare
+# `unittest discover` and exit 1 here.
 #
 # No bashisms used in any step — Forgejo runner defaults to POSIX sh -e {0}.
 # If bashisms are ever needed, add `shell: bash` on that specific step.
@@ -18,34 +36,26 @@ name: hook-tests
 on:
   push:
     paths:
-      - hooks/rules.json
-      - hooks/hooks.json
-      - hooks/memory_capture.py
-      - hooks/test_memory_capture.py
-      - hooks/session_inject.py
-      - hooks/test_session_inject.py
-      - hooks/session_capture.py
-      - hooks/test_session_capture.py
+      - hooks/**
       - .forgejo/workflows/test.yml
   pull_request:
     paths:
-      - hooks/rules.json
-      - hooks/hooks.json
-      - hooks/memory_capture.py
-      - hooks/test_memory_capture.py
-      - hooks/session_inject.py
-      - hooks/test_session_inject.py
-      - hooks/session_capture.py
-      - hooks/test_session_capture.py
+      - hooks/**
       - .forgejo/workflows/test.yml
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 156 tests take ~9s; anything near this bound is a hung subprocess, not
+    # slowness. test_memory_capture.py alone spawns ~100 of them.
+    timeout-minutes: 10
     container:
       # node:20-bookworm (not python:*-slim): slim images lack git + node, so
       # the JS-based actions/checkout@v4 fails before tests run. This image has
       # git + node + python3 (3.11) — same proven image family as mirror.yml.
+      #
+      # unittest is stdlib, so discovery needs no install step and no
+      # cross-border package fetch (this org has lost CI runs to those).
       image: node:20-bookworm
     steps:
       - name: Checkout
@@ -53,6 +63,50 @@ jobs:
 
       - name: Run hook unit tests
         run: |
-          python3 hooks/test_memory_capture.py
-          python3 hooks/test_session_inject.py
-          python3 hooks/test_session_capture.py
+          python3 - <<'PY'
+          import pathlib
+          import sys
+          import unittest
+
+          ROOT = "hooks"
+
+
+          def walk(suite):
+              for t in suite:
+                  if isinstance(t, unittest.TestSuite):
+                      yield from walk(t)
+                  else:
+                      yield t
+
+
+          root = pathlib.Path(ROOT)
+          on_disk = sorted(p for p in root.rglob("test_*.py"))
+          if not on_disk:
+              sys.exit(f"ERROR: no {ROOT}/**/test_*.py on disk")
+
+          suite = unittest.defaultTestLoader.discover(ROOT, pattern="test_*.py")
+          tests = list(walk(suite))
+          ids = [t.id() for t in tests]
+
+          print(f"test files on disk : {len(on_disk)}")
+          for p in on_disk:
+              print(f"    {p}")
+          print(f"tests collected    : {len(tests)}")
+
+          # An import failure becomes a _FailedTest carrying the module name,
+          # so it counts as "contributed" and fails below as a red test rather
+          # than being mistaken for a skipped file.
+          silent = [p for p in on_disk if not any(p.stem in i for i in ids)]
+          if silent:
+              print(
+                  "\nERROR: these files contributed no tests — discover skipped "
+                  "them, or they no longer contain any:",
+                  file=sys.stderr,
+              )
+              for p in silent:
+                  print(f"    {p}", file=sys.stderr)
+              sys.exit(1)
+
+          ok = unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
+          sys.exit(0 if ok else 1)
+          PY
