@@ -171,21 +171,44 @@ class TestStateRoundTrip(_TempStateDir):
 
 
 class TestFailureLegs(_TempStateDir):
-    def test_readonly_dir_does_not_lose_the_run(self):
-        """Read-only state dir: the ledger write complains and returns.
+    def test_unwritable_state_dir_does_not_lose_the_run(self):
+        """A failing ledger write complains and returns instead of raising.
 
         By the time a hook records its run the remote work is done; raising
         here would turn a local bookkeeping problem into a lost run.
+
+        The failure is injected rather than produced with chmod 0o500,
+        because CI runs as root in the container and root bypasses directory
+        permission checks (CAP_DAC_OVERRIDE). The permission version exercised
+        this leg locally at uid 1000 and did nothing in CI. Injecting the
+        OSError pins the same contract at any uid.
+        """
+        with mock.patch.object(
+            _hook_state, "_atomic_write", side_effect=OSError("read-only fs")
+        ) as write, mock.patch("sys.stderr") as stderr:
+            entry = _hook_state.record_run("demo", ok=True, cwd=self.cwd)
+        self.assertTrue(write.called, "the failing write must actually be reached")
+        self.assertEqual(entry["hook"], "demo")  # returned, not raised
+        self.assertTrue(stderr.write.called, "the failure must reach stderr")
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("ledger", printed)
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    def test_readonly_dir_is_the_real_shape_of_that_failure(self):
+        """The same contract through a genuinely unwritable directory.
+
+        Skipped as root -- which is exactly why the injected version above
+        exists. This one is the evidence that a read-only directory really does
+        raise the OSError the other test injects, so the injection is not
+        testing a failure mode that cannot happen.
         """
         os.makedirs(_hook_state.project_dir(self.cwd), exist_ok=True)
         os.chmod(_hook_state.project_dir(self.cwd), 0o500)
         self.addCleanup(os.chmod, _hook_state.project_dir(self.cwd), 0o700)
         with mock.patch("sys.stderr") as stderr:
             entry = _hook_state.record_run("demo", ok=True, cwd=self.cwd)
-        self.assertEqual(entry["hook"], "demo")  # returned, not raised
+        self.assertEqual(entry["hook"], "demo")
         self.assertTrue(stderr.write.called, "the failure must reach stderr")
-        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
-        self.assertIn("ledger", printed)
 
     def test_flock_failure_is_reported_not_swallowed(self):
         """A lock that silently stops locking is worse than no lock: the
