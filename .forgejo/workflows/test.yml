@@ -1,14 +1,24 @@
 # Hook unit tests — nexus-memory plugin hooks
 #
-# Covers ALL THREE hooks and their tests:
-#   - memory_capture.py   (UserPromptSubmit nudge, rules.json-driven)
-#   - session_inject.py   (SessionStart warm-start injection, P2 / workflow A)
-#   - session_capture.py  (SessionEnd activity capture, P1 / workflow C)
+# Both the trigger and the test run are GLOBS, deliberately. They used to be
+# two hand-maintained enumerations — nine `paths:` entries and three
+# `python3 hooks/test_X.py` lines — and a hand-maintained list of inputs is a
+# gate that silently stops covering whatever you add next: the file lands, CI
+# stays green, and its tests never ran (10CG/nexus#442 is the same shape; see
+# also the project lesson feedback_ci_gate_trigger_must_cover_own_inputs).
+# The structured-ingestion change adds ~10 files under hooks/, none of which
+# would have been in either list.
 #
-# The paths filter MUST cover every hook + its test + shared inputs so that
-# editing any one of them triggers the gate. Omitting an input means silent
-# escape: a bad edit would not rerun its tests
-# (project lesson: feedback_ci_gate_trigger_must_cover_own_inputs).
+# Everything the tests read lives under hooks/ (verified: no test or hook
+# module references a path outside it), so `hooks/**` is the complete input
+# set, plus this workflow itself.
+#
+# ⚠️ `python3 -m unittest discover` exits 0 on "Ran 0 tests". A glob that stops
+# matching — directory renamed, files moved — would therefore report success
+# with nothing executed, which is the exact failure this file is meant to
+# remove, reintroduced one level up. Hence the count guard below: it fails
+# closed when the glob finds nothing, and prints the count so the CI log shows
+# how many test files actually ran.
 #
 # No bashisms used in any step — Forgejo runner defaults to POSIX sh -e {0}.
 # If bashisms are ever needed, add `shell: bash` on that specific step.
@@ -18,25 +28,11 @@ name: hook-tests
 on:
   push:
     paths:
-      - hooks/rules.json
-      - hooks/hooks.json
-      - hooks/memory_capture.py
-      - hooks/test_memory_capture.py
-      - hooks/session_inject.py
-      - hooks/test_session_inject.py
-      - hooks/session_capture.py
-      - hooks/test_session_capture.py
+      - hooks/**
       - .forgejo/workflows/test.yml
   pull_request:
     paths:
-      - hooks/rules.json
-      - hooks/hooks.json
-      - hooks/memory_capture.py
-      - hooks/test_memory_capture.py
-      - hooks/session_inject.py
-      - hooks/test_session_inject.py
-      - hooks/session_capture.py
-      - hooks/test_session_capture.py
+      - hooks/**
       - .forgejo/workflows/test.yml
 
 jobs:
@@ -46,13 +42,26 @@ jobs:
       # node:20-bookworm (not python:*-slim): slim images lack git + node, so
       # the JS-based actions/checkout@v4 fails before tests run. This image has
       # git + node + python3 (3.11) — same proven image family as mirror.yml.
+      #
+      # unittest is stdlib, so discovery needs no install step and no
+      # cross-border package fetch (this org has lost CI runs to those).
       image: node:20-bookworm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run hook unit tests
+      - name: Count test files (fail closed if the glob matches nothing)
         run: |
-          python3 hooks/test_memory_capture.py
-          python3 hooks/test_session_inject.py
-          python3 hooks/test_session_capture.py
+          count=$(find hooks -maxdepth 1 -name 'test_*.py' | wc -l)
+          echo "hooks/test_*.py on disk: $count"
+          find hooks -maxdepth 1 -name 'test_*.py' | sort
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: no hooks/test_*.py found — refusing to report success" >&2
+            exit 1
+          fi
+
+      - name: Run hook unit tests
+        # -v lists every test, so the log shows what ran rather than just a
+        # count. A module that fails to import becomes an error test here, so
+        # an unimportable new hook test fails the job instead of vanishing.
+        run: python3 -m unittest discover -s hooks -p 'test_*.py' -v
