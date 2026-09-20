@@ -40,8 +40,12 @@ import subprocess
 # Aria uuids are hex fragments (8 chars today); full uuids are accepted so a
 # future widening does not read as a format violation. Hostnames and labels
 # are not -- which is the entire point, see owner_container_uuid.
+# The two shapes aria emits: an 8-hex fragment (today) or a full uuid. NOT a
+# general "8 to 32 hex chars" -- that also accepts `deadbeef`, `cafebabe` and
+# docker's 12-hex default hostname, each of which would sail through as a
+# comparable identity and land back in the silent `not_owner` case.
 _UUID_SHAPED = re.compile(
-    r"^[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}$|^[0-9a-f]{8,32}$"
+    r"^[0-9a-f]{8}$|^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$"
 )
 
 ARIA_CONTAINER_ID_FILE = "~/.aria/container-id"
@@ -105,7 +109,13 @@ def aria_uuid(path=None):
         # cannot match the prefix below. An explicit skip here would be a dead
         # branch that reads as protection.
         if stripped.startswith("uuid:"):
-            value = stripped[len("uuid:"):].strip()
+            value = stripped[len("uuid:"):].strip().lower()
+            # Lowercased because owner_container_uuid lowercases the other
+            # half. Leaving this one as-is revives exactly the C1 failure from
+            # the local side: `uuid: BFE8285D` (macOS uuidgen emits uppercase)
+            # would never equal the document's lowercased value, the owner
+            # check would be merely false, and ingestion would stop under
+            # `not_owner` -- an expected skip that is never reported.
             return value or None
     return None
 

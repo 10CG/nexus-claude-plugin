@@ -61,7 +61,10 @@ class _TempStateDir(unittest.TestCase):
         stray = []
         for base, _dirs, files in os.walk(self.home):
             stray.extend(os.path.join(base, f) for f in files)
-        assert not stray, f"wrote outside the override: {stray}"
+        # self.assertFalse, not a bare assert: `python3 -O` strips assert
+        # statements, and a guard that silently disappears does not belong in
+        # a file whose subject is things silently disappearing.
+        self.assertFalse(stray, f"wrote outside the override: {stray}")
 
 
 class TestLedgerRotation(_TempStateDir):
@@ -274,6 +277,19 @@ class TestFailureLegs(_TempStateDir):
         data, _ = _hook_state.read_state("memory-sync", self.cwd)
         self.assertEqual(data, {"cursor": 1})
 
+    def test_ledger_lock_degradation_is_recorded(self):
+        """The ledger carries the whole visibility baseline.
+
+        An earlier revision computed the lock reasons here and dropped them,
+        so on an NFS home -- the case `lock_unavailable` exists for -- every
+        ledger write ran unlocked and nothing ever said so.
+        """
+        with mock.patch.object(_hook_state.fcntl, "flock", side_effect=OSError("no locks")):
+            entry = _hook_state.record_run("demo", ok=True, reason="unchanged", cwd=self.cwd)
+        self.assertEqual(entry["reason"], "lock_unavailable")
+        entries, _ = _hook_state.read_ledger("demo", self.cwd)
+        self.assertEqual(entries[-1]["reason"], "lock_unavailable")
+
     def test_lock_unavailable_is_a_failure_reason(self):
         self.assertTrue(_hook_state.is_failure_reason("lock_unavailable"))
 
@@ -368,8 +384,16 @@ class TestConcurrency(_TempStateDir):
         )
         return subprocess.Popen([sys.executable, "-c", code])
 
-    def test_record_run_blocks_while_the_ledger_lock_is_held(self):
-        # seed the ledger so the directory and lock file exist
+    def test_the_ledger_lock_spans_the_read(self):
+        """Not just that a lock exists -- that the read is inside it.
+
+        Asserting only "the child blocks" passes even when the read sits
+        outside the lock, because the child still has to acquire it to write.
+        So: while holding the lock, add a third entry. A child that read the
+        ledger before waiting will write back a copy that predates it, and the
+        third entry disappears -- which is the original defect, and is what a
+        second SessionEnd for the same session does in real life.
+        """
         _hook_state.record_run("demo", ok=True, reason="unchanged", cwd=self.cwd)
         lock_path = _hook_state.ledger_path("demo", self.cwd) + ".lock"
 
@@ -378,12 +402,17 @@ class TestConcurrency(_TempStateDir):
         fcntl.flock(fd, fcntl.LOCK_EX)
 
         child = self._spawn_record_run("demo", "timeout")
-        try:
-            with self.assertRaises(subprocess.TimeoutExpired):
-                child.wait(timeout=2)  # must still be blocked on the lock
-        except AssertionError:
-            child.kill()
-            raise
+        self.addCleanup(child.kill)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            child.wait(timeout=2)  # blocked, so its read has not happened yet
+
+        # Written directly rather than via record_run: this process already
+        # holds the file's flock, and flock is per open file description, so
+        # record_run would block taking it again against itself.
+        path = _hook_state.ledger_path("demo", self.cwd)
+        existing, _ = _hook_state.read_ledger("demo", self.cwd)
+        existing.append({"hook": "demo", "ok": True, "reason": "peer_absent"})
+        _hook_state._atomic_write(path, json.dumps(existing, ensure_ascii=False))
         fcntl.flock(fd, fcntl.LOCK_UN)
         self.assertEqual(child.wait(timeout=30), 0)
 
@@ -391,8 +420,9 @@ class TestConcurrency(_TempStateDir):
         self.assertEqual(reasons, [])
         self.assertEqual(
             sorted(e["reason"] for e in entries),
-            ["timeout", "unchanged"],
-            "both runs must survive once the lock is released",
+            ["peer_absent", "timeout", "unchanged"],
+            "the entry written while the child waited was overwritten: the "
+            "child read the ledger before taking the lock",
         )
 
 
@@ -434,16 +464,73 @@ class TestUpdateState(_TempStateDir):
             f"_hook_state.update_state('sync', {self.cwd!r}, lambda s: dict(s, cursor=9))\n"
         )
         child = subprocess.Popen([sys.executable, "-c", code])
-        try:
-            with self.assertRaises(subprocess.TimeoutExpired):
-                child.wait(timeout=2)
-        except AssertionError:
-            child.kill()
-            raise
+        self.addCleanup(child.kill)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            child.wait(timeout=2)  # blocked, so its read has not happened yet
+
+        # Set another key while the child waits. A child that read before
+        # waiting writes back a state without it -- a lost update, which is
+        # what read_state + write_state does and what this primitive exists to
+        # prevent. Asserting only "the child eventually wins" cannot see it.
+        # Direct write: this process holds the flock, and write_state would
+        # block taking it again against itself (flock is per open file
+        # description, not reentrant).
+        _hook_state._atomic_write(
+            _hook_state.state_path("sync", self.cwd),
+            json.dumps({"cursor": 0, "marker": "set-while-locked"}),
+        )
         fcntl.flock(fd, fcntl.LOCK_UN)
         self.assertEqual(child.wait(timeout=30), 0)
         data, _ = _hook_state.read_state("sync", self.cwd)
         self.assertEqual(data["cursor"], 9)
+        self.assertEqual(
+            data.get("marker"),
+            "set-while-locked",
+            "the child read the state before taking the lock and lost the update",
+        )
+
+    def test_mutation_returning_non_dict_leaves_state_intact(self):
+        """`lambda s: s.update(...)` returns None.
+
+        Writing it put `null` on disk -- destroying the cursor and the
+        container_id the identity guard reads -- while the run recorded as
+        clean, and the damage surfaced one run later as an `unknown` with
+        nothing pointing at its cause.
+        """
+        _hook_state.write_state("sync", {"cursor": 42, "container_id": "bfe8285d"}, self.cwd)
+        with mock.patch("sys.stderr") as stderr:
+            data, reasons = _hook_state.update_state(
+                "sync", self.cwd, lambda s: s.update({"cursor": 43})
+            )
+        self.assertIn("state_write_failed", reasons)
+        self.assertEqual(data, {"cursor": 42, "container_id": "bfe8285d"})
+        on_disk, _ = _hook_state.read_state("sync", self.cwd)
+        self.assertEqual(on_disk, {"cursor": 42, "container_id": "bfe8285d"})
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("NoneType", printed)
+
+    def test_mutation_raising_does_not_reach_the_blanket_handler(self):
+        """A caller bug must not delete the run.
+
+        read_state returns {} for a corrupt file, so a mutate written as
+        `s["cursor"] + 1` raises on the first run after corruption -- and
+        propagating would hit `except Exception: pass` + exit(0) upstream.
+        """
+        _hook_state.write_state("sync", {"cursor": 1}, self.cwd)
+        with mock.patch("sys.stderr") as stderr:
+            data, reasons = _hook_state.update_state("sync", self.cwd, lambda s: s["missing"])
+        self.assertIn("unknown", reasons)
+        self.assertEqual(data, {"cursor": 1})
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("KeyError", printed)
+
+    def test_write_state_refuses_a_non_dict(self):
+        _hook_state.write_state("sync", {"cursor": 1}, self.cwd)
+        with mock.patch("sys.stderr"):
+            reasons = _hook_state.write_state("sync", None, self.cwd)
+        self.assertEqual(reasons, ["state_write_failed"])
+        on_disk, _ = _hook_state.read_state("sync", self.cwd)
+        self.assertEqual(on_disk, {"cursor": 1})
 
     def test_write_failure_returns_a_reason_and_the_on_disk_value(self):
         _hook_state.write_state("sync", {"cursor": 3}, self.cwd)
@@ -486,8 +573,16 @@ class TestProjectDirSource(_TempStateDir):
         kept all 199 tests green.
         """
         self.slug.reset_mock()
-        _hook_state.project_dir("/some/where")
+        self.slug.return_value = "sentinel-slug"
+        result = _hook_state.project_dir("/some/where")
         self.slug.assert_called_once_with("/some/where")
+        # The return value has to be what keys the directory. Asserting only
+        # the call passes when project_dir calls project_slug, throws the
+        # answer away, and derives its own -- which is the drift this pins.
+        self.assertTrue(
+            result.endswith("sentinel-slug"),
+            f"project_dir ignored project_slug's answer: {result}",
+        )
 
     def test_ledger_and_state_share_that_directory(self):
         self.assertEqual(
@@ -540,6 +635,25 @@ class TestWorstReason(_TempStateDir):
 
     def test_skip_only_keeps_the_first(self):
         self.assertEqual(_hook_state.worst_reason(["unchanged", "not_owner"]), "unchanged")
+
+    def test_state_write_failed_outranks_lock_unavailable(self):
+        """Both appear together on a read-only directory.
+
+        First-wins reported "could not lock" for "nothing was persisted" -- in
+        the very scenario state_write_failed was added for.
+        """
+        self.assertEqual(
+            _hook_state.worst_reason(["lock_unavailable", "state_write_failed"]),
+            "state_write_failed",
+        )
+        self.assertEqual(
+            _hook_state.worst_reason(["state_write_failed", "lock_unavailable"]),
+            "state_write_failed",
+        )
+
+    def test_a_bare_string_is_not_iterated_per_character(self):
+        """`worst_reason("timeout")` used to return "t"."""
+        self.assertEqual(_hook_state.worst_reason("timeout"), "timeout")
 
 
 class TestStateAtomicity(_TempStateDir):

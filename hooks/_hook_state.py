@@ -97,6 +97,17 @@ NO_REASON = "none"
 ALL_REASONS = FAILURE_REASONS | SKIP_REASONS | {NO_REASON}
 
 
+# Checked in order when a run produced several failures. Everything not
+# listed keeps its given order behind these.
+_REASON_PRIORITY = (
+    "state_write_failed",  # nothing was persisted: outranks how it failed
+    "ingest_disabled",
+    "http_error",
+    "rate_limited",
+    "timeout",
+)
+
+
 def is_failure_reason(reason):
     """True when a reason must be surfaced at the next SessionStart."""
     return reason in FAILURE_REASONS
@@ -111,12 +122,22 @@ def worst_reason(reasons):
     each hook would pick its own and some would drop the failure. Failures win;
     among failures, the first given wins.
     """
+    if isinstance(reasons, str):  # a bare string would iterate per character
+        reasons = [reasons]
     reasons = [r for r in (reasons or []) if r and r != NO_REASON]
     if not reasons:
         return NO_REASON
-    for reason in reasons:
-        if is_failure_reason(reason):
-            return reason
+    failures = [r for r in reasons if is_failure_reason(r)]
+    if failures:
+        # Ordered, not first-wins. A read-only directory produces both
+        # lock_unavailable (the lock file could not be opened) and
+        # state_write_failed (the write itself failed), and reporting "could
+        # not lock" for "nothing was persisted" describes the wrong problem --
+        # in precisely the scenario state_write_failed was added for.
+        for preferred in _REASON_PRIORITY:
+            if preferred in failures:
+                return preferred
+        return failures[0]
     return reasons[0]
 
 
@@ -256,7 +277,13 @@ def record_run(hook, ok, reason=NO_REASON, elapsed_ms=None, calls=0, cwd=None, e
     try:
         lock_reasons = []
         with _locked(path, lock_reasons):
-            entries, _ = read_ledger(hook, cwd)
+            entries, read_reasons = read_ledger(hook, cwd)
+            # A degraded lock on THIS path has to be reported: the ledger is
+            # what the whole visibility baseline is carried in, and a lock that
+            # silently stopped locking leaves the concurrency assumption
+            # reading as satisfied. Earlier revisions computed lock_reasons
+            # here and dropped them.
+            entry["reason"] = worst_reason([entry["reason"], *lock_reasons, *read_reasons])
             entries.append(entry)
             _atomic_write(path, json.dumps(entries[-LEDGER_LIMIT:], ensure_ascii=False))
     except OSError as exc:
@@ -300,6 +327,9 @@ def write_state(name, data, cwd):
     """
     reasons = []
     path = state_path(name, cwd)
+    if not isinstance(data, dict):
+        print(f"[{name}] refusing to write {type(data).__name__} as state", file=sys.stderr)
+        return ["state_write_failed"]
     try:
         with _locked(path, reasons):
             _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
@@ -326,7 +356,25 @@ def update_state(name, cwd, mutate):
         with _locked(path, reasons):
             current, read_reasons = read_state(name, cwd)
             reasons.extend(read_reasons)
-            new = mutate(dict(current))
+            try:
+                new = mutate(dict(current))
+            except Exception as exc:  # noqa: BLE001 - caller bug, not ours
+                # Propagating would reach the hooks' blanket handler and delete
+                # the run, which is the failure C3 was about.
+                print(f"[{name}] state mutation raised: {exc!r}", file=sys.stderr)
+                return current, reasons + ["unknown"]
+            if not isinstance(new, dict):
+                # `lambda s: s.update(...)` returns None. Writing it would put
+                # `null` on disk -- destroying the cursor and the container_id
+                # the identity guard depends on -- while this run recorded as
+                # clean and the damage surfaced as an unattributable `unknown`
+                # on the NEXT run.
+                print(
+                    f"[{name}] state mutation returned {type(new).__name__}, "
+                    f"expected dict; state left unchanged",
+                    file=sys.stderr,
+                )
+                return current, reasons + ["state_write_failed"]
             _atomic_write(path, json.dumps(new, ensure_ascii=False, indent=2))
     except OSError as exc:
         print(f"[{name}] could not update state: {exc}", file=sys.stderr)

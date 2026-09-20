@@ -89,6 +89,16 @@ class TestAriaUuid(unittest.TestCase):
         text = "# uuid: deadbeef is the old one\nuuid: bfe8285d\n"
         self.assertEqual(_identity.aria_uuid(self._write(text)), "bfe8285d")
 
+    def test_uuid_line_is_lowercased(self):
+        """The other half of the case-insensitive comparison.
+
+        owner_container_uuid lowercases the document side; leaving this side
+        alone revives the same silent `not_owner` from the local side. macOS
+        uuidgen emits uppercase, and the shape check already anticipates a
+        move to full uuids.
+        """
+        self.assertEqual(_identity.aria_uuid(self._write("uuid: BFE8285D\n")), "bfe8285d")
+
     def test_missing_file_is_none(self):
         self.assertIsNone(_identity.aria_uuid(os.path.join(self.tmp.name, "nope")))
 
@@ -132,6 +142,33 @@ class TestOwnerContainerUuid(unittest.TestCase):
         for value in ("simonfish/dev-claude", "simonfish/dev-claude2",
                       "creationhikari/dev-claude2", "simonfish/devbox-A"):
             self.assertIsNone(_identity.owner_container_uuid(value), value)
+
+    def test_hex_shaped_hostnames_that_can_be_rejected_are(self):
+        """The widths a general 8-32 hex rule would have let through.
+
+        Docker's default hostname is its 12-hex short id, and a sha prefix is
+        another common one; both would otherwise read as comparable identities
+        and land back in the silent not_owner case.
+        """
+        for value in ("a1b2c3d4e5f6", "0123456789abcdef0123", "abcdef1234567"):
+            self.assertIsNone(_identity.owner_container_uuid(f"owner/{value}"), value)
+
+    def test_an_eight_hex_hostname_is_indistinguishable_and_accepted(self):
+        """The residual ambiguity, recorded rather than papered over.
+
+        `deadbeef` is exactly the shape aria emits, so no check can reject it
+        without rejecting real uuids. A host named that would compare unequal
+        and fall into the quiet `not_owner` path -- the failure this shape
+        check narrows but cannot close. Narrowing further would trade a rare
+        silent skip for routine false `identity_unresolved` noise on every
+        legitimate uuid, which is the worse deal.
+        """
+        self.assertEqual(_identity.owner_container_uuid("owner/deadbeef"), "deadbeef")
+
+    def test_the_two_shapes_aria_emits_are_accepted(self):
+        self.assertEqual(_identity.owner_container_uuid("o/bfe8285d"), "bfe8285d")
+        full = "bfe8285d-1234-5678-9abc-def012345678"
+        self.assertEqual(_identity.owner_container_uuid(f"o/{full}"), full)
 
     def test_bare_uuid(self):
         self.assertEqual(_identity.owner_container_uuid("bfe8285d"), "bfe8285d")
