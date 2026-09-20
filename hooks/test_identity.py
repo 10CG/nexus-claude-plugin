@@ -109,6 +109,30 @@ class TestOwnerContainerUuid(unittest.TestCase):
         self.assertEqual(_identity.owner_container_uuid("someone-else/bfe8285d"),
                          _identity.owner_container_uuid("simonfish/bfe8285d"))
 
+    def test_comparison_is_case_insensitive(self):
+        """Frontmatter casing must not decide ownership.
+
+        An uppercased uuid would otherwise be unequal to aria_uuid()'s
+        lowercase one, land in `not_owner`, and stop ingestion silently.
+        """
+        self.assertEqual(_identity.owner_container_uuid("SIMONFISH/BFE8285D"), "bfe8285d")
+        self.assertEqual(
+            _identity.owner_container_uuid("simonfish/BFE8285D"),
+            _identity.owner_container_uuid("simonfish/bfe8285d"),
+        )
+
+    def test_hostname_form_is_not_comparable(self):
+        """42 of this repo's 96 handoffs carry a hostname here.
+
+        Returning it would make the owner check merely false -> `not_owner` ->
+        an expected skip that is never reported, so handoff ingestion would
+        stop dead and say nothing. None sends the caller to
+        `identity_unresolved`, which is reported.
+        """
+        for value in ("simonfish/dev-claude", "simonfish/dev-claude2",
+                      "creationhikari/dev-claude2", "simonfish/devbox-A"):
+            self.assertIsNone(_identity.owner_container_uuid(value), value)
+
     def test_bare_uuid(self):
         self.assertEqual(_identity.owner_container_uuid("bfe8285d"), "bfe8285d")
 

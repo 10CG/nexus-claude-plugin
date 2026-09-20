@@ -33,8 +33,16 @@ Two different identities are in play and they are NOT interchangeable:
 """
 
 import os
+import re
 import socket
 import subprocess
+
+# Aria uuids are hex fragments (8 chars today); full uuids are accepted so a
+# future widening does not read as a format violation. Hostnames and labels
+# are not -- which is the entire point, see owner_container_uuid.
+_UUID_SHAPED = re.compile(
+    r"^[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}$|^[0-9a-f]{8,32}$"
+)
 
 ARIA_CONTAINER_ID_FILE = "~/.aria/container-id"
 
@@ -103,15 +111,31 @@ def aria_uuid(path=None):
 
 
 def owner_container_uuid(owner_container):
-    """Extract the uuid half of a handoff's ``<owner>/<uuid>`` frontmatter value.
+    """The uuid half of a handoff's ``<owner>/<uuid>`` frontmatter, or None.
 
     The owner half drifts (this repo has seen the two containers swap it), so
-    only the uuid half is comparable. A bare value with no slash is treated as
-    the uuid, which is what single-segment legacy documents carry.
+    only the uuid half is comparable, lowercased on both sides.
+
+    Returns None for a value that is not uuid-shaped, and that matters more
+    than it looks: 42 of the 96 handoff documents in this repo carry a
+    *hostname* there (``simonfish/dev-claude2``) rather than an aria uuid,
+    because Aria's own ``get_container_id()`` prefers ``label`` over ``uuid``
+    and the note saying "label MUST stay empty on this machine" is a hand-kept
+    convention, not an enforced one. Set a label and the closer writes
+    hostnames there again.
+
+    Returning the hostname would make the owner comparison merely false, which
+    the caller records as ``not_owner`` -- an expected skip, never reported --
+    so handoff ingestion would stop dead and say nothing. "Read it, but it is
+    not a comparable identity" is a third case and belongs with
+    ``identity_unresolved``, which is reported. (TASK-001 pre-merge audit C1.)
     """
     if not owner_container:
         return None
     value = str(owner_container).strip()
     if not value:
         return None
-    return value.rsplit("/", 1)[-1].strip() or None
+    candidate = value.rsplit("/", 1)[-1].strip().lower()
+    if not candidate or not _UUID_SHAPED.match(candidate):
+        return None
+    return candidate

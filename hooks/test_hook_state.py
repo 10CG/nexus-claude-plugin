@@ -11,8 +11,11 @@ later module. Use mock.patch / addCleanup only — never save-and-restore by
 hand.
 """
 
+import fcntl
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -30,16 +33,35 @@ class _TempStateDir(unittest.TestCase):
         self.root = os.path.join(self.tmp.name, "state")
         self.cwd = os.path.join(self.tmp.name, "myproject")
         os.makedirs(self.cwd)
+        self.home = os.path.join(self.tmp.name, "home")
+        os.makedirs(self.home)
         patcher = mock.patch.dict(
-            os.environ, {_hook_state.STATE_DIR_ENV: self.root}, clear=False
+            os.environ,
+            {_hook_state.STATE_DIR_ENV: self.root, "HOME": self.home},
+            clear=False,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
         # project_slug shells out to git; pin it so these tests do not depend on
-        # whether the temp dir happens to sit inside a repository.
+        # whether the temp dir happens to sit inside a repository. Patched on
+        # the _identity module because _hook_state reaches it by attribute --
+        # a `from` import would bind at import time and ignore this.
         slug_patcher = mock.patch.object(_identity, "project_slug", return_value="proj")
-        slug_patcher.start()
+        self.slug = slug_patcher.start()
         self.addCleanup(slug_patcher.stop)
+        self.addCleanup(self._assert_nothing_under_home)
+
+    def _assert_nothing_under_home(self):
+        """Nothing may be written under HOME -- the real default is ~/.nexus.
+
+        The previous version walked only the override directory and asserted
+        every path found there started with it, which is true by construction.
+        An injected write to ~/.nexus passed it.
+        """
+        stray = []
+        for base, _dirs, files in os.walk(self.home):
+            stray.extend(os.path.join(base, f) for f in files)
+        assert not stray, f"wrote outside the override: {stray}"
 
 
 class TestLedgerRotation(_TempStateDir):
@@ -58,7 +80,7 @@ class TestLedgerRotation(_TempStateDir):
     def test_entry_carries_the_required_fields(self):
         _hook_state.record_run("demo", ok=False, reason="timeout", elapsed_ms=12, calls=3,
                                cwd=self.cwd)
-        entry = _hook_state.read_ledger("demo", self.cwd)[-1]
+        entry = _hook_state.read_ledger("demo", self.cwd)[0][-1]
         for field in ("hook", "ts", "ok", "reason", "elapsed_ms", "calls"):
             self.assertIn(field, entry)
         self.assertEqual(entry["hook"], "demo")
@@ -83,9 +105,9 @@ class TestLedgerRotation(_TempStateDir):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("{not json")
-        self.assertEqual(_hook_state.read_ledger("demo", self.cwd), [])
+        self.assertEqual(_hook_state.read_ledger("demo", self.cwd)[0], [])
         _hook_state.record_run("demo", ok=True, cwd=self.cwd)
-        self.assertEqual(len(_hook_state.read_ledger("demo", self.cwd)), 1)
+        self.assertEqual(len(_hook_state.read_ledger("demo", self.cwd)[0]), 1)
 
 
 class TestReasonTables(_TempStateDir):
@@ -98,6 +120,9 @@ class TestReasonTables(_TempStateDir):
                     "ingest_disabled", "identity_unresolved", "identity_changed",
                     "sections_unparsed", "file_unparsable", "rejected_422",
                     "orphan_guard", "lock_unavailable", "orphans_deleted", "unknown",
+                    # Amendment A4-1 (TASK-001 pre-merge audit C3): conditions
+                    # the spec's B/C/D rows name but left without a reason.
+                    "rate_limited", "state_write_failed",
                 }
             ),
         )
@@ -110,6 +135,8 @@ class TestReasonTables(_TempStateDir):
                     "not_owner", "opted_out", "empty_sections", "pointer_unresolved",
                     "stale_local", "unchanged", "peer_absent", "fact_delta_truncated",
                     "dedup_merged",
+                    # Amendment A4-1, as above.
+                    "not_configured", "nothing_to_do",
                 }
             ),
         )
@@ -119,16 +146,43 @@ class TestReasonTables(_TempStateDir):
         order, which is exactly the ambiguity the split exists to remove."""
         self.assertEqual(_hook_state.FAILURE_REASONS & _hook_state.SKIP_REASONS, frozenset())
 
-    def test_reason_outside_both_tables_raises(self):
-        with self.assertRaises(ValueError) as ctx:
-            _hook_state.record_run("demo", ok=False, reason="oops_new_reason", cwd=self.cwd)
-        self.assertIn("oops_new_reason", str(ctx.exception))
+    def test_reason_outside_both_tables_is_recorded_loudly_not_raised(self):
+        """A typo must be loud, not fatal.
+
+        Raising looked strict, but every caller runs under the hooks'
+        `except Exception: pass` + `exit(0)` idiom, so the exception deleted
+        the entire ledger entry -- leaving yesterday's success as the newest
+        record and the reporter with nothing to say. Recording `unknown` (a
+        failure reason) surfaces it at the next SessionStart instead.
+        """
+        with mock.patch("sys.stderr") as stderr:
+            entry = _hook_state.record_run(
+                "demo", ok=False, reason="oops_new_reason", cwd=self.cwd
+            )
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertTrue(_hook_state.is_failure_reason(entry["reason"]))
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("oops_new_reason", printed)
+        # and it really reached the ledger
+        entries, _ = _hook_state.read_ledger("demo", self.cwd)
+        self.assertEqual(entries[-1]["reason"], "unknown")
+
+    def test_reason_none_does_not_vanish(self):
+        """`reason=None` is an easy slip when the constant is NO_REASON."""
+        with mock.patch("sys.stderr"):
+            entry = _hook_state.record_run("demo", ok=True, reason=None, cwd=self.cwd)
+        self.assertEqual(entry["reason"], "unknown")
+
+    def test_new_reasons_from_the_audit_are_present(self):
+        """Amendment A4-1 additions, each tied to a condition the spec names."""
+        for reason in ("rate_limited", "state_write_failed"):
+            self.assertIn(reason, _hook_state.FAILURE_REASONS)
+        for reason in ("not_configured", "nothing_to_do"):
+            self.assertIn(reason, _hook_state.SKIP_REASONS)
 
     def test_classification_matches_the_table(self):
-        self.assertTrue(_hook_state.is_failure_reason("identity_unresolved"))
-        self.assertFalse(_hook_state.is_failure_reason("not_owner"))
-        # The pair that is easiest to get backwards: one means "not mine",
-        # the other means "cannot tell whose", and only the second is a fault.
+        # The pair the design hinges on: one means "not mine", the other
+        # means "cannot tell whose", and only the second is a fault.
         self.assertFalse(_hook_state.is_failure_reason("not_owner"))
         self.assertTrue(_hook_state.is_failure_reason("identity_unresolved"))
 
@@ -226,15 +280,14 @@ class TestFailureLegs(_TempStateDir):
 
 class TestHermetic(_TempStateDir):
     def test_everything_lands_under_the_override(self):
-        """Nothing is written outside NEXUS_HOOK_STATE_DIR."""
+        """The override receives the files; the HOME check in tearDown proves
+        nothing landed anywhere else (walking only self.root cannot)."""
         _hook_state.record_run("demo", ok=True, cwd=self.cwd)
         _hook_state.write_state("memory-sync", {"cursor": 1}, self.cwd)
         written = []
         for base, _dirs, files in os.walk(self.root):
             written.extend(os.path.join(base, f) for f in files)
         self.assertTrue(written, "expected the override dir to receive the files")
-        for path in written:
-            self.assertTrue(path.startswith(self.root))
 
     def test_default_root_is_under_home_when_unset(self):
         """Documents the default without creating it."""
@@ -254,17 +307,254 @@ class TestHermetic(_TempStateDir):
 
 class TestIdentityDrift(_TempStateDir):
     def test_change_is_reported(self):
-        self.assertEqual(_hook_state.identity_drift("old-box", "new-box"),
-                         ["identity_changed"])
+        self.assertEqual(
+            _hook_state.identity_drift("old-box", "new-box", True), ["identity_changed"]
+        )
 
     def test_same_is_quiet(self):
-        self.assertEqual(_hook_state.identity_drift("box", "box"), [])
+        self.assertEqual(_hook_state.identity_drift("box", "box", True), [])
 
-    def test_first_run_is_not_drift(self):
-        """No previous value means nothing moved — reporting here would fire on
-        every fresh install."""
-        self.assertEqual(_hook_state.identity_drift(None, "box"), [])
-        self.assertEqual(_hook_state.identity_drift("", "box"), [])
+    def test_genuine_first_run_is_quiet(self):
+        """No state file and no previous value: nothing moved.
+
+        Reporting here would fire on every fresh install.
+        """
+        self.assertEqual(_hook_state.identity_drift(None, "box", False), [])
+        self.assertEqual(_hook_state.identity_drift("", "box", False), [])
+
+    def test_state_lost_is_not_treated_as_a_first_run(self):
+        """State present but carrying no id means the prior identity is gone.
+
+        This is the case the first draft got backwards: a wiped state dir, a
+        changed NEXUS_HOOK_STATE_DIR, or a project slug that degraded when git
+        timed out all destroy the previous id — and that same event is what
+        makes a container-id change invisible. Rows written under the old id
+        then read as a peer's: the injection recipe gives away slots to them
+        and the orphan reconciliation, which lists only container_id=<self>,
+        cannot see them at all.
+        """
+        self.assertEqual(_hook_state.identity_drift(None, "box", True), ["unknown"])
+
+    def test_state_existed_is_required(self):
+        """Not defaulted: whoever forgets it is exactly who gets the dangerous
+        answer, so the signature makes them say it."""
+        with self.assertRaises(TypeError):
+            _hook_state.identity_drift("a", "b")
+
+
+class TestConcurrency(_TempStateDir):
+    """record_run must hold an exclusive lock across its read-modify-write.
+
+    Pinned deterministically rather than by racing two processes: the window is
+    microseconds, so a race test passes with the lock removed most of the time.
+    (It did, in the injection matrix -- which is how this version came to be.)
+    Holding the lock here and requiring the child to block tests the contract
+    itself, and fails every time if the lock goes away.
+
+    The reason it matters: two SessionEnd runs for one session
+    (10CG/nexus-claude-plugin#31) do read-modify-write on the same ledger, and
+    an unlocked loser silently drops its entry -- the rename stays atomic, so
+    the file is perfectly parseable and one run has simply vanished.
+    """
+
+    def _spawn_record_run(self, hook, reason):
+        code = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})\n"
+            f"os.environ['NEXUS_HOOK_STATE_DIR'] = {self.root!r}\n"
+            "import _identity, _hook_state\n"
+            "_identity.project_slug = lambda cwd: 'proj'\n"
+            f"_hook_state.record_run({hook!r}, True, reason={reason!r}, cwd={self.cwd!r})\n"
+        )
+        return subprocess.Popen([sys.executable, "-c", code])
+
+    def test_record_run_blocks_while_the_ledger_lock_is_held(self):
+        # seed the ledger so the directory and lock file exist
+        _hook_state.record_run("demo", ok=True, reason="unchanged", cwd=self.cwd)
+        lock_path = _hook_state.ledger_path("demo", self.cwd) + ".lock"
+
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        child = self._spawn_record_run("demo", "timeout")
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.wait(timeout=2)  # must still be blocked on the lock
+        except AssertionError:
+            child.kill()
+            raise
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertEqual(child.wait(timeout=30), 0)
+
+        entries, reasons = _hook_state.read_ledger("demo", self.cwd)
+        self.assertEqual(reasons, [])
+        self.assertEqual(
+            sorted(e["reason"] for e in entries),
+            ["timeout", "unchanged"],
+            "both runs must survive once the lock is released",
+        )
+
+
+class TestUpdateState(_TempStateDir):
+    def test_sequential_updates_accumulate(self):
+        _hook_state.write_state("sync", {"cursor": 0}, self.cwd)
+
+        def bump(state):
+            state["cursor"] = state.get("cursor", 0) + 1
+            return state
+
+        for _ in range(5):
+            _, reasons = _hook_state.update_state("sync", self.cwd, bump)
+            self.assertEqual(reasons, [])
+        data, _ = _hook_state.read_state("sync", self.cwd)
+        self.assertEqual(data["cursor"], 5)
+
+    def test_the_lock_spans_the_read_modify_write(self):
+        """`read_state` then `write_state` leaves the gap between them open.
+
+        Two runs racing there lose one another's updates while each individual
+        write looks perfectly atomic -- which is the whole reason this
+        primitive exists. Asserted by holding the lock and requiring the child
+        to block: a sequential accumulation test passes either way, as the
+        injection matrix showed.
+        """
+        _hook_state.write_state("sync", {"cursor": 0}, self.cwd)
+        lock_path = _hook_state.state_path("sync", self.cwd) + ".lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        code = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})\n"
+            f"os.environ['NEXUS_HOOK_STATE_DIR'] = {self.root!r}\n"
+            "import _identity, _hook_state\n"
+            "_identity.project_slug = lambda cwd: 'proj'\n"
+            f"_hook_state.update_state('sync', {self.cwd!r}, lambda s: dict(s, cursor=9))\n"
+        )
+        child = subprocess.Popen([sys.executable, "-c", code])
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.wait(timeout=2)
+        except AssertionError:
+            child.kill()
+            raise
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertEqual(child.wait(timeout=30), 0)
+        data, _ = _hook_state.read_state("sync", self.cwd)
+        self.assertEqual(data["cursor"], 9)
+
+    def test_write_failure_returns_a_reason_and_the_on_disk_value(self):
+        _hook_state.write_state("sync", {"cursor": 3}, self.cwd)
+        with mock.patch.object(
+            _hook_state, "_atomic_write", side_effect=OSError("read-only fs")
+        ), mock.patch("sys.stderr"):
+            data, reasons = _hook_state.update_state(
+                "sync", self.cwd, lambda s: {"cursor": 99}
+            )
+        self.assertIn("state_write_failed", reasons)
+        self.assertTrue(_hook_state.is_failure_reason("state_write_failed"))
+        self.assertEqual(data, {"cursor": 3}, "caller must see what is on disk")
+
+
+class TestStateWriteFailure(_TempStateDir):
+    def test_write_state_returns_a_reason_instead_of_raising(self):
+        """Propagating here is the quietest option, not the loudest.
+
+        Every hook runs under `except Exception: pass` + `exit(0)`, so an
+        exception means exit 0, no stdout, and -- because record_run is never
+        reached -- no ledger row either. The next SessionStart sees yesterday's
+        success and reports nothing.
+        """
+        with mock.patch.object(
+            _hook_state, "_atomic_write", side_effect=OSError("read-only fs")
+        ), mock.patch("sys.stderr") as stderr:
+            reasons = _hook_state.write_state("sync", {"cursor": 1}, self.cwd)
+        self.assertEqual(reasons, ["state_write_failed"])
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("state", printed)
+
+
+class TestProjectDirSource(_TempStateDir):
+    def test_project_dir_goes_through_project_slug(self):
+        """Not just equal today -- the same call.
+
+        A `from _identity import project_slug` binds at import time, so the
+        fixture's patch could not reach it and nothing noticed that
+        project_dir had its own derivation. Replacing it with a cwd basename
+        kept all 199 tests green.
+        """
+        self.slug.reset_mock()
+        _hook_state.project_dir("/some/where")
+        self.slug.assert_called_once_with("/some/where")
+
+    def test_ledger_and_state_share_that_directory(self):
+        self.assertEqual(
+            os.path.dirname(_hook_state.ledger_path("h", self.cwd)),
+            os.path.dirname(_hook_state.state_path("s", self.cwd)),
+        )
+
+
+class TestLedgerGuards(_TempStateDir):
+    def test_non_dict_elements_are_dropped_and_reported(self):
+        """The reporter does entry.get(...); an int there raises inside the
+        hooks' blanket handler and loses the whole injection."""
+        path = _hook_state.ledger_path("demo", self.cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('[1, "x", null, {"hook": "demo", "reason": "none"}]')
+        entries, reasons = _hook_state.read_ledger("demo", self.cwd)
+        self.assertEqual(entries, [{"hook": "demo", "reason": "none"}])
+        self.assertEqual(reasons, ["unknown"])
+
+    def test_missing_corrupt_and_empty_are_distinguishable(self):
+        """V(2) asks for missing / unparsable to report unknown; an empty
+        array is neither."""
+        self.assertEqual(_hook_state.read_ledger("never", self.cwd), ([], []))
+        path = _hook_state.ledger_path("bad", self.cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(_hook_state.read_ledger("bad", self.cwd), ([], ["unknown"]))
+        with open(_hook_state.ledger_path("empty", self.cwd), "w", encoding="utf-8") as fh:
+            fh.write("[]")
+        self.assertEqual(_hook_state.read_ledger("empty", self.cwd), ([], []))
+
+
+class TestWorstReason(_TempStateDir):
+    def test_failure_beats_skip(self):
+        """A ledger entry holds one scalar and the reporter reads only that, so
+        a run that hit both must record the failure."""
+        self.assertEqual(
+            _hook_state.worst_reason(["unchanged", "lock_unavailable"]),
+            "lock_unavailable",
+        )
+
+    def test_empty_and_none_collapse_to_no_reason(self):
+        self.assertEqual(_hook_state.worst_reason([]), _hook_state.NO_REASON)
+        self.assertEqual(_hook_state.worst_reason(None), _hook_state.NO_REASON)
+        self.assertEqual(
+            _hook_state.worst_reason([_hook_state.NO_REASON]), _hook_state.NO_REASON
+        )
+
+    def test_skip_only_keeps_the_first(self):
+        self.assertEqual(_hook_state.worst_reason(["unchanged", "not_owner"]), "unchanged")
+
+
+class TestStateAtomicity(_TempStateDir):
+    def test_write_state_replaces_rather_than_truncating(self):
+        """A reader must never see a half-written state file."""
+        _hook_state.write_state("sync", {"cursor": 1}, self.cwd)
+        first = os.stat(_hook_state.state_path("sync", self.cwd)).st_ino
+        _hook_state.write_state("sync", {"cursor": 2}, self.cwd)
+        second = os.stat(_hook_state.state_path("sync", self.cwd)).st_ino
+        self.assertNotEqual(first, second)
+
+    def test_state_exists_distinguishes_never_written(self):
+        self.assertFalse(_hook_state.state_exists("sync", self.cwd))
+        _hook_state.write_state("sync", {}, self.cwd)
+        self.assertTrue(_hook_state.state_exists("sync", self.cwd))
 
 
 if __name__ == "__main__":
