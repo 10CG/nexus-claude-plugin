@@ -66,7 +66,11 @@ PLUGIN_MANIFEST = os.path.join(
 # narrow: urllib raises on a header value containing a newline, and that would
 # fail the remote call -- and the whole run -- over a cosmetic field. `/` is
 # excluded because the backend splits the header on the first one.
-_VERSION_SHAPED = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$")
+#
+# No anchors, and matched with fullmatch: the first version was `^...$`, and
+# `$` also matches just before a trailing newline -- so "0.5.0\n" passed the
+# check that exists to keep newlines out.
+_VERSION_SHAPED = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,31}")
 
 
 def normalize_slug(text):
@@ -120,7 +124,7 @@ def plugin_version():
             version = json.load(fh).get("version")
     except (OSError, ValueError, AttributeError):
         return "unknown"
-    if isinstance(version, str) and _VERSION_SHAPED.match(version):
+    if isinstance(version, str) and _VERSION_SHAPED.fullmatch(version):
         return version
     return "unknown"
 

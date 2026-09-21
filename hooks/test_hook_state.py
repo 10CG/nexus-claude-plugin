@@ -16,6 +16,7 @@ import http.client
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -739,6 +740,13 @@ class TestReasonForException(unittest.TestCase):
         ("read timeout, bare", lambda: socket.timeout("timed out"), "timeout"),
         ("read timeout, bare (3.10+)", lambda: TimeoutError("timed out"), "timeout"),
         ("server hung up", lambda: http.client.RemoteDisconnected("bye"), "http_error"),
+        # RemoteDisconnected is ALSO a ConnectionResetError, so on its own it
+        # never exercised the HTTPException half of the check -- dropping that
+        # half survived the suite. These three are HTTPException and nothing else.
+        ("body cut short", lambda: http.client.IncompleteRead(b"par"), "http_error"),
+        ("garbage status line", lambda: http.client.BadStatusLine("x"), "http_error"),
+        ("NEXUS_API_URL that is not a URL", lambda: http.client.InvalidURL("bad"), "http_error"),
+        ("TLS failure raised bare", lambda: ssl.SSLError("handshake"), "http_error"),
         ("reset mid-response", lambda: ConnectionResetError("reset"), "http_error"),
         ("anything else", lambda: KeyError("profile"), "unknown"),
         ("a bare ValueError is not assumed to be the network", lambda: ValueError("x"), "unknown"),
@@ -762,6 +770,94 @@ class TestReasonForException(unittest.TestCase):
         429 into http_error -- the exact conflation this function prevents."""
         self.assertTrue(issubclass(urllib.error.HTTPError, urllib.error.URLError))
         self.assertEqual(_hook_state.reason_for_exception(_http_error(429)), "rate_limited")
+
+
+class TestRecordRunIsTotal(_TempStateDir):
+    """`record_run` says "never raises". The hooks rely on it, and the first
+    real callers (TASK-002) showed three ways it was not true. Each one left a
+    run with no record at all, which is the failure this module exists to
+    prevent. Found by the TASK-002 pre-merge review."""
+
+    def _write_raw_ledger(self, text):
+        path = _hook_state.ledger_path("demo", self.cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_a_poisoned_entry_does_not_block_recording_forever(self):
+        """A lone surrogate is valid JSON (as an escape) and unencodable as
+        UTF-8. Once one entry carried it, every later write raised
+        UnicodeEncodeError -- not an OSError, so it escaped -- and because the
+        entry could never rotate out, the ledger stayed frozen for good."""
+        path = self._write_raw_ledger('[{"hook": "demo", "reason": "none", "note": "\\ud800"}]')
+        entry = _hook_state.record_run("demo", ok=True, cwd=self.cwd)
+        self.assertEqual(entry["reason"], "none")
+        with open(path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)  # still valid JSON, still round-trips
+        self.assertEqual(len(on_disk), 2)
+        self.assertEqual(on_disk[0]["note"], "\ud800")
+
+    def test_state_carrying_a_lone_surrogate_still_writes(self):
+        reasons = _hook_state.write_state("memory-sync", {"name": "bad\ud800name"}, self.cwd)
+        self.assertEqual(reasons, [])
+        data, read_reasons = _hook_state.read_state("memory-sync", self.cwd)
+        self.assertEqual((data, read_reasons), ({"name": "bad\ud800name"}, []))
+
+    def test_ok_is_never_true_next_to_a_failure_reason(self):
+        """The caller computes `ok` before record_run has seen the ledger. A
+        corrupt ledger upgrades the reason to `unknown`; the record used to say
+        ok: true beside it."""
+        self._write_raw_ledger("{not json")
+        with mock.patch("sys.stderr"):
+            entry = _hook_state.record_run("demo", ok=True, cwd=self.cwd)
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
+        entries, _ = _hook_state.read_ledger("demo", self.cwd)
+        self.assertEqual((entries[-1]["ok"], entries[-1]["reason"]), (False, "unknown"))
+
+    def test_a_clean_run_stays_ok(self):
+        """The other half, so the fix above cannot be `ok = False` always."""
+        entry = _hook_state.record_run("demo", ok=True, cwd=self.cwd)
+        self.assertEqual((entry["ok"], entry["reason"]), (True, "none"))
+        skipped = _hook_state.record_run("demo", ok=True, reason="unchanged", cwd=self.cwd)
+        self.assertTrue(skipped["ok"])
+
+    def test_an_unserialisable_extra_does_not_lose_the_record(self):
+        _hook_state.record_run("demo", ok=True, cwd=self.cwd, extra={"oops": object()})
+        entries, reasons = _hook_state.read_ledger("demo", self.cwd)
+        self.assertEqual((len(entries), reasons), (1, []))
+        self.assertIn("object", entries[0]["oops"])
+
+    def test_it_does_not_raise_when_the_working_directory_is_gone(self):
+        with mock.patch("os.getcwd", side_effect=FileNotFoundError("cwd was deleted")), \
+                mock.patch("sys.stderr") as stderr:
+            _hook_state.record_run("demo", ok=True, cwd=None)  # must not raise
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("could not write ledger", printed)
+
+    def test_it_does_not_raise_on_something_that_is_not_an_oserror(self):
+        """The handler used to be `except OSError`. The project lookup shells
+        out to git and can fail in ways that are not."""
+        self.slug.side_effect = RuntimeError("git exploded")
+        with mock.patch("sys.stderr") as stderr:
+            _hook_state.record_run("demo", ok=True, cwd=self.cwd)  # must not raise
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("git exploded", printed)
+
+    def test_ok_follows_the_reason_even_when_nothing_could_be_written(self):
+        """The returned entry is corrected before the ledger is reached, so the
+        rule holds on the path where the write never happens."""
+        self.slug.side_effect = RuntimeError("no project")
+        with mock.patch("sys.stderr"):
+            entry = _hook_state.record_run("demo", ok=True, reason="http_error", cwd=self.cwd)
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "http_error"))
+
+    def test_recording_asks_for_the_project_once(self):
+        """Each ask is a `git rev-parse` with a 5 s timeout, and the hooks'
+        worst-case arithmetic (hooks.json `timeout`) counts them. It was two."""
+        self.slug.reset_mock()
+        _hook_state.record_run("demo", ok=True, cwd=self.cwd)
+        self.assertEqual(self.slug.call_count, 1)
 
 
 class TestStateAtomicity(_TempStateDir):

@@ -314,7 +314,12 @@ class TestPluginVersion(unittest.TestCase):
         """This value goes into an HTTP header. urllib rejects a header value
         containing a newline by raising, which would fail the whole remote
         call -- and the run with it -- over a cosmetic field."""
-        for bad in ("1.0\nX-Evil: 1", "1.0 beta", "1.0/2", "v" * 40, "1.0\r"):
+        # "0.5.0\n" is the one that got through the first version of this
+        # check: `$` matches before a trailing newline, so an anchored pattern
+        # accepted it and the request died on "Invalid header value". Found by
+        # the pre-merge review, not by the cases that were here.
+        for bad in ("1.0\nX-Evil: 1", "1.0 beta", "1.0/2", "v" * 40, "1.0\r",
+                    "0.5.0\n", "\n0.5.0", "0.5.0\t"):
             with self.subTest(version=bad), self._with_manifest(json.dumps({"version": bad})):
                 self.assertEqual(_identity.plugin_version(), "unknown")
 

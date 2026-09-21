@@ -41,6 +41,13 @@ import sys
 import tempfile
 import time
 import urllib.error
+
+try:
+    import ssl
+
+    _SSL_ERRORS = (ssl.SSLError,)
+except ImportError:  # a Python built without ssl
+    _SSL_ERRORS = ()
 from contextlib import contextmanager
 
 import _identity
@@ -152,7 +159,9 @@ def reason_for_exception(exc):
         return "timeout"  # raised bare when the read, not the connect, stalls
     if isinstance(exc, urllib.error.URLError):
         return "timeout" if isinstance(exc.reason, timeouts) else "http_error"
-    if isinstance(exc, (http.client.HTTPException, ConnectionError)):
+    # HTTPException: IncompleteRead, BadStatusLine, InvalidURL (a NEXUS_API_URL
+    # that is not one). SSLError: a TLS failure raised bare rather than wrapped.
+    if isinstance(exc, (http.client.HTTPException, ConnectionError) + _SSL_ERRORS):
         return "http_error"
     return "unknown"
 
@@ -210,7 +219,14 @@ def _atomic_write(path, text):
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        # backslashreplace, because a lone surrogate is valid JSON (as an
+        # escape) but cannot be encoded as UTF-8: one such string anywhere in a
+        # ledger made every later write raise UnicodeEncodeError, and since the
+        # entry could then never rotate out, the ledger froze for good. A lone
+        # surrogate is the only thing UTF-8 cannot encode, and its replacement
+        # text is exactly the JSON escape for it, so the file stays valid JSON
+        # and round-trips.
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -273,7 +289,15 @@ def read_ledger(hook, cwd):
     does ``entry.get(...)`` and an AttributeError there reaches the blanket
     handler and loses the whole injection.
     """
-    path = ledger_path(hook, cwd)
+    return _read_ledger_file(ledger_path(hook, cwd))
+
+
+def _read_ledger_file(path):
+    """``read_ledger`` for a path already resolved.
+
+    Resolving a path asks git for the project (5 s timeout). ``record_run``
+    used to resolve it twice, once directly and once through ``read_ledger``.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
             entries = json.load(fh)
@@ -297,7 +321,13 @@ def record_run(hook, ok, reason=NO_REASON, elapsed_ms=None, calls=0, cwd=None, e
 
     Write failures go to stderr and are swallowed: by the time a hook records
     its run the remote work is already done, and failing here would throw away
-    a completed run over local bookkeeping.
+    a completed run over local bookkeeping. "Failures" means every exception,
+    not only OSError -- a vanished working directory, an ``extra`` that will
+    not serialise and an unencodable string all used to escape from here.
+
+    ``ok`` is the caller's view, formed before the ledger was looked at. If
+    recording upgrades the reason to a failure (a corrupt ledger, a degraded
+    lock), ``ok`` follows it: a record never says ok next to a failure reason.
     """
     if reason not in ALL_REASONS:
         print(
@@ -306,32 +336,36 @@ def record_run(hook, ok, reason=NO_REASON, elapsed_ms=None, calls=0, cwd=None, e
             file=sys.stderr,
         )
         reason = "unknown"
-    cwd = cwd or os.getcwd()
     entry = {
         "hook": hook,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "ok": bool(ok),
+        "ok": bool(ok) and not is_failure_reason(reason),
         "reason": reason,
         "elapsed_ms": elapsed_ms,
         "calls": calls,
     }
     if extra:
         entry.update(extra)
-    path = ledger_path(hook, cwd)
     try:
+        path = ledger_path(hook, cwd or os.getcwd())
         lock_reasons = []
         with _locked(path, lock_reasons):
-            entries, read_reasons = read_ledger(hook, cwd)
+            entries, read_reasons = _read_ledger_file(path)
             # A degraded lock on THIS path has to be reported: the ledger is
             # what the whole visibility baseline is carried in, and a lock that
             # silently stopped locking leaves the concurrency assumption
             # reading as satisfied. Earlier revisions computed lock_reasons
             # here and dropped them.
             entry["reason"] = worst_reason([entry["reason"], *lock_reasons, *read_reasons])
+            entry["ok"] = entry["ok"] and not is_failure_reason(entry["reason"])
             entries.append(entry)
-            _atomic_write(path, json.dumps(entries[-LEDGER_LIMIT:], ensure_ascii=False))
-    except OSError as exc:
-        print(f"[{hook}] could not write ledger: {exc}", file=sys.stderr)
+            # default=str: an `extra` value that will not serialise is a caller
+            # bug, and losing the whole record over it is the worse outcome.
+            _atomic_write(
+                path, json.dumps(entries[-LEDGER_LIMIT:], ensure_ascii=False, default=str)
+            )
+    except Exception as exc:  # noqa: BLE001 - "never raises" means never
+        print(f"[{hook}] could not write ledger: {exc!r}", file=sys.stderr)
     return entry
 
 

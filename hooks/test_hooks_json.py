@@ -85,6 +85,18 @@ class TestSessionEndBudget(unittest.TestCase):
             self.assertIs(type(hook.get("timeout")), int, hook)
             self.assertEqual(hook["timeout"], 60, hook)
 
+    def test_the_capture_hook_gives_up_before_the_host_does(self):
+        spec = importlib.util.spec_from_file_location(
+            "session_capture_for_manifest_test", os.path.join(_HOOKS_DIR, "session_capture.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for _, hook in _commands("SessionEnd"):
+            self.assertGreater(
+                hook["timeout"], mod._WORK_BUDGET_SECONDS + mod._LEDGER_BUDGET_SECONDS, hook
+            )
+        self.assertGreater(mod._WORK_BUDGET_SECONDS, 2 * 5 + mod._HTTP_TIMEOUT_SECONDS)
+
     def test_the_capture_hook_is_one_of_them(self):
         commands = [hook["command"] for _, hook in _commands("SessionEnd")]
         self.assertTrue(any("session_capture.py" in c for c in commands), commands)
@@ -106,9 +118,21 @@ class TestSessionStartBound(unittest.TestCase):
         self.assertTrue(hooks, "no SessionStart command hook registered")
         for _, hook in hooks:
             self.assertIs(type(hook.get("timeout")), int, hook)
-            # Below the network budget and a slow success gets killed; the
-            # margin covers the three 5 s git calls around it.
-            self.assertGreaterEqual(hook["timeout"], network + 15, hook)
+            # Below the hook's own nominal worst case and a slow success gets
+            # killed: two 5 s git calls (project slug, branch), the two HTTP
+            # tiers, and the bounded ledger step. The first version of this
+            # arithmetic said 25 s and the real figure was 30 -- equal to the
+            # timeout -- because recording a run asked git for the project
+            # twice more. The numbers are read from the module so they cannot
+            # drift apart again.
+            worst_case = 2 * 5 + network + mod._LEDGER_BUDGET_SECONDS
+            self.assertGreater(hook["timeout"], worst_case, hook)
+            # And the hook's own deadline has to fire first. If the host's
+            # timeout wins, the process is killed: no record, no brief.
+            self.assertGreater(
+                hook["timeout"], mod._WORK_BUDGET_SECONDS + mod._LEDGER_BUDGET_SECONDS, hook
+            )
+            self.assertGreater(mod._WORK_BUDGET_SECONDS, 2 * 5 + network)
             self.assertLessEqual(hook["timeout"], 60, hook)
 
 

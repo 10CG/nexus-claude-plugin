@@ -19,8 +19,10 @@ Coverage maps to workflow A acceptance:
 """
 
 import glob
+import http.server
 import importlib.util
 import io
+import itertools
 import json
 import os
 import shutil
@@ -28,6 +30,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -655,6 +659,354 @@ class TestSharedModulesUnavailable(_LedgerCase):
         self.assertIn("_identity", stderr)
         self.assertNotIn("Traceback", stderr)
 
+
+
+class TestLedgerStepIsBounded(_LedgerCase):
+    """Found by the TASK-002 pre-merge review: writing the brief first does not
+    protect it from bookkeeping that STALLS. The host only uses stdout from a
+    hook that exits 0, so a ledger write stuck on a held lock kept the hook
+    alive until the host's timeout killed it -- brief discarded, session start
+    delayed by the full timeout, and no ledger record either."""
+
+    def test_a_stalled_ledger_write_is_left_behind(self):
+        release = threading.Event()
+        self.addCleanup(release.set)  # let the abandoned worker finish
+
+        def stall(*args, **kwargs):
+            release.wait(30)
+
+        began = time.monotonic()
+        with mock.patch.object(_hook_state, "record_run", side_effect=stall), \
+                mock.patch.object(_MOD, "_LEDGER_BUDGET_SECONDS", 0.2):
+            out, err = self._main(_UrlopenCapture([{"profile": [_profile_row("kept")]}]))
+        self.assertLess(time.monotonic() - began, 5, "main() waited for the stalled write")
+        self.assertIn("kept", out, "the brief must already be out")
+        self.assertIn("still running", err)
+
+    def test_as_a_script_a_held_ledger_lock_cannot_hang_it(self):
+        """End to end, with a real flock held by this process."""
+        import fcntl
+
+        state = os.path.join(self.tmp.name, "held-state")
+        project = os.path.join(state, "proj")  # the subprocess derives this from self.cwd
+        os.makedirs(project)
+        lock_path = os.path.join(project, "session-inject.json.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        began = time.monotonic()
+        stdout, code, stderr = _run_hook(  # _run_hook gives up at 20 s: a hang is an error
+            json.dumps({"cwd": self.cwd}), env={"NEXUS_HOOK_STATE_DIR": state}, want_stderr=True
+        )
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertLess(time.monotonic() - began, 12)
+        self.assertIn("still running", stderr)
+
+
+class TestInterpreterSettings(unittest.TestCase):
+    def test_safe_path_does_not_switch_the_hook_off(self):
+        """PYTHONSAFEPATH=1 (3.11+, also `python -P`) drops the script's own
+        directory from sys.path. The hooks were single self-contained files
+        until TASK-002 made them import siblings, so without putting the
+        directory back an interpreter setting silently turned the plugin off."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.path.join(tmp, "proj")
+            os.makedirs(cwd)
+            state = os.path.join(tmp, "state")
+            stdout, code, stderr = _run_hook(
+                json.dumps({"cwd": cwd}),
+                env={"PYTHONSAFEPATH": "1", "NEXUS_HOOK_STATE_DIR": state},
+                want_stderr=True,
+            )
+            self.assertEqual((stdout, code), (b"", 0))
+            self.assertNotIn("cannot import", stderr)
+            ledgers = glob.glob(os.path.join(state, "*", "session-inject.json"))
+            self.assertEqual(len(ledgers), 1, (ledgers, stderr))
+
+
+class TestBackendSaidItFailed(_LedgerCase):
+    """The backend degrades gracefully: when its memory lookup raises, the
+    answer is still HTTP 200, with `profile: null` and the exception text under
+    `errors`. Reading only `profile` turned that into `nothing_to_do` -- an
+    expected skip, never reported. A backend outage looked exactly like a
+    project with no memories."""
+
+    def test_a_reported_profile_failure_is_not_a_clean_skip(self):
+        failed = {"profile": None, "errors": {"profile": "connection pool exhausted"}}
+        out, err = self._main(_UrlopenCapture([failed, failed]))
+        self.assertEqual(out, "")
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, "http_error", 2))
+        self.assertEqual(entry["backend_errors"], ["profile"])
+        self.assertIn("profile", err)
+
+    def test_what_did_come_back_is_still_injected(self):
+        """`recent` and `profile` are merged server-side, so one can fail
+        while the other returns rows. Inject them AND report the failure."""
+        partial = {"profile": [_profile_row("half an answer")], "errors": {"recent": "timeout"}}
+        out, _ = self._main(_UrlopenCapture([partial]))
+        self.assertIn("half an answer", out)
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "http_error"))
+        self.assertEqual(entry["backend_errors"], ["recent"])
+
+    def test_a_failure_in_a_layer_this_hook_does_not_read_is_not_its_problem(self):
+        unrelated = {"profile": [_profile_row("fine")], "errors": {"graph": "neo4j down"}}
+        self._main(_UrlopenCapture([unrelated]))
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (True, "none"))
+        self.assertNotIn("backend_errors", entry)
+
+    def test_a_body_of_the_wrong_shape_is_an_http_error_not_an_empty_result(self):
+        for body in ([], "a string", {"profile": "not a list"}, {"profile": [1, 2]}):
+            with self.subTest(body=body):
+                self._main(_UrlopenCapture([body, body]))
+                entry = self._entries()[-1]
+                self.assertEqual((entry["ok"], entry["reason"]), (False, "http_error"))
+
+    def test_an_honest_empty_profile_is_still_a_skip(self):
+        """The other half: `profile: null` with no `errors` is what the backend
+        sends when there is nothing, and must stay quiet."""
+        self._main(_UrlopenCapture([{"profile": None}, {"profile": None, "errors": None}]))
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (True, "nothing_to_do"))
+
+
+# ── Round 3: what the pre-merge review's surviving mutants pointed at ───────────
+
+class _FakeBackend:
+    """A real HTTP server on 127.0.0.1, for the few things only a real socket
+    and a real interpreter exit can show."""
+
+    def __init__(self, body, status=200, content_type="application/json"):
+        self.seen = []
+        payload = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        seen = self.seen
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(handler):
+                handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
+                seen.append({k.lower(): v for k, v in handler.headers.items()})
+                handler.send_response(status)
+                handler.send_header("Content-Type", content_type)
+                handler.send_header("Content-Length", str(len(payload)))
+                handler.end_headers()
+                handler.wfile.write(payload)
+
+            def log_message(handler, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+# urllib honours proxy variables, and a developer machine's cross-border proxy
+# answers 502 for 127.0.0.1 -- which reads exactly like the backend being down.
+_PROXY_VARS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+_NO_PROXY = {"no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"}
+
+
+class _Clock:
+    """time.monotonic that advances a quarter second every time it is read."""
+
+    def __init__(self):
+        self._ticks = itertools.count(1000.0, 0.25)
+
+    def __call__(self):
+        return next(self._ticks)
+
+
+class TestWhatTheLedgerSays(_LedgerCase):
+
+    def test_elapsed_ms_is_the_hooks_own_time_in_milliseconds(self):
+        """`type is int and >= 0` let both "always 0" and "seconds, not
+        milliseconds" through, and the visibility baseline is read off this."""
+        with mock.patch.object(_MOD.time, "monotonic", _Clock()):
+            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]))
+        elapsed = self._entries()[-1]["elapsed_ms"]
+        self.assertGreaterEqual(elapsed, 250)
+        self.assertEqual(elapsed % 250, 0, elapsed)
+
+    def test_the_record_is_filed_under_the_payloads_project(self):
+        """Not under wherever the process happens to be running. Every other
+        test pins the slug to one value, so this was never asserted."""
+        elsewhere = os.path.join(self.tmp.name, "some-other-project")
+        os.makedirs(elsewhere)
+        with mock.patch.object(_identity, "project_slug", side_effect=os.path.basename):
+            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]), stdin_text=json.dumps({"cwd": elsewhere}))
+        expected = os.path.join(self.state_dir, "some-other-project", "session-inject.json")
+        self.assertTrue(os.path.isfile(expected), os.listdir(self.state_dir))
+
+    def test_a_payload_cwd_that_is_not_a_string_is_ignored_not_fatal(self):
+        """The slug stub has to fail the way the real lookup does on a value
+        that is not a path. With a stub that answers "proj" to anything, a cwd
+        of 123 had no consequences at all and this test passed against a hook
+        that accepted it -- the injection matrix caught that, not review."""
+        def like_the_real_one(cwd):
+            return os.path.basename(cwd.rstrip("/"))
+
+        with mock.patch.object(_identity, "project_slug", side_effect=like_the_real_one):
+            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]), stdin_text=json.dumps({"cwd": 123}))
+        ledgers = glob.glob(os.path.join(self.state_dir, "*", "session-inject.json"))
+        self.assertEqual(len(ledgers), 1, "the run left no record")
+        with open(ledgers[0], encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)[-1]["reason"], "none")
+
+    def test_running_out_of_time_is_recorded_by_the_hook_itself(self):
+        """urllib's timeout is per socket operation, not per request: against a
+        server that drips bytes, one 6 s request was measured at 24 s. Left to
+        the host's timeout, the hook is killed -- no record, and for
+        SessionStart no brief. So the hook keeps its own deadline and leaves
+        first, with a record."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def drip(req, timeout=None):
+            release.wait(30)
+            raise RuntimeError("released by test cleanup")
+
+        began = time.monotonic()
+        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.2):
+            out, err = self._main(drip)
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertEqual(out, "")
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "timeout"))
+        self.assertIn("timeout", err)
+
+
+class TestImportedNotRun(unittest.TestCase):
+    def test_a_broken_install_is_loud_when_imported(self):
+        """Run as a hook, a missing sibling is exit 0 and a line on stderr.
+        Imported by a test it has to raise: a quiet sys.exit(0) during
+        collection is a green run that executed nothing."""
+        with mock.patch.dict(sys.modules, {"_identity": None}):
+            with self.assertRaises(ImportError):
+                _load_module()
+
+
+class _EventfulStdout(io.StringIO):
+    def __init__(self, events):
+        super().__init__()
+        self._events = events
+
+    def write(self, text):
+        self._events.append("write")
+        return super().write(text)
+
+    def flush(self):
+        self._events.append("flush")
+        return super().flush()
+
+
+class TestTheBriefIsReallyOut(_LedgerCase):
+
+    def test_stdout_is_flushed_before_the_ledger_is_touched(self):
+        """The ordering test reads a StringIO, which has no buffer to forget to
+        flush. With the ledger step able to be abandoned, an unflushed brief is
+        a lost brief."""
+        events = []
+        out = _EventfulStdout(events)
+        with mock.patch.object(_hook_state, "record_run", side_effect=lambda *a, **k: events.append("record")), \
+                mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([{"profile": [_profile_row("x")]}])), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", io.StringIO()):
+            _MOD.main()
+        self.assertIn("record", events)
+        before = events[: events.index("record")]
+        self.assertIn("write", before)
+        self.assertIn("flush", before)
+        self.assertLess(before.index("write"), len(before) - 1 - before[::-1].index("flush"))
+
+    def test_a_brief_that_could_not_be_written_is_not_recorded_as_delivered(self):
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("reader went away")
+
+        with mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([{"profile": [_profile_row("x")]}])), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", Broken()), mock.patch.object(sys, "stderr", io.StringIO()):
+            _MOD.main()
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
+
+    def test_one_unencodable_row_does_not_cost_the_whole_brief(self):
+        """A lone surrogate in one row raised UnicodeEncodeError on the write,
+        and every other row went with it."""
+        rows = [_profile_row("good row"), _profile_row("bad \ud800 row")]
+        out, _ = self._main(_UrlopenCapture([{"profile": rows}]))
+        self.assertIn("good row", out)
+        json.loads(out).get("hookSpecificOutput")["additionalContext"].encode("utf-8")
+        self.assertEqual(self._entries()[-1]["reason"], "none")
+
+
+class TestAsARealProcess(unittest.TestCase):
+    """The script, a socket, and a real interpreter exit."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.path.join(self.tmp.name, "proj")
+        os.makedirs(self.cwd)
+        self.state = os.path.join(self.tmp.name, "state")
+        self.backend = _FakeBackend({"profile": [_profile_row("from a real socket")]})
+        self.addCleanup(self.backend.close)
+        self.env = dict(_NO_PROXY, NEXUS_API_URL=self.backend.url, NEXUS_HOOK_STATE_DIR=self.state,
+                        NEXUS_DEFAULT_USER_ID="nexus")
+
+    def _last_entry(self):
+        (ledger,) = glob.glob(os.path.join(self.state, "*", "session-inject.json"))
+        with open(ledger, encoding="utf-8") as fh:
+            return json.load(fh)[-1]
+
+    def test_end_to_end(self):
+        stdout, code = _run_hook(json.dumps({"cwd": self.cwd}), env=self.env, drop=_PROXY_VARS)
+        self.assertEqual(code, 0)
+        self.assertIn("from a real socket", json.loads(stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.backend.seen[0]["x-nexus-source"], f"sessionstart-hook/{_plugin_version()}")
+        self.assertEqual(self._last_entry()["reason"], "none")
+
+    def test_a_stdout_nobody_is_reading_still_exits_zero(self):
+        """Python retries the flush at interpreter exit; against a closed pipe
+        that fails again and the process exits 120 -- a hook error on a plugin
+        whose contract is exit 0, always."""
+        run_env = {k: v for k, v in os.environ.items()
+                   if k not in _PROXY_VARS and not k.startswith("NEXUS_")}
+        run_env.update(self.env)
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        try:
+            proc = subprocess.run(
+                [sys.executable, _HOOK_SCRIPT], input=json.dumps({"cwd": self.cwd}).encode(),
+                stdout=write_end, stderr=subprocess.PIPE, env=run_env, timeout=20,
+            )
+        finally:
+            os.close(write_end)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        self.assertEqual(self._last_entry()["reason"], "unknown")
+
+
+class TestTheWorkerDiedQuietly(_LedgerCase):
+    def test_a_worker_that_ends_without_a_result_is_still_recorded(self):
+        """SystemExit is not an Exception, so the worker's own handler misses it
+        and it ends having reported nothing. Found re-reading my own fix for
+        the very pattern it was fixing."""
+        with mock.patch.object(_MOD, "_collect", side_effect=SystemExit(3)), \
+                mock.patch.object(threading, "excepthook", lambda args: None):
+            out, err = self._main(mock.Mock())
+        self.assertEqual(out, "")
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
+        self.assertIn("without a result", err)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
