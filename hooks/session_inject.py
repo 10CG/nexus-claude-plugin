@@ -21,6 +21,10 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
                           basename of the git toplevel (or cwd) — the project
                           slug (§6 user_id mapping).
       NEXUS_CONTAINER_ID -- container/provenance id; falls back to hostname.
+      NEXUS_HOOK_STATE_DIR -- where the run ledger lives (default ~/.nexus/hooks).
+    user_id and container_id come from ``_identity`` — the one derivation the
+    write side (session_capture.py) uses too. This file used to carry its own
+    byte-identical copy, which is two chances to key one project two ways.
   - Branch: ``git -C <cwd> rev-parse --abbrev-ref HEAD``. Non-git dir / git
     failure -> branch is omitted from the metadata_filter (no branch scoping).
   - Request body uses ``profile_limit`` (NOT ``limit`` — ContextRequest has no
@@ -33,7 +37,14 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
     primary/same-branch-cross-container/project three-tier recall.
   - HTTP headers MUST include a User-Agent (SPIKE #8: requests through the CF
     proxy with no UA are blocked by CF 1010 Bot Fight Mode), plus X-API-Key,
-    Content-Type, and X-Nexus-Source: sessionstart-hook.
+    Content-Type, and X-Nexus-Source: sessionstart-hook/<plugin version>.
+  - RUN LEDGER: every run appends one record (ok / reason / elapsed_ms / calls)
+    via ``_hook_state.record_run`` — the fail-open paths above included, since
+    "exit 0 with no stdout" is exactly what a hook that silently stopped working
+    looks like from the outside. Two orderings are deliberate: the brief is
+    written to stdout BEFORE the ledger is touched, so bookkeeping can never
+    cost the session its injection; and if ``_hook_state`` cannot be imported
+    at all (it needs ``fcntl``) the hook still injects and says so on stderr.
   - Render: ONLY settled summaries (metadata.layer == "summary" preferred; if no
     profile item carries a ``layer`` key at all, take all of them). Each line is
     prefixed ``[<container_id> · <age> · <branch>]`` provenance (§6 — guard the
@@ -43,11 +54,37 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
 
 import json
 import os
-import socket
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime, timezone
+
+try:
+    import _identity
+except Exception as exc:  # a broken or partial install
+    # Imported by a test this must stay loud. Run as a hook it must not be:
+    # a traceback is exit 1, which Claude Code reports as a hook error on
+    # every single session start.
+    if __name__ != "__main__":
+        raise
+    print(f"[session-inject] cannot import _identity: {exc!r}", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    import _hook_state
+except Exception as exc:  # e.g. no fcntl on a native Windows Python
+    # The ledger is bookkeeping. Losing it must not take the injection with it.
+    _hook_state = None
+    _LEDGER_IMPORT_ERROR = repr(exc)
+
+HOOK = "session-inject"  # names the ledger file
+
+# The name half of X-Nexus-Source. The backend attributes a request by this
+# exact string against an allowlist (nexus `mcp_attribution._KNOWN_CLIENTS`).
+# It was missing from that list once, and 212 SessionStart calls on prod were
+# attributed to "unknown" before anyone looked. Renaming it here redoes that.
+SOURCE_NAME = "sessionstart-hook"
 
 # Per-request timeouts; worst-case total (tier1 + tier2) stays ~10s so a slow
 # backend never stalls session start beyond that (fail-open caps it anyway).
@@ -56,28 +93,8 @@ _TIER2_TIMEOUT_SECONDS = 4
 _USER_AGENT = "nexus-sessionstart-hook/0.3"
 
 
-def _normalize_slug(text):
-    """Normalize a path basename into a project slug (lowercase, safe chars)."""
-    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in text.strip().lower())
-    slug = slug.strip("-")
-    return slug or "default"
-
-
-def _project_slug(cwd):
-    """Derive the project slug: git toplevel basename, else cwd basename."""
-    toplevel = None
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            toplevel = result.stdout.decode().strip() or None
-    except Exception:
-        toplevel = None
-    base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    return _normalize_slug(base)
+class _NotJson(Exception):
+    """A 2xx whose body is not JSON: a proxy or challenge page, not our API."""
 
 
 def _current_branch(cwd):
@@ -116,7 +133,7 @@ def _retrieve(base_url, token, user_id, metadata_filter, timeout):
         # User-Agent is mandatory: CF 1010 Bot Fight Mode blocks UA-less requests
         # through the proxy (SPIKE #8).
         "User-Agent": _USER_AGENT,
-        "X-Nexus-Source": "sessionstart-hook",
+        "X-Nexus-Source": _identity.source_header(SOURCE_NAME),
     }
     if token:
         headers["X-API-Key"] = token
@@ -124,7 +141,10 @@ def _retrieve(base_url, token, user_id, metadata_filter, timeout):
         f"{base_url}/context/retrieve", data=data, method="POST", headers=headers
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)
+        try:
+            return json.load(resp)
+        except ValueError as exc:
+            raise _NotJson(str(exc)) from exc
 
 
 def _settled_rows(profile):
@@ -179,21 +199,29 @@ def _render(rows):
     return "\n".join(lines)
 
 
-def main():
+def _collect(run):
+    """Do the work. Returns ``(reason, brief)``; raises if a remote call fails.
+
+    ``run`` is filled in as facts become known, so that whatever happens next
+    -- a return or an exception -- the ledger record has the right project and
+    the number of calls actually attempted.
+    """
     raw = sys.stdin.read()
-    # SessionStart payload is parsed only to extract cwd; malformed -> fail-open.
+    # SessionStart payload is parsed only to extract cwd.
     event = json.loads(raw) if raw.strip() else {}
     if not isinstance(event, dict):
-        return
+        raise ValueError("SessionStart payload is not a JSON object")
+    if isinstance(event.get("cwd"), str) and event["cwd"]:
+        run["cwd"] = event["cwd"]
+    cwd = run["cwd"] or os.getcwd()
 
     base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
     if not base_url:
-        return  # no backend configured -> fail-open silent
+        return "not_configured", None  # the default for a fresh install
     token = os.environ.get("NEXUS_API_TOKEN", "")
 
-    cwd = event.get("cwd") or os.getcwd()
-    user_id = os.environ.get("NEXUS_DEFAULT_USER_ID") or _project_slug(cwd)
-    container_id = os.environ.get("NEXUS_CONTAINER_ID") or socket.gethostname()
+    user_id = _identity.user_id(cwd)
+    container_id = _identity.container_id()
     branch = _current_branch(cwd)
 
     # Tier 1: branch + container scoped (branch key omitted if branch unknown).
@@ -201,27 +229,85 @@ def main():
     if branch:
         metadata_filter["branch"] = branch
 
+    run["calls"] += 1  # counted before the call: a call that fails was still made
     ctx = _retrieve(base_url, token, user_id, metadata_filter, _TIER1_TIMEOUT_SECONDS)
     profile = (ctx or {}).get("profile") or []
     rows = _settled_rows(profile)
+    run["extra"]["tier"] = 1
 
     # Tier 2: project-level fallback (no metadata_filter) when tier 1 is empty.
     if not rows:
+        run["calls"] += 1
         ctx = _retrieve(base_url, token, user_id, None, _TIER2_TIMEOUT_SECONDS)
         profile = (ctx or {}).get("profile") or []
         rows = _settled_rows(profile)
+        run["extra"]["tier"] = 2
 
+    run["extra"]["rows"] = len(rows)
     brief = _render(rows)
     if not brief:
-        return  # nothing to inject -> fail-open silent
+        return "nothing_to_do", None  # nothing to inject
+    return (_hook_state.NO_REASON if _hook_state else "none"), brief
 
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": brief,
+
+def _warn(reason, exc):
+    print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+
+
+def _record(reason, started, run):
+    """Append this run to the ledger. Never raises."""
+    if _hook_state is None:
+        print(
+            f"[{HOOK}] run ledger unavailable ({_LEDGER_IMPORT_ERROR}); "
+            f"this run ({reason}) is not recorded",
+            file=sys.stderr,
+        )
+        return
+    try:
+        _hook_state.record_run(
+            HOOK,
+            ok=not _hook_state.is_failure_reason(reason),
+            reason=reason,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            calls=run["calls"],
+            cwd=run["cwd"],
+            extra=run["extra"] or None,
+        )
+    except Exception as exc:  # record_run does not raise by contract; the net under it
+        print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+
+
+def main():
+    started = time.monotonic()
+    run = {"cwd": None, "calls": 0, "extra": {}}
+    reason, brief = "unknown", None
+    try:
+        reason, brief = _collect(run)
+    except _NotJson as exc:
+        reason = "http_error"
+        _warn(reason, exc)
+    except Exception as exc:
+        # Still exit 0 with no stdout -- but no longer without a trace.
+        reason = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
+        _warn(reason, exc)
+
+    if brief:
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": brief,
+            }
         }
-    }
-    sys.stdout.write(json.dumps(output, ensure_ascii=False))
+        # Before the ledger, not after: nothing below this line may cost the
+        # session its injection.
+        try:
+            sys.stdout.write(json.dumps(output, ensure_ascii=False))
+            sys.stdout.flush()
+        except Exception as exc:
+            reason = "unknown"
+            _warn("could not write the brief", exc)
+
+    _record(reason, started, run)
 
 
 if __name__ == "__main__":

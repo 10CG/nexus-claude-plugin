@@ -22,6 +22,13 @@ Two different identities are in play and they are NOT interchangeable:
     has to match. If someone "aligns" this with Aria's helper, owner checks
     start failing open on any machine that sets a label.
 
+``plugin_version`` / ``source_header``
+    Which release is writing: the ``X-Nexus-Source: <hook-name>/<version>``
+    header every remote call carries. The *name* half is what the backend
+    attributes by, so it is chosen by each hook and must stay on the backend's
+    allowlist; the version half comes from the plugin manifest so there is one
+    number to bump, not one per hook.
+
 ``project_slug`` / ``user_id``
     Both derived from the git toplevel, deliberately from the same source: the
     ledger/state directory is keyed by project and the server rows are keyed by
@@ -32,6 +39,7 @@ Two different identities are in play and they are NOT interchangeable:
     was deleted".
 """
 
+import json
 import os
 import re
 import socket
@@ -50,6 +58,16 @@ _UUID_SHAPED = re.compile(
 
 ARIA_CONTAINER_ID_FILE = "~/.aria/container-id"
 
+PLUGIN_MANIFEST = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json"
+)
+
+# What a version may look like once it is inside an HTTP header. Deliberately
+# narrow: urllib raises on a header value containing a newline, and that would
+# fail the remote call -- and the whole run -- over a cosmetic field. `/` is
+# excluded because the backend splits the header on the first one.
+_VERSION_SHAPED = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$")
+
 
 def normalize_slug(text):
     """Normalize a path basename into a project slug (lowercase, safe chars)."""
@@ -61,9 +79,9 @@ def normalize_slug(text):
 def project_slug(cwd):
     """Derive the project slug: git toplevel basename, else cwd basename.
 
-    Kept byte-compatible with the copies in session_capture.py and
-    session_inject.py (verified identical modulo docstring); those two collapse
-    onto this one in TASK-002.
+    The only copy: session_capture.py and session_inject.py each carried a
+    byte-identical one until TASK-002, which is two chances for the write side
+    and the read side to key the same project differently.
     """
     toplevel = None
     try:
@@ -86,8 +104,36 @@ def user_id(cwd):
 
 
 def container_id():
-    """Who is writing, for provenance. Same derivation as session_capture.py."""
+    """Who is writing, for provenance: ``NEXUS_CONTAINER_ID`` else the hostname."""
     return os.environ.get("NEXUS_CONTAINER_ID") or socket.gethostname()
+
+
+def plugin_version():
+    """The plugin's version from its manifest, or ``"unknown"``.
+
+    Never raises and never returns something that is unsafe in a header: this
+    feeds ``source_header``, and an attribution field must not be able to fail
+    the request it is describing.
+    """
+    try:
+        with open(PLUGIN_MANIFEST, encoding="utf-8") as fh:
+            version = json.load(fh).get("version")
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+    if isinstance(version, str) and _VERSION_SHAPED.match(version):
+        return version
+    return "unknown"
+
+
+def source_header(hook_name):
+    """``X-Nexus-Source`` value for one hook: ``<hook-name>/<version>``.
+
+    The backend attributes a request by the part before the first ``/``
+    (nexus ``mcp_attribution._normalize_source``), against an allowlist. So the
+    name must be one the backend knows, and nothing here may add a second
+    slash.
+    """
+    return f"{hook_name}/{plugin_version()}"
 
 
 def aria_uuid(path=None):

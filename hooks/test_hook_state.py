@@ -12,12 +12,15 @@ hand.
 """
 
 import fcntl
+import http.client
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 import _hook_state
@@ -712,6 +715,53 @@ class TestWorstReason(_TempStateDir):
         self.assertEqual(
             _hook_state.worst_reason(["unchanged", "no_handoff"]), "unchanged"
         )
+
+
+def _http_error(code):
+    return urllib.error.HTTPError("https://nexus.example/v1/x", code, "msg", {}, None)
+
+
+class TestReasonForException(unittest.TestCase):
+    """One classifier for every hook that makes a remote call (TASK-002).
+
+    Two hooks each growing their own mapping is how one of them ends up
+    recording a rate limit as a generic error -- and the rate limit is the one
+    the spec treats differently (stop this round, do not retry).
+    """
+
+    CASES = (
+        ("429 is its own reason", lambda: _http_error(429), "rate_limited"),
+        ("other 4xx", lambda: _http_error(403), "http_error"),
+        ("5xx", lambda: _http_error(503), "http_error"),
+        ("connection refused", lambda: urllib.error.URLError(ConnectionRefusedError()), "http_error"),
+        ("connect timeout, wrapped", lambda: urllib.error.URLError(socket.timeout("t")), "timeout"),
+        ("connect timeout, wrapped (3.10+)", lambda: urllib.error.URLError(TimeoutError("t")), "timeout"),
+        ("read timeout, bare", lambda: socket.timeout("timed out"), "timeout"),
+        ("read timeout, bare (3.10+)", lambda: TimeoutError("timed out"), "timeout"),
+        ("server hung up", lambda: http.client.RemoteDisconnected("bye"), "http_error"),
+        ("reset mid-response", lambda: ConnectionResetError("reset"), "http_error"),
+        ("anything else", lambda: KeyError("profile"), "unknown"),
+        ("a bare ValueError is not assumed to be the network", lambda: ValueError("x"), "unknown"),
+    )
+
+    def test_each_exception_maps_to_the_expected_reason(self):
+        for label, make, expected in self.CASES:
+            with self.subTest(case=label):
+                self.assertEqual(_hook_state.reason_for_exception(make()), expected)
+
+    def test_every_result_is_a_failure_reason(self):
+        """An exception is never an expected skip. If this ever returned a
+        skip-class reason, the failure would be recorded and never reported."""
+        for label, make, _ in self.CASES:
+            with self.subTest(case=label):
+                reason = _hook_state.reason_for_exception(make())
+                self.assertTrue(_hook_state.is_failure_reason(reason), reason)
+
+    def test_http_error_is_checked_before_its_parent_class(self):
+        """HTTPError subclasses URLError. Testing URLError first turns every
+        429 into http_error -- the exact conflation this function prevents."""
+        self.assertTrue(issubclass(urllib.error.HTTPError, urllib.error.URLError))
+        self.assertEqual(_hook_state.reason_for_exception(_http_error(429)), "rate_limited")
 
 
 class TestStateAtomicity(_TempStateDir):

@@ -53,25 +53,59 @@ Design contract (proposal nexus-replace-claude-mem workflow C):
         still an agent operation; the "other" enum value is reserved for future
         non-tool, non-message activity kinds and is not currently emitted).
   - agent_id = project slug: NEXUS_DEFAULT_USER_ID, else the normalized lowercase
-    basename of the git toplevel (or cwd) — IDENTICAL derivation to
-    session_inject.py so the captured episodic memories land on the same
-    user_id=project that the read side queries.
+    basename of the git toplevel (or cwd) — the SAME call session_inject.py
+    makes (``_identity.user_id``), so the captured episodic memories land on the
+    user_id=project that the read side queries. Both files used to carry a
+    byte-identical copy of the derivation instead.
   - provenance: every activity_data is augmented with container_id
-    (NEXUS_CONTAINER_ID, else hostname) + branch
+    (``_identity.container_id``: NEXUS_CONTAINER_ID, else hostname) + branch
     (``git -C cwd rev-parse --abbrev-ref HEAD``, omitted on failure) + session_id.
   - HTTP headers MUST include a User-Agent (CF 1010 Bot Fight Mode blocks UA-less
     requests through the proxy), plus X-API-Key (if token present), Content-Type,
-    and X-Nexus-Source: session-capture-hook. ~8s timeout. fail-open.
+    and X-Nexus-Source: session-capture-hook/<plugin version>. ~8s timeout.
+    fail-open.
   - Empty activity list -> no request sent. SessionEnd never injects context, so
     success produces NO stdout.
+  - RUN LEDGER: every run appends one record (ok / reason / elapsed_ms / calls)
+    via ``_hook_state.record_run`` — the fail-open paths above included, since
+    "exit 0 with no stdout" is exactly what a capture hook that silently stopped
+    working looks like from the outside. If ``_hook_state`` cannot be imported
+    (it needs ``fcntl``) the hook still captures and says so on stderr.
+  - hooks.json gives this hook ``timeout: 60``. That is not slack: SessionEnd
+    hooks share a 1.5 s budget unless one declares a longer timeout, and this
+    hook's own HTTP timeout is 8 s.
 """
 
 import json
 import os
-import socket
 import subprocess
 import sys
+import time
 import urllib.request
+
+try:
+    import _identity
+except Exception as exc:  # a broken or partial install
+    # Imported by a test this must stay loud. Run as a hook it must not be:
+    # a traceback is exit 1, reported as a hook error on every session end.
+    if __name__ != "__main__":
+        raise
+    print(f"[session-capture] cannot import _identity: {exc!r}", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    import _hook_state
+except Exception as exc:  # e.g. no fcntl on a native Windows Python
+    # The ledger is bookkeeping. Losing it must not take the capture with it.
+    _hook_state = None
+    _LEDGER_IMPORT_ERROR = repr(exc)
+
+HOOK = "session-capture"  # names the ledger file
+
+# The name half of X-Nexus-Source. The backend attributes a request by this
+# exact string against an allowlist (nexus `mcp_attribution._KNOWN_CLIENTS`);
+# renaming it here sends every capture to source="unknown".
+SOURCE_NAME = "session-capture-hook"
 
 # Bounded capture: keep at most the most-recent _MAX_ACTIVITIES extracted
 # activities. The backend ActivityStreamRequest caps at 1000; we stay well under
@@ -174,34 +208,6 @@ def _is_low_signal(action, activity_data):
         ad = activity_data if isinstance(activity_data, dict) else {}
         return _is_readonly_command(ad.get("summary", ""))
     return False
-
-
-def _normalize_slug(text):
-    """Normalize a path basename into a project slug (lowercase, safe chars)."""
-    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in text.strip().lower())
-    slug = slug.strip("-")
-    return slug or "default"
-
-
-def _project_slug(cwd):
-    """Derive the project slug: git toplevel basename, else cwd basename.
-
-    IDENTICAL to session_inject._project_slug so the write side lands episodic
-    memory on the same user_id the read side queries.
-    """
-    toplevel = None
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            toplevel = result.stdout.decode().strip() or None
-    except Exception:
-        toplevel = None
-    base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    return _normalize_slug(base)
 
 
 def _current_branch(cwd):
@@ -388,7 +394,7 @@ def _post(base_url, token, agent_id, activities):
         "Content-Type": "application/json",
         # CF 1010 Bot Fight Mode blocks UA-less requests through the proxy.
         "User-Agent": _USER_AGENT,
-        "X-Nexus-Source": "session-capture-hook",
+        "X-Nexus-Source": _identity.source_header(SOURCE_NAME),
     }
     if token:
         headers["X-API-Key"] = token
@@ -399,34 +405,81 @@ def _post(base_url, token, agent_id, activities):
         resp.read()  # drain; we do not need the body
 
 
-def main():
+def _collect(run):
+    """Do the work. Returns the reason; raises if the remote call fails.
+
+    ``run`` is filled in as facts become known, so that whatever happens next
+    -- a return or an exception -- the ledger record has the right project and
+    the number of calls actually attempted.
+    """
     raw = sys.stdin.read()
     event = json.loads(raw) if raw.strip() else {}
     if not isinstance(event, dict):
-        return  # malformed -> fail-open silent
+        raise ValueError("SessionEnd payload is not a JSON object")
+    if isinstance(event.get("cwd"), str) and event["cwd"]:
+        run["cwd"] = event["cwd"]
+    cwd = run["cwd"] or os.getcwd()
 
     base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
     if not base_url:
-        return  # no backend configured -> fail-open silent
+        return "not_configured"  # the default for a fresh install
 
     transcript_path = event.get("transcript_path")
     if not transcript_path or not os.path.isfile(transcript_path):
-        return  # nothing to capture -> fail-open silent
+        return "nothing_to_do"  # nothing to capture
 
     token = os.environ.get("NEXUS_API_TOKEN", "")
-    cwd = event.get("cwd") or os.getcwd()
-    agent_id = os.environ.get("NEXUS_DEFAULT_USER_ID") or _project_slug(cwd)
-    container_id = os.environ.get("NEXUS_CONTAINER_ID") or socket.gethostname()
+    agent_id = _identity.user_id(cwd)
+    container_id = _identity.container_id()
     branch = _current_branch(cwd)
     session_id = event.get("session_id")
 
     extracted = _parse_transcript(transcript_path)
     activities = _build_activities(extracted, container_id, branch, session_id)
+    run["extra"]["activities"] = len(activities)
     if not activities:
-        return  # nothing to send -> no request, fail-open silent
+        return "nothing_to_do"  # nothing to send -> no request
 
+    run["calls"] += 1  # counted before the call: a call that fails was still made
     _post(base_url, token, agent_id, activities)
     # SessionEnd injects no context -> no stdout on success.
+    return _hook_state.NO_REASON if _hook_state else "none"
+
+
+def _record(reason, started, run):
+    """Append this run to the ledger. Never raises."""
+    if _hook_state is None:
+        print(
+            f"[{HOOK}] run ledger unavailable ({_LEDGER_IMPORT_ERROR}); "
+            f"this run ({reason}) is not recorded",
+            file=sys.stderr,
+        )
+        return
+    try:
+        _hook_state.record_run(
+            HOOK,
+            ok=not _hook_state.is_failure_reason(reason),
+            reason=reason,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            calls=run["calls"],
+            cwd=run["cwd"],
+            extra=run["extra"] or None,
+        )
+    except Exception as exc:  # record_run does not raise by contract; the net under it
+        print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+
+
+def main():
+    started = time.monotonic()
+    run = {"cwd": None, "calls": 0, "extra": {}}
+    reason = "unknown"
+    try:
+        reason = _collect(run)
+    except Exception as exc:
+        # Still exit 0 with no stdout -- but no longer without a trace.
+        reason = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
+        print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+    _record(reason, started, run)
 
 
 if __name__ == "__main__":

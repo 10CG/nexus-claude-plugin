@@ -33,11 +33,14 @@ measured at 100% entry loss with two writers before this was fixed.
 
 import errno
 import fcntl
+import http.client
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
+import urllib.error
 from contextlib import contextmanager
 
 import _identity
@@ -126,6 +129,32 @@ _REASON_PRIORITY = (
 def is_failure_reason(reason):
     """True when a reason must be surfaced at the next SessionStart."""
     return reason in FAILURE_REASONS
+
+
+def reason_for_exception(exc):
+    """The failure reason for an exception raised around a remote call.
+
+    One mapping for every hook. Each hook growing its own is how one of them
+    ends up recording a rate limit as a generic error -- and the rate limit is
+    the case the spec treats differently (stop this round, do not retry).
+
+    Always a failure reason, never a skip: an exception is by definition not
+    the hook working correctly, and a skip is recorded without being reported.
+    Anything unrecognised is ``unknown`` rather than a guess.
+    """
+    # HTTPError first: it subclasses URLError, so the other order turns every
+    # 429 into http_error.
+    if isinstance(exc, urllib.error.HTTPError):
+        return "rate_limited" if exc.code == 429 else "http_error"
+    # socket.timeout is TimeoutError from 3.10 on, a separate OSError before.
+    timeouts = (socket.timeout, TimeoutError)
+    if isinstance(exc, timeouts):
+        return "timeout"  # raised bare when the read, not the connect, stalls
+    if isinstance(exc, urllib.error.URLError):
+        return "timeout" if isinstance(exc.reason, timeouts) else "http_error"
+    if isinstance(exc, (http.client.HTTPException, ConnectionError)):
+        return "http_error"
+    return "unknown"
 
 
 def worst_reason(reasons):

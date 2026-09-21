@@ -20,17 +20,63 @@ Coverage maps to workflow C acceptance:
   C3 bad-line skip; empty-activities -> no POST
 """
 
+import glob
 import importlib.util
 import io
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
+from unittest import mock
+
+import _hook_state
+import _identity
 
 _HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 _HOOK_SCRIPT = os.path.join(_HOOKS_DIR, "session_capture.py")
+
+
+# ── Hermetic module fixture ─────────────────────────────────────────────────────
+#
+# Every test here ends up running the hook, and since TASK-002 the hook writes a
+# run ledger -- under ~/.nexus/hooks unless told otherwise. The first full run of
+# this suite after that change wrote 39 fabricated records into the developer's
+# real home directory, where a later SessionStart would have reported them as
+# failures. So the whole module runs with HOME and NEXUS_HOOK_STATE_DIR pointed
+# at a throwaway directory, and asserts on the way out that the fake HOME is
+# still empty: a test that loses the override writes into it and turns this red.
+
+def _assert_home_untouched(home):
+    leaked = sorted(os.listdir(home))
+    if leaked:
+        raise AssertionError(f"a test wrote under HOME instead of the state dir: {leaked}")
+
+
+def setUpModule():
+    root = tempfile.mkdtemp(prefix="nexus-hooktest-")
+    unittest.addModuleCleanup(shutil.rmtree, root, ignore_errors=True)
+    home = os.path.join(root, "home")
+    os.makedirs(home)
+    patcher = mock.patch.dict(
+        os.environ, {"HOME": home, "NEXUS_HOOK_STATE_DIR": os.path.join(root, "state")}
+    )
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs first
+
+
+def _plugin_version():
+    """Read independently of _identity, so the two can only agree by both
+    being right."""
+    manifest = os.path.join(_HOOKS_DIR, "..", ".claude-plugin", "plugin.json")
+    with open(manifest, encoding="utf-8") as fh:
+        return json.load(fh)["version"]
 
 
 # ── In-process import of the hook module (for monkeypatch tests) ────────────────
@@ -47,21 +93,23 @@ _MOD = _load_module()
 
 # ── Subprocess driver (for fail-open / degenerate-stdin tests) ──────────────────
 
-def _run_hook(stdin_text, env=None):
+def _run_hook(stdin_text, env=None, drop=(), script=None, want_stderr=False):
     """Drive the hook as a subprocess; return (stdout_bytes, exit_code)."""
     run_env = dict(os.environ)
     for k in ("NEXUS_API_URL", "NEXUS_API_TOKEN", "NEXUS_DEFAULT_USER_ID",
-              "NEXUS_CONTAINER_ID"):
+              "NEXUS_CONTAINER_ID") + tuple(drop):
         run_env.pop(k, None)
     if env:
         run_env.update(env)
     result = subprocess.run(
-        [sys.executable, _HOOK_SCRIPT],
+        [sys.executable, script or _HOOK_SCRIPT],
         input=stdin_text.encode(),
         capture_output=True,
         timeout=20,
         env=run_env,
     )
+    if want_stderr:
+        return result.stdout, result.returncode, result.stderr.decode()
     return result.stdout, result.returncode
 
 
@@ -281,7 +329,11 @@ class TestActionMapping(unittest.TestCase):
 
         # User-Agent header present (CF 1010 guard) + source + content type.
         self.assertIn("User-agent", headers, f"User-Agent required (CF 1010): {headers}")
-        self.assertEqual(headers.get("X-nexus-source"), "session-capture-hook")
+        # <hook-name>/<version> since TASK-002; the backend attributes by the
+        # part before the slash, so the name half is unchanged on purpose.
+        self.assertEqual(
+            headers.get("X-nexus-source"), f"session-capture-hook/{_plugin_version()}"
+        )
         self.assertEqual(headers.get("X-api-key"), "tok123")
 
     def test_bash_pytest_maps_run_test(self):
@@ -633,6 +685,269 @@ class TestNonVacuity(unittest.TestCase):
         except AssertionError:
             triggered = True
         self.assertTrue(triggered, "Non-vacuity: git-commit Bash did not map to commit")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TASK-002 — run ledger, X-Nexus-Source, shared identity.
+# New tests use mock.patch / addCleanup only (TASK-011 audit rule): CI runs every
+# hook test in one process, so a patch that is not restored leaks everywhere.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _raising(exc):
+    def urlopen(req, timeout=None):
+        raise exc
+    return urlopen
+
+
+def _http_error(code):
+    return urllib.error.HTTPError("https://nexus.example/v1/activities/stream", code, "msg", {}, None)
+
+
+_HIGH_SIGNAL = (
+    _assistant_tool_use("Edit", {"file_path": "/r/a.py"}),
+    _assistant_tool_use("Bash", {"command": "git commit -m wip"}),
+)
+
+
+class _LedgerCase(unittest.TestCase):
+    """A private state dir per test, a pinned project, and a captured urlopen."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.path.join(self.tmp.name, "proj")
+        os.makedirs(self.cwd)
+        self.state_dir = os.path.join(self.tmp.name, "state")
+        self._patch(mock.patch.dict(os.environ, {
+            "NEXUS_HOOK_STATE_DIR": self.state_dir,
+            "NEXUS_API_URL": "https://nexus.example/v1",
+            "NEXUS_DEFAULT_USER_ID": "nexus",
+            "NEXUS_CONTAINER_ID": "dev-claude-308",
+            "NEXUS_API_TOKEN": "tok123",
+        }))
+        self._patch(mock.patch.object(_MOD, "_current_branch", return_value="feat/p1-capture"))
+        # The ledger directory is keyed by the project slug, which shells out to
+        # git. Patched on _identity: both the hook and _hook_state reach it by
+        # attribute, which is what makes this patch land (a `from` import would
+        # have bound the original at import time).
+        self._patch(mock.patch.object(_identity, "project_slug", return_value="proj"))
+
+    def _patch(self, patcher):
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _transcript(self, lines=_HIGH_SIGNAL):
+        path = _write_transcript(list(lines))
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _main(self, urlopen, event=None, stdin_text=None, mod=None):
+        mod = mod or _MOD
+        if stdin_text is None:
+            stdin_text = json.dumps(
+                {"cwd": self.cwd, "session_id": "s1", "transcript_path": self._transcript()}
+                if event is None else event
+            )
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(urllib.request, "urlopen", urlopen), \
+                mock.patch.object(sys, "stdin", io.StringIO(stdin_text)), \
+                mock.patch.object(sys, "stdout", out), \
+                mock.patch.object(sys, "stderr", err):
+            mod.main()
+        return out.getvalue(), err.getvalue()
+
+    def _entries(self):
+        entries, reasons = _hook_state.read_ledger("session-capture", self.cwd)
+        self.assertEqual(reasons, [])
+        return entries
+
+
+class TestLedger(_LedgerCase):
+
+    def test_a_successful_capture_records_one_clean_run(self):
+        cap = _UrlopenCapture()
+        out, _ = self._main(cap)
+        self.assertEqual(out, "", "SessionEnd never injects")
+        self.assertEqual(len(cap.requests), 1)
+        entries = self._entries()
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(
+            (entry["hook"], entry["ok"], entry["reason"], entry["calls"]),
+            ("session-capture", True, "none", 1),
+        )
+        self.assertIs(type(entry["elapsed_ms"]), int)
+        self.assertEqual(entry["activities"], len(cap.requests[0][1]["activities"]))
+        self.assertEqual(entry["activities"], 2)
+
+    def test_a_failed_post_is_recorded_with_its_own_reason(self):
+        cases = (
+            (_http_error(500), "http_error"),
+            (_http_error(429), "rate_limited"),
+            (socket.timeout("timed out"), "timeout"),
+            (urllib.error.URLError(ConnectionRefusedError()), "http_error"),
+        )
+        for count, (exc, expected) in enumerate(cases, start=1):
+            with self.subTest(expected=expected):
+                out, err = self._main(_raising(exc))  # and main() does not raise
+                self.assertEqual(out, "")
+                entries = self._entries()
+                self.assertEqual(len(entries), count, "every run appends exactly one record")
+                entry = entries[-1]
+                self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, expected, 1))
+                self.assertIn(expected, err)
+
+    def test_no_backend_configured_is_a_recorded_skip_and_makes_no_call(self):
+        urlopen = mock.Mock()
+        with mock.patch.dict(os.environ):
+            del os.environ["NEXUS_API_URL"]
+            self._main(urlopen)
+        urlopen.assert_not_called()
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (True, "not_configured", 0))
+
+    def test_nothing_to_capture_is_a_recorded_skip_not_silence(self):
+        """Exit 0 with no request is also what a broken capture hook looks like.
+        The ledger is the only thing that tells the two apart."""
+        urlopen = mock.Mock()
+        low_signal = self._transcript([_assistant_tool_use("Read", {"file_path": "/r/a.py"})])
+        events = (
+            {"cwd": self.cwd, "session_id": "s1"},  # no transcript at all
+            {"cwd": self.cwd, "transcript_path": os.path.join(self.tmp.name, "absent.jsonl")},
+            {"cwd": self.cwd, "transcript_path": low_signal},  # everything filtered out
+        )
+        for event in events:
+            with self.subTest(event=sorted(event)):
+                self._main(urlopen, event=event)
+                entry = self._entries()[-1]
+                self.assertEqual(
+                    (entry["ok"], entry["reason"], entry["calls"]), (True, "nothing_to_do", 0)
+                )
+        urlopen.assert_not_called()
+        self.assertEqual(self._entries()[-1]["activities"], 0)
+
+    def test_a_malformed_payload_is_recorded_not_swallowed(self):
+        urlopen = mock.Mock()
+        for payload in ("not json at all", "[]"):
+            with self.subTest(payload=payload):
+                self._main(urlopen, stdin_text=payload)
+                entry = self._entries()[-1]
+                self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
+        urlopen.assert_not_called()
+
+    def test_a_ledger_that_blows_up_does_not_take_the_hook_down(self):
+        cap = _UrlopenCapture()
+        with mock.patch.object(_hook_state, "record_run", side_effect=RuntimeError("disk on fire")):
+            _, err = self._main(cap)
+        self.assertEqual(len(cap.requests), 1, "the capture itself still went out")
+        self.assertIn("could not record", err)
+        self.assertIn("disk on fire", err)
+
+
+class TestSourceHeader(_LedgerCase):
+
+    def test_the_post_carries_name_slash_version(self):
+        cap = _UrlopenCapture()
+        self._main(cap)
+        _, _, headers = cap.requests[0]  # urllib title-cases header keys
+        self.assertEqual(
+            headers.get("X-nexus-source"), f"session-capture-hook/{_plugin_version()}"
+        )
+
+    def test_the_name_half_is_the_one_the_backend_allowlists(self):
+        """nexus `mcp_attribution._KNOWN_CLIENTS` contains this literal; a
+        rename sends every capture to source="unknown"."""
+        self.assertEqual(_MOD.SOURCE_NAME, "session-capture-hook")
+
+
+class TestIdentityIsShared(_LedgerCase):
+
+    def test_agent_id_and_container_id_come_from_the_shared_module(self):
+        """Not `equal to what _identity would say` -- *the same call*. The read
+        side uses it too, and two derivations that merely agree today are how
+        the two sides end up keying one project differently."""
+        cap = _UrlopenCapture()
+        with mock.patch.object(_identity, "user_id", return_value="pinned-user") as user_id, \
+                mock.patch.object(_identity, "container_id", return_value="pinned-container"):
+            self._main(cap)
+        user_id.assert_called_once_with(self.cwd)
+        _, body, _ = cap.requests[0]
+        self.assertEqual(body["agent_id"], "pinned-user")
+        containers = {a["activity_data"]["container_id"] for a in body["activities"]}
+        self.assertEqual(containers, {"pinned-container"})
+
+
+class TestStateDirectory(unittest.TestCase):
+    """The real script, as a subprocess, against a HOME of its own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.join(self.tmp.name, "home")
+        self.cwd = os.path.join(self.tmp.name, "proj")
+        os.makedirs(self.home)
+        os.makedirs(self.cwd)
+
+    def test_the_override_is_honoured_and_home_stays_clean(self):
+        state = os.path.join(self.tmp.name, "state")
+        stdout, code = _run_hook(
+            json.dumps({"cwd": self.cwd}), env={"HOME": self.home, "NEXUS_HOOK_STATE_DIR": state}
+        )
+        self.assertEqual((stdout, code), (b"", 0))
+        ledgers = glob.glob(os.path.join(state, "*", "session-capture.json"))
+        self.assertEqual(len(ledgers), 1, ledgers)
+        with open(ledgers[0], encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)[-1]["reason"], "not_configured")
+        self.assertEqual(os.listdir(self.home), [])
+
+    def test_without_the_override_the_ledger_lands_under_home(self):
+        """The other half: proves the test above can fail, and pins the default."""
+        stdout, code = _run_hook(
+            json.dumps({"cwd": self.cwd}), env={"HOME": self.home}, drop=("NEXUS_HOOK_STATE_DIR",)
+        )
+        self.assertEqual((stdout, code), (b"", 0))
+        ledgers = glob.glob(os.path.join(self.home, ".nexus", "hooks", "*", "session-capture.json"))
+        self.assertEqual(len(ledgers), 1, ledgers)
+
+
+class TestSharedModulesUnavailable(_LedgerCase):
+    """`_hook_state` needs fcntl, which a native Windows Python does not have.
+    Wiring the hook to the ledger must not make the ledger a precondition for
+    the hook's actual job."""
+
+    def _copy_hook_without(self, *missing):
+        target = os.path.join(self.tmp.name, "partial-install")
+        os.makedirs(target)
+        for name in ("session_capture.py", "_identity.py", "_hook_state.py"):
+            if name not in missing:
+                shutil.copy(os.path.join(_HOOKS_DIR, name), target)
+        return os.path.join(target, "session_capture.py")
+
+    def test_without_the_ledger_module_the_hook_still_captures(self):
+        with mock.patch.dict(sys.modules, {"_hook_state": None}):  # import -> ImportError
+            mod = _load_module()
+        self.assertIsNone(mod._hook_state)
+        cap = _UrlopenCapture()
+        with mock.patch.object(mod, "_current_branch", return_value="feat/p1-capture"):
+            _, err = self._main(cap, mod=mod)
+        self.assertEqual(len(cap.requests), 1)
+        self.assertIn("ledger unavailable", err)
+        self.assertFalse(os.path.exists(self.state_dir), "nothing should have been written")
+
+    def test_as_a_script_without_the_ledger_module_it_exits_zero(self):
+        script = self._copy_hook_without("_hook_state.py")
+        stdout, code, stderr = _run_hook(json.dumps({"cwd": self.cwd}), script=script, want_stderr=True)
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertIn("ledger unavailable", stderr)
+
+    def test_as_a_script_without_the_identity_module_it_exits_zero_and_says_why(self):
+        """A traceback here would be exit 1 -- a hook error on every session
+        end -- for a plugin whose whole contract is fail-open."""
+        script = self._copy_hook_without("_identity.py", "_hook_state.py")
+        stdout, code, stderr = _run_hook(json.dumps({"cwd": self.cwd}), script=script, want_stderr=True)
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertIn("_identity", stderr)
+        self.assertNotIn("Traceback", stderr)
 
 
 if __name__ == "__main__":
