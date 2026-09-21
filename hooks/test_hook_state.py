@@ -126,6 +126,9 @@ class TestReasonTables(_TempStateDir):
                     # Amendment A4-1 (TASK-001 pre-merge audit C3): conditions
                     # the spec's B/C/D rows name but left without a reason.
                     "rate_limited", "state_write_failed",
+                    # Amendments A4-4 / A4-5 (owner rulings 2026-09-21): both
+                    # started in the skip table.
+                    "dedup_merged", "pointer_unresolved",
                 }
             ),
         )
@@ -135,11 +138,12 @@ class TestReasonTables(_TempStateDir):
             _hook_state.SKIP_REASONS,
             frozenset(
                 {
-                    "not_owner", "opted_out", "empty_sections", "pointer_unresolved",
+                    "not_owner", "opted_out", "empty_sections",
                     "stale_local", "unchanged", "peer_absent", "fact_delta_truncated",
-                    "dedup_merged",
                     # Amendment A4-1, as above.
                     "not_configured", "nothing_to_do",
+                    # Amendment A4-5: the quiet half of the pointer split.
+                    "no_handoff",
                 }
             ),
         )
@@ -189,10 +193,34 @@ class TestReasonTables(_TempStateDir):
         self.assertFalse(_hook_state.is_failure_reason("not_owner"))
         self.assertTrue(_hook_state.is_failure_reason("identity_unresolved"))
 
-    def test_orphans_deleted_is_a_failure_reason(self):
-        """It is the only destructive action, so a non-zero count is reported
-        even though the cleanup itself may be correct."""
-        self.assertTrue(_hook_state.is_failure_reason("orphans_deleted"))
+    def test_every_destructive_action_is_a_failure_reason(self):
+        """Both reasons that delete rows on the server are reported, even
+        though the cleanup itself may be correct.
+
+        Amendment A4-4 (owner ruling 2026-09-21): dedup_merged sat in the skip
+        table while orphans_deleted -- the same kind of action -- sat here
+        under a comment calling it "the only destructive action". And the rows
+        dedup merges can only be this hook's own race, so a non-zero count also
+        says the idempotency protocol lost one.
+        """
+        for reason in ("orphans_deleted", "dedup_merged"):
+            with self.subTest(reason=reason):
+                self.assertTrue(_hook_state.is_failure_reason(reason))
+                self.assertNotIn(reason, _hook_state.SKIP_REASONS)
+
+    def test_no_handoffs_is_quiet_but_unlocatable_handoffs_are_loud(self):
+        """Amendment A4-5 (owner ruling 2026-09-21).
+
+        The same split the spec already makes one level down (empty_sections /
+        sections_unparsed), for the same reason: "this project keeps no
+        handoffs" must stay quiet forever, while "there are handoffs and none
+        could be located" is ingestion stalling -- a renamed template or a
+        broken frontmatter -- and from the outside the two look identical.
+        """
+        self.assertIn("no_handoff", _hook_state.SKIP_REASONS)
+        self.assertFalse(_hook_state.is_failure_reason("no_handoff"))
+        self.assertTrue(_hook_state.is_failure_reason("pointer_unresolved"))
+        self.assertNotIn("pointer_unresolved", _hook_state.SKIP_REASONS)
 
 
 class TestStateRoundTrip(_TempStateDir):
@@ -654,6 +682,36 @@ class TestWorstReason(_TempStateDir):
     def test_a_bare_string_is_not_iterated_per_character(self):
         """`worst_reason("timeout")` used to return "t"."""
         self.assertEqual(_hook_state.worst_reason("timeout"), "timeout")
+
+    def test_a_merge_in_an_otherwise_quiet_run_is_what_gets_recorded(self):
+        """The B row carries on after merging duplicates, so such a run ends on
+        a skip or clean -- and `unchanged` is appended first. Table membership
+        alone would not surface the merge: it has to win this collapse, or the
+        scalar the reporter reads says `unchanged`.
+        """
+        self.assertEqual(
+            _hook_state.worst_reason(["unchanged", "dedup_merged"]), "dedup_merged"
+        )
+        entry = _hook_state.record_run(
+            "handoff-ingest",
+            ok=True,
+            reason=_hook_state.worst_reason(["unchanged", "dedup_merged"]),
+            cwd=self.cwd,
+            extra={"dedup_merged": 1},
+        )
+        entries, _ = _hook_state.read_ledger("handoff-ingest", self.cwd)
+        self.assertEqual(entries[-1]["reason"], "dedup_merged")
+        self.assertEqual(entries[-1]["dedup_merged"], 1)
+        self.assertTrue(_hook_state.is_failure_reason(entry["reason"]))
+
+    def test_unlocatable_handoffs_outrank_a_skip_in_the_same_run(self):
+        self.assertEqual(
+            _hook_state.worst_reason(["not_configured", "pointer_unresolved"]),
+            "pointer_unresolved",
+        )
+        self.assertEqual(
+            _hook_state.worst_reason(["unchanged", "no_handoff"]), "unchanged"
+        )
 
 
 class TestStateAtomicity(_TempStateDir):

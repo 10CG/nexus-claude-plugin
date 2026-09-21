@@ -61,15 +61,28 @@ FAILURE_REASONS = frozenset(
         "rejected_422",
         "orphan_guard",
         "lock_unavailable",
-        # The only destructive action any hook takes, so a non-zero count is
-        # reported even though a successful cleanup is not an error.
+        # The two destructive actions: both delete rows on the server, so a
+        # non-zero count is reported even though a successful cleanup is not an
+        # error. dedup_merged started in the skip table, next to a comment here
+        # that called orphans_deleted "the only destructive action" (Amendment
+        # A4-4, owner ruling 2026-09-21). The rows it merges can only be this
+        # hook's own race, so a non-zero count also says the idempotency
+        # protocol lost one.
         "orphans_deleted",
+        "dedup_merged",
         "unknown",
         # Added by the TASK-001 pre-merge audit (Amendment A4-1): conditions
         # the B/C/D rows name but had no reason, which would have forced the
         # next author to reuse a wrong one.
         "rate_limited",  # 429; spec C row: "遇 429 停止本轮"
         "state_write_failed",  # could not persist state; the run will repeat
+        # Handoff files exist and none could be located (Amendment A4-5, owner
+        # ruling 2026-09-21). It used to be a skip that also covered "this
+        # project keeps no handoffs" -- now no_handoff, below. Same split as
+        # empty_sections / sections_unparsed one level down, for the same
+        # reason: a renamed template or a broken frontmatter must not stop
+        # ingestion silently.
+        "pointer_unresolved",
     }
 )
 
@@ -79,15 +92,17 @@ SKIP_REASONS = frozenset(
         "not_owner",
         "opted_out",
         "empty_sections",
-        "pointer_unresolved",
         "stale_local",
         "unchanged",
         "peer_absent",
         "fact_delta_truncated",
-        "dedup_merged",
         # Amendment A4-1, as above.
         "not_configured",  # no backend configured; the default for a fresh install
         "nothing_to_do",  # nothing to send this run
+        # Amendment A4-5: no handoff directory, or no handoff files in it. The
+        # default for any project that does not use aria handoffs, so it must
+        # stay quiet. "Files exist but none resolved" is pointer_unresolved.
+        "no_handoff",
     }
 )
 
