@@ -256,15 +256,33 @@ class TestRender(unittest.TestCase):
         self.assertNotIn("raw obs", brief)
 
     def test_session_summary_goes_first_and_each_layer_keeps_the_backend_order(self):
+        # Backend order runs against both content and id, so a secondary sort
+        # key on either would show up as a reordering.
         rows = [
-            _profile_row("migrated 1", layer="summary"),
+            _profile_row("migrated y", layer="summary"),
             _profile_row("raw obs", layer="observation"),
-            self._aggregated_row("episode 1"),
-            _profile_row("migrated 2", layer="summary"),
-            self._aggregated_row("episode 2"),
+            self._aggregated_row("episode z"),
+            _profile_row("migrated b", layer="summary"),
+            self._aggregated_row("episode a"),
         ]
+        for row, memory_id in zip(rows, ("m-4", "m-5", "m-3", "m-2", "m-1")):
+            row["memory_id"] = memory_id
         kept = [r["content"] for r in _MOD._settled_rows(rows)]
-        self.assertEqual(kept, ["episode 1", "episode 2", "migrated 1", "migrated 2"])
+        self.assertEqual(kept, ["episode z", "episode a", "migrated y", "migrated b"])
+
+    def test_a_profile_of_only_observations_renders_nothing(self):
+        """The rows carry a layer, just not a settled one: that is not the
+        no-layer case, and observations must not fall through into the brief."""
+        rows = [_profile_row("obs 1", layer="observation"), _profile_row("obs 2", layer="observation")]
+        self.assertEqual(_MOD._settled_rows(rows), [])
+        self.assertIsNone(_MOD._render(_MOD._settled_rows(rows)))
+
+    def test_an_empty_branch_is_rendered_like_a_missing_one(self):
+        migrated = _profile_row("old", layer="summary", branch="")
+        episode = self._aggregated_row("new", branch="")
+        lines = _MOD._render(_MOD._settled_rows([migrated, episode])).splitlines()
+        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
+        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
 
     def test_a_layer_value_that_is_not_a_known_string_is_dropped_not_raised(self):
         """`in` on the rank table hashes the value: a list would raise and take
@@ -390,6 +408,21 @@ class TestRequestParams(unittest.TestCase):
         self.assertNotIn("metadata_filter", body2, "tier-2 fallback must omit metadata_filter")
         # And the tier-2 hit must be rendered.
         self.assertIn("project level hit", out)
+
+    def test_known_limit_own_episodes_in_tier_one_keep_tier_two_from_running(self):
+        """Pinned known limit (10CG/nexus-claude-plugin#32 interim fix): this
+        container's aggregated episode on the branch satisfies tier 1, so the
+        project-level tier 2 -- the only source of the other container's rows
+        and of the migrated summaries -- is never sent. Workflow D (change 2
+        TASK-007) replaces the tiers; this test is expected to change then."""
+        own = TestRender._aggregated_row("my own episode", branch="feat/inject")
+        tier1 = {"profile": [own], "total_latency_ms": 1}
+        tier2 = {"profile": [_profile_row("other container episode", container_id="dev-claude2")],
+                 "total_latency_ms": 1}
+        cap, out = self._run_main_capturing([tier1, tier2], {"cwd": _HOOKS_DIR})
+        self.assertEqual(len(cap.requests), 1)
+        self.assertIn("my own episode", out)
+        self.assertNotIn("other container episode", out)
 
     def test_output_shape_and_provenance(self):
         resp = {"profile": [_profile_row("did a refactor", container_id="dev-claude-308",
