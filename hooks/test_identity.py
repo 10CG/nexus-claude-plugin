@@ -236,6 +236,46 @@ class TestProjectSlugAndUserId(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=OSError("no git")):
             self.assertEqual(_identity.project_slug(plain), "notarepo")
 
+    def test_slug_asks_git_once_per_process_per_cwd(self):
+        """Amendment A6-4: a SessionStart was measured at 11 `rev-parse
+        --show-toplevel` calls, each with a 5 s timeout. The second call for
+        the same cwd must come from the cache; a different cwd must not."""
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=done) as run:
+            self.assertEqual(_identity.project_slug("/x/therepo/a"), "therepo")
+            self.assertEqual(_identity.project_slug("/x/therepo/a"), "therepo")
+            self.assertEqual(run.call_count, 1)
+            _identity.project_slug("/x/therepo/b")
+            self.assertEqual(run.call_count, 2)
+
+    def test_project_identity_says_when_the_slug_is_a_guess(self):
+        """A8-4: outside a repository the basename is the answer; when git
+        could not be asked it is a guess, and a writer must not key rows by
+        a guess. The cache keeps the flag with the slug."""
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        not_a_repo = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: not a git repository (or any of the parent directories): .git\n",
+        )
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=not_a_repo):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", False))
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", True))
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", True))  # cached with the flag
+            self.assertEqual(_identity.project_slug(plain), "notarepo")
+        # Review R2-b: git present, repository present, answer refused.
+        refused = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: detected dubious ownership in repository at '/x/therepo'\n",
+        )
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=refused):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", True))
+
     def test_user_id_env_wins(self):
         with mock.patch.dict(os.environ, {"NEXUS_DEFAULT_USER_ID": "pinned"}):
             self.assertEqual(_identity.user_id(self.tmp.name), "pinned")

@@ -80,14 +80,37 @@ def normalize_slug(text):
     return slug or "default"
 
 
-def project_slug(cwd):
-    """Derive the project slug: git toplevel basename, else cwd basename.
+# One git call per process per cwd. A SessionStart with one failed ledger to
+# report was measured at 12 git subprocesses (11 of them `rev-parse
+# --show-toplevel`): every ledger path, state path and the user_id each asked
+# again. Normally that is tens of milliseconds, but each call carries a 5 s
+# timeout, so a git that hangs (NFS, an index lock) could eat the hook's whole
+# 25 s deadline. Caching also keeps one run internally consistent: two calls
+# that disagreed (git timing out once) used to overwrite the ledger history
+# (Amendment A5-5). Amendment A6-4.
+_SLUG_CACHE = {}  # cwd -> (slug, degraded)
 
-    The only copy: session_capture.py and session_inject.py each carried a
-    byte-identical one until TASK-002, which is two chances for the write side
-    and the read side to key the same project differently.
+
+def project_identity(cwd):
+    """``(slug, degraded)``: the project slug and whether it is a guess.
+
+    The slug is the git toplevel basename; outside a repository it is the cwd
+    basename, and that fallback is fine. ``degraded`` is True when git could
+    not be *asked* -- it timed out, is not installed, or refused to answer for
+    a directory that is a repository (``dubious ownership``) -- so the
+    fallback may name a different project than the one the rows are keyed by. That is not
+    fine: ``user_id`` derives from the same call, and one git hiccup would
+    file a whole run of writes under a different user_id, invisible to the
+    next run and to the orphan reconciliation (which lists rows by the new
+    id). A writer must record ``identity_unresolved`` and skip, not guess
+    (TASK-010 pre-merge review A8-4). Memoised per process by ``cwd``: one
+    git call per run, and one answer per run (Amendment A6-4).
     """
+    cached = _SLUG_CACHE.get(cwd)
+    if cached is not None:
+        return cached
     toplevel = None
+    degraded = False
     try:
         result = subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -96,10 +119,30 @@ def project_slug(cwd):
         )
         if result.returncode == 0:
             toplevel = result.stdout.decode().strip() or None
-    except Exception:
+        elif b"not a git repository" not in result.stderr.lower():
+            # git is there and refused to answer -- `dubious ownership`
+            # (a checkout mounted into a container under another uid, this
+            # repo's own deployment shape), a corrupt index, permissions.
+            # That IS a repository, and the basename is not its name.
+            degraded = True
+    except Exception:  # timeout, no git binary, a cwd that vanished
         toplevel = None
+        degraded = True
     base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    return normalize_slug(base)
+    identity = (normalize_slug(base), degraded)
+    _SLUG_CACHE[cwd] = identity
+    return identity
+
+
+def project_slug(cwd):
+    """Derive the project slug: git toplevel basename, else cwd basename.
+
+    The only copy: session_capture.py and session_inject.py each carried a
+    byte-identical one until TASK-002, which is two chances for the write side
+    and the read side to key the same project differently. See
+    ``project_identity`` for the degraded case a writer must check.
+    """
+    return project_identity(cwd)[0]
 
 
 def user_id(cwd):
