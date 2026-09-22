@@ -503,6 +503,7 @@ class TestMetadataOnlyChange(_ClientCase):
             "not JSON": ("body", {"aria.when": datetime(2026, 9, 22, tzinfo=timezone.utc)}),
             "NaN": ("body", {"aria.score": float("nan")}),
             "NUL in content": ("a\x00b", {}),
+            "NUL inside a metadata list": ("body", {"aria.tags": ["ok", "a\x00b"]}),
             "lone surrogate": ("a\ud800b", {}),
         }
         for label, (content, meta) in cases.items():
@@ -517,6 +518,15 @@ class TestMetadataOnlyChange(_ClientCase):
                 self.assertEqual((out.reason, out.action, out.calls), ("unknown", None, 1))
                 self.assertFalse(out.aborts_round, "a caller bug is per document, not a round stop")
                 self.assertEqual([r["method"] for r in backend.requests], ["GET"])
+
+    def test_a_document_that_writes_the_escape_sequence_is_still_sent(self):
+        """The NUL guard reads the body, not the serialised text: json escapes
+        a NUL to the six characters `\\u0000`, which a note *about* escape
+        sequences also contains -- and this repo's own memory has such notes."""
+        self.backend.reply(200, _page()).reply(201, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "s", "jsonb rejects \\u0000 in text", {"aria.description": "\\u0000"})
+        self.assertEqual((out.reason, out.action), (_hook_state.NO_REASON, "created"))
+        self.assertEqual(self.requests[1]["json"]["content"], "jsonb rejects \\u0000 in text")
 
     def test_a_key_the_caller_stops_sending_is_not_a_change(self):
         """Shallow merge keeps omitted keys, so dropping a flag cannot clear

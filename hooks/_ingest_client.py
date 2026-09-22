@@ -122,6 +122,26 @@ def content_hash(text):
     return "sha256:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def _has_nul(value, _depth=0):
+    """True when any string inside ``value`` carries a NUL character.
+
+    Checked on the body, not on the serialised text: json escapes a NUL to the
+    six characters ``\\u0000``, and so a document that merely *writes* those
+    six characters -- notes about escape sequences do -- would match and be
+    refused, where the server stores it fine (a real backend confirmed both
+    halves). Bounded like ``_redact.redact_object``: a cycle cannot be an
+    outbound body, but it must not hang the hook either."""
+    if isinstance(value, str):
+        return "\x00" in value
+    if _depth >= 64:
+        return False
+    if isinstance(value, dict):
+        return any(_has_nul(k, _depth + 1) or _has_nul(v, _depth + 1) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nul(item, _depth + 1) for item in value)
+    return False
+
+
 def _as_stored(value):
     """``value`` as the server gives it back: the JSON round trip turns a tuple
     into a list and an int dict key into a string, and comparing the raw value
@@ -332,11 +352,11 @@ class IngestClient:
             # the 500 the server answers, which is `http_error` and stops the
             # caller's whole round on this document, for every round after.
             try:
-                # allow_nan: NaN / Infinity are not JSON; the server 500s.
-                serialised = json.dumps(body, ensure_ascii=False, allow_nan=False)
-                if "\\u0000" in serialised:
+                if _has_nul(body):
                     # Valid JSON, but PostgreSQL rejects NUL in text / jsonb.
                     raise ValueError("body contains a NUL character")
+                # allow_nan: NaN / Infinity are not JSON; the server 500s.
+                serialised = json.dumps(body, ensure_ascii=False, allow_nan=False)
                 data = serialised.encode("utf-8")  # a lone surrogate raises here
             except (TypeError, ValueError, UnicodeEncodeError) as exc:
                 print(f"[{self.source_name}] {method} {path}: body is not sendable: {exc}", file=sys.stderr)
