@@ -35,16 +35,22 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
     returned profile is empty, a SECOND request is sent WITHOUT metadata_filter
     (project-level recall). This is the simplified stand-in for the full
     primary/same-branch-cross-container/project three-tier recall.
-    Known limit since 10CG/nexus-claude-plugin#32: tier 1 used to come back
-    empty almost always (migrated summaries carry no branch, observations are
-    filtered out), so tier 2 ran and rendered the migrated summaries. Now
-    this container's own aggregated episodes on the branch fill tier 1, and
-    tier 2 -- the only source of the other container's rows and of the
-    migrated summaries -- is not sent. A start then sees its own episodes
-    and not the other container's (before the fix it saw neither). Workflow D
-    (change 2 TASK-007) replaces these tiers with per-container grouping
-    and peer look-ups, and ships in the same release (TASK-008), so no
-    released client runs this in between. A test pins it.
+    Known limit since the layer whitelist (10CG/nexus-claude-plugin#32): tier
+    1 used to come back empty almost always (migrated summaries carry no
+    branch, observations are filtered out), so tier 2 ran and rendered the
+    migrated summaries. Now this container's own aggregated episodes fill
+    tier 1 -- on the current branch, or across all branches when the branch
+    is unknown, since the filter is then ``container_id`` alone -- and tier 2
+    is not sent. Tier 2 is the only source of the migrated summaries and of
+    this container's other branches, and the usual source of the other
+    container's rows (a hybrid tenant's sentence channel ignores the filter,
+    so some can arrive in tier 1 anyway). A start then sees its own episodes
+    and typically not the other container's -- before the whitelist it saw
+    neither. Workflow D (change 2 TASK-007) replaces these tiers with
+    per-container grouping and peer look-ups and ships in the same release
+    (TASK-008); until then an installed client stays on the snapshot it was
+    installed from, but the marketplace source pins no ref, so a fresh
+    install or an update takes main HEAD. A test pins it.
   - HTTP headers MUST include a User-Agent (SPIKE #8: requests through the CF
     proxy with no UA are blocked by CF 1010 Bot Fight Mode), plus X-API-Key,
     Content-Type, and X-Nexus-Source: sessionstart-hook/<plugin version>.
@@ -379,10 +385,11 @@ def _render(rows):
         meta = r.get("metadata") or {}
         container = meta.get("container_id", "?")
         branch = meta.get("branch")
-        if not branch:
+        if not isinstance(branch, str) or not branch.strip():
             # A migrated summary never had a branch: "-" says "none", where
-            # "?" would suggest one went missing. An empty string is missing
-            # too; rendered as-is it left an empty slot in the bracket.
+            # "?" would suggest one went missing. Empty, blank and non-string
+            # values are missing too; rendered as they came they left an empty
+            # (or nonsense) slot in the bracket.
             branch = "-" if meta.get("layer") == "summary" else "?"
         age = _age(meta)
         content = (r.get("content") or "").strip().replace("\n", " ")

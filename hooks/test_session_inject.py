@@ -284,6 +284,14 @@ class TestRender(unittest.TestCase):
         self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
         self.assertTrue(lines[2].endswith("· -] old"), lines[2])
 
+    def test_a_blank_or_non_string_branch_is_rendered_like_a_missing_one(self):
+        """Whitespace leaves the same empty slot an empty string did, and a
+        branch that is not a string is not a branch."""
+        for value in ("  ", "\t", 0, 7, ["main"]):
+            with self.subTest(value=value):
+                row = self._aggregated_row("x", branch=value)
+                self.assertTrue(_MOD._render(_MOD._settled_rows([row])).endswith("· ?] x"))
+
     def test_a_layer_value_that_is_not_a_known_string_is_dropped_not_raised(self):
         """`in` on the rank table hashes the value: a list would raise and take
         every other row down with it."""
