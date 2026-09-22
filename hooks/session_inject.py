@@ -41,12 +41,12 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
     migrated summaries. Now this container's own aggregated episodes fill
     tier 1 -- on the current branch, or across all branches when the branch
     is unknown, since the filter is then ``container_id`` alone -- and tier 2
-    is not sent. Tier 2 is the only source of the migrated summaries and of
-    this container's other branches, and the usual source of the other
-    container's rows (a hybrid tenant's sentence channel ignores the filter,
-    so some can arrive in tier 1 anyway). A start then sees its own episodes
-    and typically not the other container's -- before the whitelist it saw
-    neither. Workflow D (change 2 TASK-007) replaces these tiers with
+    is not sent. Tier 2 is the usual source of the migrated summaries, of this
+    container's other branches, and of the other container's rows -- "usual"
+    because a hybrid tenant's sentence channel sends no filter at all, so rows
+    of any of those kinds can arrive in tier 1 anyway. A start then sees its
+    own episodes and typically not the other container's -- before the
+    whitelist it saw neither. Workflow D (change 2 TASK-007) replaces these tiers with
     per-container grouping and peer look-ups and ships in the same release
     (TASK-008); until then an installed client stays on the snapshot it was
     installed from, but the marketplace source pins no ref, so a fresh
