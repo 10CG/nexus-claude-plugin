@@ -14,7 +14,11 @@ The protocol, per document (contract ``docs/architecture/memory-layers.md``
    metadata, ``aria.description`` included -- goes through ``_redact`` first,
    and the ``content_hash`` is taken of what is actually sent. A change to the
    redaction rules therefore changes the hash and re-writes the row, which is
-   the behaviour you want from a redactor that just learned a new shape.
+   the behaviour you want from a redactor that just learned a new shape --
+   **but only for a document the caller sends again**. memory-sync sends
+   nothing once every file is synced and clean, so it has to mark its synced
+   files dirty itself when the rules change (Amendment A8-2 ruling); this
+   client cannot see documents it is not given.
 2. Look up by ``(container_id, external_id)`` on the list endpoint, one page
    of five. Then **verify every returned row**: ``metadata.layer`` /
    ``external_id`` / ``container_id`` must equal what was asked for, byte for
@@ -30,13 +34,24 @@ The protocol, per document (contract ``docs/architecture/memory-layers.md``
    -- it is in the failure table (Amendment A4-4) and the caller collapses it
    with ``worst_reason`` so that a run that merged duplicates and then found
    nothing to change is reported as ``dedup_merged``, not ``unchanged``.
-4. One row: same hash → ``unchanged``; local timestamp older than the
-   server's → ``stale_local`` (do not clobber a newer copy from the other
-   container's checkout); else PATCH ``content`` + ``content_hash`` + the
-   ``aria.*`` keys only. Never ``session_id`` / ``branch`` / ``container_id``
-   / ``layer`` / ``external_id``: PATCH metadata is a shallow merge (§4) and
+4. One row: same hash **and** every ``aria.*`` key equal to the stored value
+   → ``unchanged``; local timestamp older than the server's → ``stale_local``
+   (do not clobber a newer copy from the other container's checkout); else
+   PATCH ``content_hash`` + the ``aria.*`` keys, plus ``content`` only when
+   the hash changed. Never ``session_id`` / ``branch`` / ``container_id`` /
+   ``layer`` / ``external_id``: PATCH metadata is a shallow merge (§4) and
    re-sending the identity keys is how an episode gets moved to another
-   session.
+   session. The ``aria.*`` comparison is what makes a metadata-only edit
+   travel: a memory file whose description changed but whose body did not,
+   or a handoff flipped from active to done, has the same content hash, and
+   judging on the hash alone recorded it as ``unchanged`` -- a skip-class
+   reason nobody is shown -- while the server kept the old description, the
+   one field the SessionStart injection renders (Amendment A8-1 follow-up).
+   Content is left out of a metadata-only PATCH because the backend
+   re-embeds whenever a PATCH carries content; ``updated_at`` moves either
+   way, so incremental readers see the change. A key the caller stops
+   sending is *not* removed (shallow merge keeps omitted keys): a caller
+   whose flag can turn off must send it as ``False``, not drop it.
 
 Every 2xx is checked for the shape the API promises (Amendment A5-4): a
 proxy's login page is a 200 too. GET must answer a memory list, POST and
@@ -435,7 +450,9 @@ class IngestClient:
 
         ``metadata`` is the full metadata for a POST (the identity keys are set
         here from the arguments; ``content_hash`` is computed here). On a PATCH
-        only ``content_hash`` and the ``aria.*`` keys are sent.
+        only ``content_hash`` and the ``aria.*`` keys are sent, with
+        ``content`` added only when the hash changed; a row whose hash and
+        ``aria.*`` values all match is ``unchanged``.
         ``local_updated_at`` (ISO-8601) is compared with the stored row's
         ``updated_key`` to refuse writing an older local copy over a newer
         server one.
@@ -498,7 +515,9 @@ class IngestClient:
         outcome.memory_id = row["memory_id"]
         stored = row.get("metadata") or {}
 
-        if stored.get("content_hash") == digest:
+        source_meta = {k: v for k, v in meta.items() if k.startswith(PATCH_PREFIX)}
+        content_changed = stored.get("content_hash") != digest
+        if not content_changed and all(stored.get(k) == v for k, v in source_meta.items()):
             outcome.reasons.append("unchanged")
             outcome.action = "unchanged"
             return outcome
@@ -508,13 +527,16 @@ class IngestClient:
             outcome.action = None
             return outcome.fail("stale_local", f"local {local_updated_at} < server {stored.get(updated_key)}")
 
-        patch_meta = {"content_hash": digest}
-        patch_meta.update({k: v for k, v in meta.items() if k.startswith(PATCH_PREFIX)})
+        patch = {"metadata": {"content_hash": digest, **source_meta}}
+        if content_changed:
+            # The backend re-embeds on any PATCH that carries content; a
+            # metadata-only edit (step 4) must not pay for that.
+            patch["content"] = content
         response = self._call(
             outcome,
             "PATCH",
             "/memories/" + urllib.parse.quote(row["memory_id"], safe=""),
-            body={"content": content, "metadata": patch_meta},
+            body=patch,
         )
         if response is None or self._refused(outcome, response, "update"):
             return outcome
