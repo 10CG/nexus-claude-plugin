@@ -5,6 +5,7 @@ test in ONE process, so use mock.patch / addCleanup only — never
 save-and-restore by hand, and never leave an env var popped.
 """
 
+import json
 import os
 import socket
 import subprocess
@@ -23,6 +24,16 @@ uuid: bfe8285d
 label:
 created_at: 2026-05-24T16:59:24Z
 """
+
+
+def _mentions(source, needle):
+    """`needle in source`, as a bool.
+
+    Not assertIn / assertNotIn: on failure those print the whole haystack, and
+    the haystack here is an entire hook source file -- 30 KB of output hiding a
+    one-line answer.
+    """
+    return needle in source
 
 
 def _read_sibling(name):
@@ -51,14 +62,28 @@ class TestContainerId(unittest.TestCase):
             with mock.patch("socket.gethostname", return_value="some-host"):
                 self.assertEqual(_identity.container_id(), "some-host")
 
-    def test_matches_session_capture_derivation(self):
-        """Same rule as the hook that writes observation rows.
+    def test_the_hooks_no_longer_carry_their_own_derivation(self):
+        """One rule, one place (TASK-002).
 
-        If these two ever diverge, the read side groups one container as two
-        and the aggregator tags rows the injection recipe will not match.
+        Until TASK-002 this test pinned the *text* of session_capture's copy,
+        because two independent derivations that merely agree are the setup
+        for the read side grouping one container as two. The copies are gone;
+        what is left to guard is somebody re-growing one. That each hook really
+        routes through this module is asserted behaviourally in its own suite.
         """
-        source = _read_sibling("session_capture.py")
-        self.assertIn('os.environ.get("NEXUS_CONTAINER_ID") or socket.gethostname()', source)
+        for name in ("session_capture.py", "session_inject.py"):
+            with self.subTest(hook=name):
+                source = _read_sibling(name)
+                self.assertFalse(
+                    _mentions(source, "socket.gethostname"), "derives the hostname itself"
+                )
+                self.assertFalse(
+                    _mentions(source, 'NEXUS_CONTAINER_ID")'), "reads NEXUS_CONTAINER_ID itself"
+                )
+                self.assertTrue(
+                    _mentions(source, "_identity.container_id()"),
+                    "does not call _identity.container_id()",
+                )
 
 
 class TestAriaUuid(unittest.TestCase):
@@ -234,9 +259,92 @@ class TestProjectSlugAndUserId(unittest.TestCase):
                 _identity.user_id("/somewhere")
         slug.assert_called_once_with("/somewhere")
 
-    def test_matches_session_capture_user_id_derivation(self):
-        source = _read_sibling("session_capture.py")
-        self.assertIn('os.environ.get("NEXUS_DEFAULT_USER_ID") or _project_slug(cwd)', source)
+    def test_the_hooks_no_longer_carry_their_own_slug(self):
+        """The three byte-identical copies collapsed onto this module in
+        TASK-002. A `def _project_slug` reappearing in a hook is the mass-
+        deletion failure above being set up again."""
+        for name in ("session_capture.py", "session_inject.py"):
+            with self.subTest(hook=name):
+                source = _read_sibling(name)
+                self.assertFalse(_mentions(source, "def _project_slug"), "re-grew _project_slug")
+                self.assertFalse(
+                    _mentions(source, "def _normalize_slug"), "re-grew _normalize_slug"
+                )
+                self.assertFalse(
+                    _mentions(source, 'NEXUS_DEFAULT_USER_ID")'),
+                    "reads NEXUS_DEFAULT_USER_ID itself",
+                )
+                self.assertTrue(
+                    _mentions(source, "_identity.user_id("), "does not call _identity.user_id()"
+                )
+
+
+class TestPluginVersion(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.manifest = os.path.join(self.tmp.name, "plugin.json")
+
+    def _with_manifest(self, text):
+        with open(self.manifest, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return mock.patch.object(_identity, "PLUGIN_MANIFEST", self.manifest)
+
+    def test_reads_the_real_manifest(self):
+        """Read independently here, so the two can only agree by both being
+        right -- not by sharing a parser."""
+        real = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json"
+        )
+        with open(real, encoding="utf-8") as fh:
+            expected = json.load(fh)["version"]
+        self.assertRegex(expected, r"^\d+\.\d+\.\d+")
+        self.assertEqual(_identity.plugin_version(), expected)
+
+    def test_missing_manifest_is_unknown_not_an_exception(self):
+        with mock.patch.object(_identity, "PLUGIN_MANIFEST", self.manifest + ".absent"):
+            self.assertEqual(_identity.plugin_version(), "unknown")
+
+    def test_unparsable_or_wrongly_shaped_manifest_is_unknown(self):
+        for text in ("{not json", "[]", '{"version": 7}', '{"version": ""}', "{}"):
+            with self.subTest(manifest=text), self._with_manifest(text):
+                self.assertEqual(_identity.plugin_version(), "unknown")
+
+    def test_a_version_that_is_not_header_safe_is_unknown(self):
+        """This value goes into an HTTP header. urllib rejects a header value
+        containing a newline by raising, which would fail the whole remote
+        call -- and the run with it -- over a cosmetic field."""
+        # "0.5.0\n" is the one that got through the first version of this
+        # check: `$` matches before a trailing newline, so an anchored pattern
+        # accepted it and the request died on "Invalid header value". Found by
+        # the pre-merge review, not by the cases that were here.
+        for bad in ("1.0\nX-Evil: 1", "1.0 beta", "1.0/2", "v" * 40, "1.0\r",
+                    "0.5.0\n", "\n0.5.0", "0.5.0\t"):
+            with self.subTest(version=bad), self._with_manifest(json.dumps({"version": bad})):
+                self.assertEqual(_identity.plugin_version(), "unknown")
+
+    def test_ordinary_prerelease_versions_survive(self):
+        for good in ("0.5.0", "1.2.3-rc.1", "1.2.3+build5"):
+            with self.subTest(version=good), self._with_manifest(json.dumps({"version": good})):
+                self.assertEqual(_identity.plugin_version(), good)
+
+
+class TestSourceHeader(unittest.TestCase):
+    def test_shape_is_name_slash_version(self):
+        with mock.patch.object(_identity, "plugin_version", return_value="9.9.9"):
+            self.assertEqual(
+                _identity.source_header("sessionstart-hook"), "sessionstart-hook/9.9.9"
+            )
+
+    def test_the_name_half_survives_the_backend_split(self):
+        """The backend attributes a request by `raw.split("/", 1)[0]` against
+        an allowlist (nexus `mcp_attribution._normalize_source`). Whatever this
+        returns, that split has to give back the bare hook name -- including
+        when the version could not be read."""
+        with mock.patch.object(_identity, "plugin_version", return_value="unknown"):
+            header = _identity.source_header("session-capture-hook")
+        self.assertEqual(header.split("/", 1)[0], "session-capture-hook")
+        self.assertEqual(header.count("/"), 1)
 
 
 if __name__ == "__main__":

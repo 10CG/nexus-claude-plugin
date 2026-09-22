@@ -53,31 +53,93 @@ Design contract (proposal nexus-replace-claude-mem workflow C):
         still an agent operation; the "other" enum value is reserved for future
         non-tool, non-message activity kinds and is not currently emitted).
   - agent_id = project slug: NEXUS_DEFAULT_USER_ID, else the normalized lowercase
-    basename of the git toplevel (or cwd) — IDENTICAL derivation to
-    session_inject.py so the captured episodic memories land on the same
-    user_id=project that the read side queries.
+    basename of the git toplevel (or cwd) — the SAME call session_inject.py
+    makes (``_identity.user_id``), so the captured episodic memories land on the
+    user_id=project that the read side queries. Both files used to carry a
+    byte-identical copy of the derivation instead.
   - provenance: every activity_data is augmented with container_id
-    (NEXUS_CONTAINER_ID, else hostname) + branch
+    (``_identity.container_id``: NEXUS_CONTAINER_ID, else hostname) + branch
     (``git -C cwd rev-parse --abbrev-ref HEAD``, omitted on failure) + session_id.
   - HTTP headers MUST include a User-Agent (CF 1010 Bot Fight Mode blocks UA-less
     requests through the proxy), plus X-API-Key (if token present), Content-Type,
-    and X-Nexus-Source: session-capture-hook. ~8s timeout. fail-open.
+    and X-Nexus-Source: session-capture-hook/<plugin version>. ~8s timeout.
+    fail-open.
   - Empty activity list -> no request sent. SessionEnd never injects context, so
     success produces NO stdout.
+  - RUN LEDGER: every run the process survives appends one record (ok / reason
+    / elapsed_ms / calls) via ``_hook_state.record_run`` — the fail-open paths
+    above included, since "exit 0 with no stdout" is exactly what a capture hook
+    that silently stopped working looks like from the outside. A hook the host
+    kills leaves nothing, so the work runs against a deadline of its own
+    (``_WORK_BUDGET_SECONDS``, recorded as ``timeout``) and the ledger write is
+    capped (``_LEDGER_BUDGET_SECONDS``). If ``_hook_state`` cannot be imported
+    (it needs ``fcntl``) the hook still captures and says so on stderr.
+  - A 2xx is not an acknowledgement: the response must be the API's JSON with a
+    positive integer ``accepted``, else ``http_error``. And zero activities is
+    only ``nothing_to_do`` when the transcript was readable; a transcript that
+    will not open, parses to nothing, or is long and holds no messages is
+    ``file_unparsable`` — its format belongs to Claude Code, not to this plugin.
+  - hooks.json gives this hook ``timeout: 60``. That is not slack: SessionEnd
+    hooks share a 1.5 s budget unless one declares a longer timeout, and this
+    hook's own HTTP timeout is 8 s.
 """
 
 import json
 import os
-import socket
 import subprocess
 import sys
+import threading
+import time
 import urllib.request
+
+# Siblings are imported by name, which only works while this file's directory
+# is on sys.path. PYTHONSAFEPATH=1 / `python -P` (3.11+) takes it off, and this
+# hook was one self-contained file until TASK-002 -- so put it back rather than
+# let an interpreter setting switch the plugin off.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+try:
+    import _identity
+except Exception as exc:  # a broken or partial install
+    # Imported by a test this must stay loud. Run as a hook it must not be:
+    # a traceback is exit 1, reported as a hook error on every session end.
+    if __name__ != "__main__":
+        raise
+    print(f"[session-capture] cannot import _identity: {exc!r}", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    import _hook_state
+except Exception as exc:  # e.g. no fcntl on a native Windows Python
+    # The ledger is bookkeeping. Losing it must not take the capture with it.
+    _hook_state = None
+    _LEDGER_IMPORT_ERROR = repr(exc)
+
+HOOK = "session-capture"  # names the ledger file
+
+# The name half of X-Nexus-Source. The backend attributes a request by this
+# exact string against an allowlist (nexus `mcp_attribution._KNOWN_CLIENTS`);
+# renaming it here sends every capture to source="unknown".
+SOURCE_NAME = "session-capture-hook"
 
 # Bounded capture: keep at most the most-recent _MAX_ACTIVITIES extracted
 # activities. The backend ActivityStreamRequest caps at 1000; we stay well under
 # so a long session never produces an oversized 422-bound payload.
 _MAX_ACTIVITIES = 200
 _HTTP_TIMEOUT_SECONDS = 8
+# How long the ledger write may hold up the exit. Normally it takes
+# milliseconds; this is the cap for when it does not (see _record).
+_LEDGER_BUDGET_SECONDS = 2.0
+# The hook's own deadline for everything before the ledger (see main). It has
+# to clear the nominal worst case -- two 5 s git calls and the POST -- and, with
+# the ledger budget, stay under the host's timeout.
+_WORK_BUDGET_SECONDS = 20.0
+# A transcript this long with not one user / assistant entry in it is not a
+# quiet session, it is a format this parser no longer understands. Below the
+# threshold it is just a session that was opened and closed.
+_SHAPE_SUSPECT_MIN_LINES = 20
 _USER_AGENT = "nexus-session-capture-hook/0.4"
 _SUMMARY_CAP = 200  # max chars of a command / path summary
 _USER_TEXT_CAP = 500  # max chars of a captured user message
@@ -176,32 +238,8 @@ def _is_low_signal(action, activity_data):
     return False
 
 
-def _normalize_slug(text):
-    """Normalize a path basename into a project slug (lowercase, safe chars)."""
-    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in text.strip().lower())
-    slug = slug.strip("-")
-    return slug or "default"
-
-
-def _project_slug(cwd):
-    """Derive the project slug: git toplevel basename, else cwd basename.
-
-    IDENTICAL to session_inject._project_slug so the write side lands episodic
-    memory on the same user_id the read side queries.
-    """
-    toplevel = None
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            toplevel = result.stdout.decode().strip() or None
-    except Exception:
-        toplevel = None
-    base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    return _normalize_slug(base)
+class _BadResponse(Exception):
+    """A 2xx that is not the API's acknowledgement."""
 
 
 def _current_branch(cwd):
@@ -329,21 +367,31 @@ def _extract_from_entry(entry):
 
 
 def _parse_transcript(path):
-    """Parse a JSONL transcript into a list of (action, activity_data_partial).
+    """Parse a JSONL transcript. Returns ``(extracted, stats)``.
 
-    Defensive: each line is JSON-decoded independently; a bad/blank/non-dict line
-    is skipped, never fatal. Returns the most-recent _MAX_ACTIVITIES.
+    ``extracted`` is the most-recent _MAX_ACTIVITIES (action,
+    activity_data_partial) pairs. Defensive: each line is JSON-decoded
+    independently; a bad/blank/non-dict line is skipped, never fatal.
+
+    ``stats`` counts non-blank ``lines``, lines that ``parsed`` as JSON, and
+    ``messages`` (user / assistant entries), so the caller can tell a session
+    with nothing worth capturing from a transcript it could not read.
     """
     extracted = []
+    stats = {"lines": 0, "parsed": 0, "messages": 0}
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
+            stats["lines"] += 1
             try:
                 entry = json.loads(line)
             except Exception:
                 continue  # malformed line -> skip
+            stats["parsed"] += 1
+            if isinstance(entry, dict) and (entry.get("type") or entry.get("role")) in ("user", "assistant"):
+                stats["messages"] += 1
             for action, ad in _extract_from_entry(entry):
                 # P0: drop low-signal activities at the source so the LLM
                 # extractor never sees navigation/search/read-only noise (C0d:
@@ -358,7 +406,20 @@ def _parse_transcript(path):
     # Bound to the most-recent activities (tail of the session).
     if len(extracted) > _MAX_ACTIVITIES:
         extracted = extracted[-_MAX_ACTIVITIES:]
-    return extracted
+    return extracted, stats
+
+
+def _unreadable(stats):
+    """True when zero activities means "could not read it", not "nothing there".
+
+    The transcript format belongs to Claude Code. If it changes, every session
+    parses to zero activities, and recording that as `nothing_to_do` -- an
+    expected skip, never reported -- would stop capture for good without a
+    word. Same split as empty_sections / sections_unparsed.
+    """
+    if stats["lines"] and not stats["parsed"]:
+        return True
+    return stats["parsed"] >= _SHAPE_SUSPECT_MIN_LINES and not stats["messages"]
 
 
 def _build_activities(extracted, container_id, branch, session_id):
@@ -380,15 +441,23 @@ def _build_activities(extracted, container_id, branch, session_id):
 
 
 def _post(base_url, token, agent_id, activities):
-    """POST the ActivityStreamRequest to /activities/stream. Raises on failure
-    (caller is wrapped in fail-open)."""
+    """POST the ActivityStreamRequest to /activities/stream. Returns how many
+    activities the backend acknowledged; raises on failure (caller is wrapped in
+    fail-open).
+
+    The response used to be drained and ignored, so ANY 2xx counted as a
+    capture. Reproduced: a POST answered with a 302 to a login page is re-issued
+    by urllib as a GET, comes back 200 text/html, and was recorded as a clean
+    run with nothing captured. The backend's answer is 201 with an integer
+    `accepted`; anything else is not an acknowledgement.
+    """
     body = {"agent_id": agent_id, "activities": activities}
     data = json.dumps(body).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         # CF 1010 Bot Fight Mode blocks UA-less requests through the proxy.
         "User-Agent": _USER_AGENT,
-        "X-Nexus-Source": "session-capture-hook",
+        "X-Nexus-Source": _identity.source_header(SOURCE_NAME),
     }
     if token:
         headers["X-API-Key"] = token
@@ -396,44 +465,177 @@ def _post(base_url, token, agent_id, activities):
         f"{base_url}/activities/stream", data=data, method="POST", headers=headers
     )
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECONDS) as resp:
-        resp.read()  # drain; we do not need the body
+        raw = resp.read()
+    try:
+        answer = json.loads(raw)
+    except ValueError as exc:
+        raise _BadResponse(f"body is not JSON: {exc}") from exc
+    accepted = answer.get("accepted") if isinstance(answer, dict) else None
+    if type(accepted) is not int or accepted <= 0:  # `type is`, so True is not 1
+        raise _BadResponse(f"no activities acknowledged (accepted={accepted!r})")
+    return accepted
 
 
-def main():
+def _collect(run):
+    """Do the work. Returns the reason; raises if the remote call fails.
+
+    ``run`` is filled in as facts become known, so that whatever happens next
+    -- a return or an exception -- the ledger record has the right project and
+    the number of calls actually attempted.
+    """
     raw = sys.stdin.read()
     event = json.loads(raw) if raw.strip() else {}
     if not isinstance(event, dict):
-        return  # malformed -> fail-open silent
+        raise ValueError("SessionEnd payload is not a JSON object")
+    if isinstance(event.get("cwd"), str) and event["cwd"]:
+        run["cwd"] = event["cwd"]
+    cwd = run["cwd"] or os.getcwd()
 
     base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
     if not base_url:
-        return  # no backend configured -> fail-open silent
+        return "not_configured"  # the default for a fresh install
 
     transcript_path = event.get("transcript_path")
     if not transcript_path or not os.path.isfile(transcript_path):
-        return  # nothing to capture -> fail-open silent
+        return "nothing_to_do"  # nothing to capture
 
     token = os.environ.get("NEXUS_API_TOKEN", "")
-    cwd = event.get("cwd") or os.getcwd()
-    agent_id = os.environ.get("NEXUS_DEFAULT_USER_ID") or _project_slug(cwd)
-    container_id = os.environ.get("NEXUS_CONTAINER_ID") or socket.gethostname()
+    agent_id = _identity.user_id(cwd)
+    container_id = _identity.container_id()
     branch = _current_branch(cwd)
     session_id = event.get("session_id")
 
-    extracted = _parse_transcript(transcript_path)
+    try:
+        extracted, stats = _parse_transcript(transcript_path)
+    except OSError:
+        # It is a file (checked above) and it would not open. Not a quiet session.
+        return "file_unparsable"
     activities = _build_activities(extracted, container_id, branch, session_id)
+    run["extra"].update(activities=len(activities), lines=stats["lines"], parsed=stats["parsed"])
     if not activities:
-        return  # nothing to send -> no request, fail-open silent
+        if _unreadable(stats):
+            return "file_unparsable"
+        return "nothing_to_do"  # nothing to send -> no request
 
-    _post(base_url, token, agent_id, activities)
+    run["calls"] += 1  # counted before the call: a call that fails was still made
+    run["extra"]["accepted"] = _post(base_url, token, agent_id, activities)
     # SessionEnd injects no context -> no stdout on success.
+    return _hook_state.NO_REASON if _hook_state else "none"
+
+
+def _record(reason, started, run):
+    """Append this run to the ledger, within a budget. Never raises.
+    Returns True when the write had to be left behind.
+
+    The write happens on a daemon thread that is abandoned after
+    ``_LEDGER_BUDGET_SECONDS``. Catching exceptions is not enough: the ledger
+    takes a blocking lock, and a write that STALLS keeps this process alive
+    until the host's timeout kills it -- and the host only uses the stdout of a
+    hook that exited 0, so the stall would cost the very output that was
+    written first to keep it safe. An abandoned daemon thread dies with the
+    interpreter.
+    """
+    if _hook_state is None:
+        print(
+            f"[{HOOK}] run ledger unavailable ({_LEDGER_IMPORT_ERROR}); "
+            f"this run ({reason}) is not recorded",
+            file=sys.stderr,
+        )
+        return False
+    elapsed_ms = int((time.monotonic() - started) * 1000)  # the hook's work, not the wait below
+    # Snapshot: if the work was abandoned, its thread may still be writing to `run`.
+    calls, cwd, extra = run["calls"], run["cwd"], dict(run["extra"])
+
+    def write():
+        try:
+            _hook_state.record_run(
+                HOOK,
+                ok=not _hook_state.is_failure_reason(reason),
+                reason=reason,
+                elapsed_ms=elapsed_ms,
+                calls=calls,
+                cwd=cwd,
+                extra=extra or None,
+            )
+        except Exception as exc:  # record_run does not raise by contract; the net under it
+            print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+
+    worker = threading.Thread(target=write, name=f"{HOOK}-ledger", daemon=True)
+    worker.start()
+    worker.join(_LEDGER_BUDGET_SECONDS)
+    if worker.is_alive():
+        print(
+            f"[{HOOK}] ledger write still running after {_LEDGER_BUDGET_SECONDS}s; "
+            f"leaving it behind, this run ({reason}) may go unrecorded",
+            file=sys.stderr,
+        )
+        return True
+    return False
+
+
+def main():
+    """Run the hook. Returns True when a worker thread had to be left behind."""
+    started = time.monotonic()
+    run = {"cwd": None, "calls": 0, "extra": {}}
+    outcome = {}
+
+    def work():  # never prints: a thread that may be abandoned must stay off stdio
+        try:
+            outcome["result"] = _collect(run)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    # The work runs against a deadline of its own. urllib's timeout is per
+    # socket operation, not per request -- one "6 s" request was measured at
+    # 24 s against a server that drips bytes -- and a hook the host has to kill
+    # leaves no record and, for SessionStart, no brief. So leave first.
+    worker = threading.Thread(target=work, name=f"{HOOK}-work", daemon=True)
+    worker.start()
+    worker.join(_WORK_BUDGET_SECONDS)
+    left_behind = worker.is_alive()
+
+    reason = "unknown"
+    if left_behind:
+        reason = "timeout"
+        print(
+            f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind",
+            file=sys.stderr,
+        )
+    elif "result" not in outcome:
+        # Still exit 0 with no stdout -- but no longer without a trace.
+        # `.get`: a worker that died of something `except Exception` does not
+        # catch (SystemExit) leaves neither key. Indexing "result" below would
+        # then raise out of main() into the blanket handler -- exit 0, no
+        # record -- which is the one outcome this file is built to rule out.
+        exc = outcome.get("error", RuntimeError("the worker ended without a result"))
+        if isinstance(exc, _BadResponse):
+            reason = "http_error"
+        else:
+            reason = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
+        print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+    else:
+        reason = outcome["result"]
+    return _record(reason, started, run) or left_behind
 
 
 if __name__ == "__main__":
+    left_behind = False
     try:
-        main()
+        left_behind = bool(main())
     except Exception:
         # FAIL-OPEN: ANY failure (config, network, timeout, parse, git) -> exit 0
         # with no stdout. Never block session teardown over activity capture.
         pass
+    if left_behind:
+        # A daemon thread is still running. Ordinary interpreter shutdown can
+        # die with "could not acquire lock for <stderr>" if that thread happens
+        # to be printing at that instant -- a non-zero exit, which for
+        # SessionStart costs the brief. Everything that matters has been
+        # flushed, so leave without the ceremony.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
     sys.exit(0)

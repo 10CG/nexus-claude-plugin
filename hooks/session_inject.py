@@ -21,6 +21,10 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
                           basename of the git toplevel (or cwd) — the project
                           slug (§6 user_id mapping).
       NEXUS_CONTAINER_ID -- container/provenance id; falls back to hostname.
+      NEXUS_HOOK_STATE_DIR -- where the run ledger lives (default ~/.nexus/hooks).
+    user_id and container_id come from ``_identity`` — the one derivation the
+    write side (session_capture.py) uses too. This file used to carry its own
+    byte-identical copy, which is two chances to key one project two ways.
   - Branch: ``git -C <cwd> rev-parse --abbrev-ref HEAD``. Non-git dir / git
     failure -> branch is omitted from the metadata_filter (no branch scoping).
   - Request body uses ``profile_limit`` (NOT ``limit`` — ContextRequest has no
@@ -33,7 +37,27 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
     primary/same-branch-cross-container/project three-tier recall.
   - HTTP headers MUST include a User-Agent (SPIKE #8: requests through the CF
     proxy with no UA are blocked by CF 1010 Bot Fight Mode), plus X-API-Key,
-    Content-Type, and X-Nexus-Source: sessionstart-hook.
+    Content-Type, and X-Nexus-Source: sessionstart-hook/<plugin version>.
+  - RUN LEDGER: every run the process survives appends one record (ok / reason
+    / elapsed_ms / calls) via ``_hook_state.record_run`` — the fail-open paths
+    above included, since "exit 0 with no stdout" is exactly what a hook that
+    silently stopped working looks like from the outside. A hook the host kills
+    leaves nothing, and its stdout is discarded too; so this one is built to
+    never need killing:
+      * the work runs against a deadline of its own (``_WORK_BUDGET_SECONDS``)
+        and records ``timeout`` — urllib's timeouts are per socket operation and
+        do not bound a request;
+      * the brief is written and flushed BEFORE the ledger is touched;
+      * the ledger write is capped (``_LEDGER_BUDGET_SECONDS``): it takes a
+        blocking lock, and ordering alone does not protect a brief from
+        bookkeeping that stalls;
+      * hooks.json ``timeout`` sits above deadline + cap, as a backstop.
+    If ``_hook_state`` cannot be imported at all (it needs ``fcntl``) the hook
+    still injects and says so on stderr.
+  - A 200 is not an answer. The backend degrades gracefully: a failed memory
+    lookup comes back 200 with ``profile: null`` and the error under ``errors``.
+    That, a body that is not JSON, and JSON of the wrong shape are all
+    ``http_error``; only an honest empty profile is ``nothing_to_do``.
   - Render: ONLY settled summaries (metadata.layer == "summary" preferred; if no
     profile item carries a ``layer`` key at all, take all of them). Each line is
     prefixed ``[<container_id> · <age> · <branch>]`` provenance (§6 — guard the
@@ -43,41 +67,71 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
 
 import json
 import os
-import socket
 import subprocess
 import sys
+import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
+
+# Siblings are imported by name, which only works while this file's directory
+# is on sys.path. PYTHONSAFEPATH=1 / `python -P` (3.11+) takes it off, and this
+# hook was one self-contained file until TASK-002 -- so put it back rather than
+# let an interpreter setting switch the plugin off.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+try:
+    import _identity
+except Exception as exc:  # a broken or partial install
+    # Imported by a test this must stay loud. Run as a hook it must not be:
+    # a traceback is exit 1, which Claude Code reports as a hook error on
+    # every single session start.
+    if __name__ != "__main__":
+        raise
+    print(f"[session-inject] cannot import _identity: {exc!r}", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    import _hook_state
+except Exception as exc:  # e.g. no fcntl on a native Windows Python
+    # The ledger is bookkeeping. Losing it must not take the injection with it.
+    _hook_state = None
+    _LEDGER_IMPORT_ERROR = repr(exc)
+
+HOOK = "session-inject"  # names the ledger file
+
+# The name half of X-Nexus-Source. The backend attributes a request by this
+# exact string against an allowlist (nexus `mcp_attribution._KNOWN_CLIENTS`).
+# It was missing from that list once, and 212 SessionStart calls on prod were
+# attributed to "unknown" before anyone looked. Renaming it here redoes that.
+SOURCE_NAME = "sessionstart-hook"
 
 # Per-request timeouts; worst-case total (tier1 + tier2) stays ~10s so a slow
 # backend never stalls session start beyond that (fail-open caps it anyway).
 _TIER1_TIMEOUT_SECONDS = 6
 _TIER2_TIMEOUT_SECONDS = 4
+# How long the ledger write may hold up the exit. Normally it takes
+# milliseconds; this is the cap for when it does not (see _record).
+# hooks.json `timeout` is checked against these numbers by a test.
+_LEDGER_BUDGET_SECONDS = 2.0
+# The hook's own deadline for everything before the ledger (see main). It has
+# to clear the nominal worst case -- two 5 s git calls and the two tiers -- and,
+# with the ledger budget, stay under the host's timeout.
+_WORK_BUDGET_SECONDS = 25.0
 _USER_AGENT = "nexus-sessionstart-hook/0.3"
 
 
-def _normalize_slug(text):
-    """Normalize a path basename into a project slug (lowercase, safe chars)."""
-    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in text.strip().lower())
-    slug = slug.strip("-")
-    return slug or "default"
+class _BadResponse(Exception):
+    """A 2xx that is not the API's answer: a body that is not JSON (a proxy or
+    challenge page), or JSON of the wrong shape."""
 
 
-def _project_slug(cwd):
-    """Derive the project slug: git toplevel basename, else cwd basename."""
-    toplevel = None
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            toplevel = result.stdout.decode().strip() or None
-    except Exception:
-        toplevel = None
-    base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    return _normalize_slug(base)
+# The server-side tasks whose results are merged into `profile`. The backend
+# degrades gracefully: when one of them raises, the response is still 200, with
+# the exception text under `errors[<task>]`.
+_PROFILE_TASKS = ("profile", "recent")
 
 
 def _current_branch(cwd):
@@ -116,7 +170,7 @@ def _retrieve(base_url, token, user_id, metadata_filter, timeout):
         # User-Agent is mandatory: CF 1010 Bot Fight Mode blocks UA-less requests
         # through the proxy (SPIKE #8).
         "User-Agent": _USER_AGENT,
-        "X-Nexus-Source": "sessionstart-hook",
+        "X-Nexus-Source": _identity.source_header(SOURCE_NAME),
     }
     if token:
         headers["X-API-Key"] = token
@@ -124,7 +178,33 @@ def _retrieve(base_url, token, user_id, metadata_filter, timeout):
         f"{base_url}/context/retrieve", data=data, method="POST", headers=headers
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)
+        try:
+            return json.load(resp)
+        except ValueError as exc:
+            raise _BadResponse(f"body is not JSON: {exc}") from exc
+
+
+def _rows_from(ctx, run):
+    """The settled rows of one response, after checking it is one.
+
+    Reading only `profile` is how a backend outage used to look exactly like a
+    project with no memories: `profile: null` plus `errors: {"profile": ...}`
+    came back as an empty list, and the run was recorded as `nothing_to_do` --
+    an expected skip, never reported.
+    """
+    if not isinstance(ctx, dict):
+        raise _BadResponse(f"expected a JSON object, got {type(ctx).__name__}")
+    errors = ctx.get("errors")
+    if isinstance(errors, dict):
+        failed = sorted(set(run["extra"].get("backend_errors", [])) | (set(errors) & set(_PROFILE_TASKS)))
+        if failed:
+            run["extra"]["backend_errors"] = failed
+    profile = ctx.get("profile")
+    if profile is None:
+        return []
+    if not isinstance(profile, list) or not all(isinstance(row, dict) for row in profile):
+        raise _BadResponse("`profile` is not a list of objects")
+    return _settled_rows(profile)
 
 
 def _settled_rows(profile):
@@ -176,24 +256,34 @@ def _render(rows):
         if len(content) > 300:
             content = content[:300] + "…"
         lines.append(f"  • [{container} · {age} · {branch}] {content}")
-    return "\n".join(lines)
+    # One row carrying a lone surrogate made the stdout write raise
+    # UnicodeEncodeError, and every other row went down with it.
+    return "\n".join(lines).encode("utf-8", "replace").decode("utf-8")
 
 
-def main():
+def _collect(run):
+    """Do the work. Returns ``(reason, brief)``; raises if a remote call fails.
+
+    ``run`` is filled in as facts become known, so that whatever happens next
+    -- a return or an exception -- the ledger record has the right project and
+    the number of calls actually attempted.
+    """
     raw = sys.stdin.read()
-    # SessionStart payload is parsed only to extract cwd; malformed -> fail-open.
+    # SessionStart payload is parsed only to extract cwd.
     event = json.loads(raw) if raw.strip() else {}
     if not isinstance(event, dict):
-        return
+        raise ValueError("SessionStart payload is not a JSON object")
+    if isinstance(event.get("cwd"), str) and event["cwd"]:
+        run["cwd"] = event["cwd"]
+    cwd = run["cwd"] or os.getcwd()
 
     base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
     if not base_url:
-        return  # no backend configured -> fail-open silent
+        return "not_configured", None  # the default for a fresh install
     token = os.environ.get("NEXUS_API_TOKEN", "")
 
-    cwd = event.get("cwd") or os.getcwd()
-    user_id = os.environ.get("NEXUS_DEFAULT_USER_ID") or _project_slug(cwd)
-    container_id = os.environ.get("NEXUS_CONTAINER_ID") or socket.gethostname()
+    user_id = _identity.user_id(cwd)
+    container_id = _identity.container_id()
     branch = _current_branch(cwd)
 
     # Tier 1: branch + container scoped (branch key omitted if branch unknown).
@@ -201,34 +291,177 @@ def main():
     if branch:
         metadata_filter["branch"] = branch
 
+    run["calls"] += 1  # counted before the call: a call that fails was still made
     ctx = _retrieve(base_url, token, user_id, metadata_filter, _TIER1_TIMEOUT_SECONDS)
-    profile = (ctx or {}).get("profile") or []
-    rows = _settled_rows(profile)
+    rows = _rows_from(ctx, run)
+    run["extra"]["tier"] = 1
 
     # Tier 2: project-level fallback (no metadata_filter) when tier 1 is empty.
     if not rows:
+        run["calls"] += 1
         ctx = _retrieve(base_url, token, user_id, None, _TIER2_TIMEOUT_SECONDS)
-        profile = (ctx or {}).get("profile") or []
-        rows = _settled_rows(profile)
+        rows = _rows_from(ctx, run)
+        run["extra"]["tier"] = 2
 
+    run["extra"]["rows"] = len(rows)
     brief = _render(rows)
+    if run["extra"].get("backend_errors"):
+        # Inject whatever did come back, and report what did not.
+        return "http_error", brief
     if not brief:
-        return  # nothing to inject -> fail-open silent
+        return "nothing_to_do", None  # nothing to inject
+    return (_hook_state.NO_REASON if _hook_state else "none"), brief
 
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": brief,
+
+def _warn(reason, exc):
+    print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+
+
+def _record(reason, started, run):
+    """Append this run to the ledger, within a budget. Never raises.
+    Returns True when the write had to be left behind.
+
+    The write happens on a daemon thread that is abandoned after
+    ``_LEDGER_BUDGET_SECONDS``. Catching exceptions is not enough: the ledger
+    takes a blocking lock, and a write that STALLS keeps this process alive
+    until the host's timeout kills it -- and the host only uses the stdout of a
+    hook that exited 0, so the stall would cost the very output that was
+    written first to keep it safe. An abandoned daemon thread dies with the
+    interpreter.
+    """
+    if _hook_state is None:
+        print(
+            f"[{HOOK}] run ledger unavailable ({_LEDGER_IMPORT_ERROR}); "
+            f"this run ({reason}) is not recorded",
+            file=sys.stderr,
+        )
+        return False
+    elapsed_ms = int((time.monotonic() - started) * 1000)  # the hook's work, not the wait below
+    # Snapshot: if the work was abandoned, its thread may still be writing to `run`.
+    calls, cwd, extra = run["calls"], run["cwd"], dict(run["extra"])
+
+    def write():
+        try:
+            _hook_state.record_run(
+                HOOK,
+                ok=not _hook_state.is_failure_reason(reason),
+                reason=reason,
+                elapsed_ms=elapsed_ms,
+                calls=calls,
+                cwd=cwd,
+                extra=extra or None,
+            )
+        except Exception as exc:  # record_run does not raise by contract; the net under it
+            print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+
+    worker = threading.Thread(target=write, name=f"{HOOK}-ledger", daemon=True)
+    worker.start()
+    worker.join(_LEDGER_BUDGET_SECONDS)
+    if worker.is_alive():
+        print(
+            f"[{HOOK}] ledger write still running after {_LEDGER_BUDGET_SECONDS}s; "
+            f"leaving it behind, this run ({reason}) may go unrecorded",
+            file=sys.stderr,
+        )
+        return True
+    return False
+
+
+def _silence_stdout():
+    """After a failed write, stop the interpreter retrying it on the way out.
+
+    Python flushes stdout again at exit. Against a pipe the host has already
+    closed that fails again, and the process exits 120 -- a hook error from a
+    plugin whose contract is exit 0, always.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except Exception:
+        pass  # not a real file descriptor (tests), or nothing left to protect
+
+
+def main():
+    """Run the hook. Returns True when a worker thread had to be left behind."""
+    started = time.monotonic()
+    run = {"cwd": None, "calls": 0, "extra": {}}
+    outcome = {}
+
+    def work():  # never prints: a thread that may be abandoned must stay off stdio
+        try:
+            outcome["result"] = _collect(run)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    # The work runs against a deadline of its own. urllib's timeout is per
+    # socket operation, not per request -- one "6 s" request was measured at
+    # 24 s against a server that drips bytes -- and a hook the host has to kill
+    # leaves no record and, for SessionStart, no brief. So leave first.
+    worker = threading.Thread(target=work, name=f"{HOOK}-work", daemon=True)
+    worker.start()
+    worker.join(_WORK_BUDGET_SECONDS)
+    left_behind = worker.is_alive()
+
+    reason, brief = "unknown", None
+    if left_behind:
+        reason = "timeout"
+        _warn(reason, f"no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind")
+    elif "result" not in outcome:
+        # Still exit 0 with no stdout -- but no longer without a trace.
+        # `.get`: a worker that died of something `except Exception` does not
+        # catch (SystemExit) leaves neither key. Indexing "result" below would
+        # then raise out of main() into the blanket handler -- exit 0, no
+        # record -- which is the one outcome this file is built to rule out.
+        exc = outcome.get("error", RuntimeError("the worker ended without a result"))
+        if isinstance(exc, _BadResponse):
+            reason = "http_error"
+        else:
+            reason = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
+        _warn(reason, exc)
+    else:
+        reason, brief = outcome["result"]
+        if run["extra"].get("backend_errors"):
+            _warn(reason, f"backend reported failures in {run['extra']['backend_errors']}")
+
+    if brief:
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": brief,
+            }
         }
-    }
-    sys.stdout.write(json.dumps(output, ensure_ascii=False))
+        # Before the ledger, not after: nothing below this line may cost the
+        # session its injection.
+        try:
+            sys.stdout.write(json.dumps(output, ensure_ascii=False))
+            sys.stdout.flush()
+        except Exception as exc:
+            reason = "unknown"
+            _warn("could not write the brief", exc)
+            _silence_stdout()
+
+    return _record(reason, started, run) or left_behind
 
 
 if __name__ == "__main__":
+    left_behind = False
     try:
-        main()
+        left_behind = bool(main())
     except Exception:
         # FAIL-OPEN: ANY failure (config, network, timeout, parse, git) -> exit 0
         # with no stdout. Never block session startup over memory retrieval.
         pass
+    if left_behind:
+        # A daemon thread is still running. Ordinary interpreter shutdown can
+        # die with "could not acquire lock for <stderr>" if that thread happens
+        # to be printing at that instant -- a non-zero exit, which for
+        # SessionStart costs the brief. Everything that matters has been
+        # flushed, so leave without the ceremony.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
     sys.exit(0)
