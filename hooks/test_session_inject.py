@@ -231,6 +231,64 @@ class TestRender(unittest.TestCase):
         kept = _MOD._settled_rows(rows)
         self.assertEqual(len(kept), 2)
 
+    # ── 10CG/nexus-claude-plugin#32: the aggregator's layer is session_summary ──
+
+    @staticmethod
+    def _aggregated_row(content, *, branch="feat/x", container_id="dev-claude-308"):
+        """A row as `workers/session_aggregator.py` writes it: the provenance
+        keys only when the session's observations agree on one, and no
+        timestamp in the metadata."""
+        meta = {"layer": "session_summary", "session_id": "s-1", "source_activity_count": 3,
+                "observation_ids": ["t::u::a"], "aggregation_hash": "h"}
+        if branch is not None:
+            meta["branch"] = branch
+        if container_id is not None:
+            meta["container_id"] = container_id
+        return {"memory_id": "m2", "content": content, "memory_type": "episodic", "metadata": meta}
+
+    def test_a_profile_of_aggregated_summaries_is_rendered(self):
+        """The bug itself: a profile holding only session_summary rows used to
+        render nothing, so the brief fell back to July's migrated summaries."""
+        rows = [self._aggregated_row("episode one"), _profile_row("raw obs", layer="observation")]
+        brief = _MOD._render(_MOD._settled_rows(rows))
+        self.assertIsNotNone(brief)
+        self.assertIn("episode one", brief)
+        self.assertNotIn("raw obs", brief)
+
+    def test_session_summary_goes_first_and_each_layer_keeps_the_backend_order(self):
+        rows = [
+            _profile_row("migrated 1", layer="summary"),
+            _profile_row("raw obs", layer="observation"),
+            self._aggregated_row("episode 1"),
+            _profile_row("migrated 2", layer="summary"),
+            self._aggregated_row("episode 2"),
+        ]
+        kept = [r["content"] for r in _MOD._settled_rows(rows)]
+        self.assertEqual(kept, ["episode 1", "episode 2", "migrated 1", "migrated 2"])
+
+    def test_a_layer_value_that_is_not_a_known_string_is_dropped_not_raised(self):
+        """`in` on the rank table hashes the value: a list would raise and take
+        every other row down with it."""
+        rows = [self._aggregated_row("keep"), _profile_row("list", layer=["summary"]),
+                _profile_row("number", layer=7), _profile_row("unknown", layer="fact")]
+        self.assertEqual([r["content"] for r in _MOD._settled_rows(rows)], ["keep"])
+
+    def test_branch_shows_dash_for_a_migrated_summary_and_question_mark_otherwise(self):
+        migrated = _profile_row("old", layer="summary")
+        del migrated["metadata"]["branch"]
+        mixed_session = self._aggregated_row("new", branch=None)  # no unique branch
+        brief = _MOD._render(_MOD._settled_rows([migrated, mixed_session]))
+        lines = brief.splitlines()
+        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
+        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
+
+    def test_an_aggregated_row_renders_its_provenance_with_an_unknown_age(self):
+        """Neither the aggregator's metadata nor a profile row carries a
+        timestamp, so the age is '?' until workflow D (TASK-007) reads
+        `created_at` from the list endpoint. Pinned so that change is seen."""
+        brief = _MOD._render(_MOD._settled_rows([self._aggregated_row("did it", branch="feat/us-037")]))
+        self.assertIn("[dev-claude-308 · ? · feat/us-037] did it", brief)
+
     def test_render_has_provenance(self):
         rows = [_profile_row("did the thing", container_id="dev-claude-308",
                              branch="feat/us-037")]
