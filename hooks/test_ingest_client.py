@@ -443,6 +443,47 @@ class TestMetadataOnlyChange(_ClientCase):
         )
         self.assertEqual((out.reason, out.calls), ("stale_local", 1))
 
+    def test_a_metadata_only_patch_is_redacted_before_send(self):
+        """The PATCH body is built from the redacted metadata, as the POST is;
+        built from the caller's own dict it would store the secret."""
+        raw = "rotate it: password: hunter22x9"
+        self._one_row("body", extra={"aria.description": "old description"})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "slug", "body", {"aria.description": raw})
+        self.assertEqual((out.action, out.redacted), ("updated", 1))
+        sent = self.requests[1]["json"]
+        self.assertEqual(sent["metadata"]["aria.description"], _redact.redact_text(raw)[0])
+        self.assertEqual(_redact.find(json.dumps(sent)), [])
+
+    def test_values_the_json_round_trip_reshapes_still_compare_equal(self):
+        """A tuple comes back as a list and an int key as a string; compared
+        raw they would differ on every run, and every run would PATCH."""
+        self._one_row("body", extra={"aria.tags": ["a", "b"], "aria.by_id": {"1": "x"}})
+        out = self.client().upsert("fact", "slug", "body", {"aria.tags": ("a", "b"), "aria.by_id": {1: "x"}})
+        self.assertEqual((out.reason, out.calls), ("unchanged", 1))
+
+    def test_equal_timestamps_do_not_make_a_metadata_edit_stale(self):
+        """Only an OLDER local copy is stale. A handoff whose status flipped
+        without touching updated-at, or a memory file whose description changed
+        under an explicit `modified:`, arrives with equal timestamps."""
+        ts = "2026-09-22T00:00:00Z"
+        self._one_row("body", extra={"aria.description": "old", "aria.modified": ts})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert(
+            "fact", "slug", "body", {"aria.description": "new", "aria.modified": ts},
+            local_updated_at=ts, updated_key="aria.modified",
+        )
+        self.assertEqual(out.action, "updated")
+
+    def test_a_key_the_stored_row_lacks_is_a_change(self):
+        """A source key the caller starts sending must reach the rows written
+        before it existed."""
+        self._one_row("body", extra={"aria.description": "d"})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "slug", "body", {"aria.description": "d", "aria.origin_session": "s-1"})
+        self.assertEqual(out.action, "updated")
+        self.assertEqual(self.requests[1]["json"]["metadata"]["aria.origin_session"], "s-1")
+
     def test_a_key_the_caller_stops_sending_is_not_a_change(self):
         """Shallow merge keeps omitted keys, so dropping a flag cannot clear
         it; only the keys the caller sends are compared. Pinned so nobody reads

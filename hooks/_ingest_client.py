@@ -110,8 +110,25 @@ ROUND_ABORT_REASONS = frozenset({"ingest_disabled", "rate_limited", "http_error"
 
 def content_hash(text):
     """``sha256:<hex>`` of the UTF-8 text. One scheme for both hooks and the
-    memory-sync state, so a hash can be compared wherever it is found."""
+    memory-sync state, so a hash can be compared wherever it is found -- but
+    mind what goes in. The server row's ``content_hash`` is of the redacted
+    body, i.e. what was sent. memory-sync's dirty check must hash the whole
+    file, frontmatter included: hashing the body there would never see an
+    edit confined to the frontmatter (the description), and the file would
+    never be sent for the metadata comparison in ``upsert`` to catch."""
     return "sha256:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _as_stored(value):
+    """``value`` as the server gives it back: the JSON round trip turns a tuple
+    into a list and an int dict key into a string, and comparing the raw value
+    with what the server returns would never be equal -- a PATCH on every run.
+    A value that is not JSON at all is returned as is; the request that would
+    carry it fails on its own."""
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError):
+        return value
 
 
 class Outcome:
@@ -517,7 +534,9 @@ class IngestClient:
 
         source_meta = {k: v for k, v in meta.items() if k.startswith(PATCH_PREFIX)}
         content_changed = stored.get("content_hash") != digest
-        if not content_changed and all(stored.get(k) == v for k, v in source_meta.items()):
+        # A key the stored row lacks is a change: a source key the caller
+        # starts sending has to reach the rows written before it existed.
+        if not content_changed and all(k in stored and stored[k] == _as_stored(v) for k, v in source_meta.items()):
             outcome.reasons.append("unchanged")
             outcome.action = "unchanged"
             return outcome
