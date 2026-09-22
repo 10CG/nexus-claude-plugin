@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+from datetime import datetime, timezone
 from unittest import mock
 
 import _hook_state
@@ -483,6 +484,39 @@ class TestMetadataOnlyChange(_ClientCase):
         out = self.client().upsert("fact", "slug", "body", {"aria.description": "d", "aria.origin_session": "s-1"})
         self.assertEqual(out.action, "updated")
         self.assertEqual(self.requests[1]["json"]["metadata"]["aria.origin_session"], "s-1")
+
+    def test_a_key_the_stored_row_lacks_is_a_change_even_when_its_value_is_none(self):
+        """The row says nothing about the key; sending null says something.
+        Pinned because dropping the membership test would read the two as
+        equal, and the row would never learn the key exists."""
+        self._one_row("body", extra={"aria.description": "d"})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "slug", "body", {"aria.description": "d", "aria.origin_session": None})
+        self.assertEqual(out.action, "updated")
+        self.assertIn("aria.origin_session", self.requests[1]["json"]["metadata"])
+
+    def test_a_body_the_caller_made_unsendable_is_a_caller_bug_not_an_exception(self):
+        """Raising here would be swallowed by the hooks' blanket handler, and
+        the server's 500 would be `http_error` -- a round stop that parks the
+        caller's cursor on this document for every round after."""
+        cases = {
+            "not JSON": ("body", {"aria.when": datetime(2026, 9, 22, tzinfo=timezone.utc)}),
+            "NaN": ("body", {"aria.score": float("nan")}),
+            "NUL in content": ("a\x00b", {}),
+            "lone surrogate": ("a\ud800b", {}),
+        }
+        for label, (content, meta) in cases.items():
+            with self.subTest(label):
+                backend = _Backend()
+                self.addCleanup(backend.close)
+                backend.reply(200, _page())  # empty page -> POST attempt
+                with mock.patch("sys.stderr"):
+                    out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert(
+                        "fact", "s", content, meta
+                    )
+                self.assertEqual((out.reason, out.action, out.calls), ("unknown", None, 1))
+                self.assertFalse(out.aborts_round, "a caller bug is per document, not a round stop")
+                self.assertEqual([r["method"] for r in backend.requests], ["GET"])
 
     def test_a_key_the_caller_stops_sending_is_not_a_change(self):
         """Shallow merge keeps omitted keys, so dropping a flag cannot clear

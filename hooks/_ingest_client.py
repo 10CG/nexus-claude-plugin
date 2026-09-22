@@ -62,7 +62,10 @@ STRUCTURED_INGEST_DISABLED`` is ``ingest_disabled`` (the tenant switch, §3.5;
 not retried), ``429`` is ``rate_limited`` (``Retry-After`` kept for the
 ledger; not retried), ``422`` is ``rejected_422``; network failures map
 through ``_hook_state.reason_for_exception``. Nothing here raises for a
-remote condition: every path returns an ``Outcome`` the caller records.
+remote condition: every path returns an ``Outcome`` the caller records. Nor
+for a local one: a body the caller made unsendable -- not JSON, ``NaN``, a
+NUL, a lone surrogate -- is ``unknown`` on stderr, per document, and no
+request is made.
 
 Time is bounded twice. ``timeout`` is urllib's, which is per socket
 operation, not per request: a server that drips four bytes every 50 ms kept
@@ -124,7 +127,8 @@ def _as_stored(value):
     into a list and an int dict key into a string, and comparing the raw value
     with what the server returns would never be equal -- a PATCH on every run.
     A value that is not JSON at all is returned as is; the request that would
-    carry it fails on its own."""
+    carry it is then refused as a caller bug (``unknown``, see ``_call``),
+    not raised."""
     try:
         return json.loads(json.dumps(value))
     except (TypeError, ValueError):
@@ -319,7 +323,25 @@ class IngestClient:
         url = f"{self.base_url}{path}"
         if query:
             url += "?" + urllib.parse.urlencode(query)
-        data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        data = None
+        if body is not None:
+            # Serialising here, inside the classified paths: a body the caller
+            # made unsendable is a caller bug, and it must land as `unknown`
+            # (per document, on stderr) rather than as an exception -- the
+            # hooks' blanket handler would swallow that into silence -- or as
+            # the 500 the server answers, which is `http_error` and stops the
+            # caller's whole round on this document, for every round after.
+            try:
+                # allow_nan: NaN / Infinity are not JSON; the server 500s.
+                serialised = json.dumps(body, ensure_ascii=False, allow_nan=False)
+                if "\\u0000" in serialised:
+                    # Valid JSON, but PostgreSQL rejects NUL in text / jsonb.
+                    raise ValueError("body contains a NUL character")
+                data = serialised.encode("utf-8")  # a lone surrogate raises here
+            except (TypeError, ValueError, UnicodeEncodeError) as exc:
+                print(f"[{self.source_name}] {method} {path}: body is not sendable: {exc}", file=sys.stderr)
+                outcome.fail("unknown", f"{method} {path}: body is not sendable: {exc}")
+                return None
         write = method in ("POST", "PATCH", "DELETE")
         req = urllib.request.Request(url, data=data, method=method, headers=self._headers(write, data is not None))
         outcome.calls += 1  # counted before the call: a call that fails was still made
