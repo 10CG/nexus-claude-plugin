@@ -653,6 +653,52 @@ class TestReviewRound1(_ClientCase):
         self.assertNotIn("content-type", delete["headers"])
         self.assertEqual(delete["headers"]["x-bulk-import"], "true")
 
+    def test_a_dripping_body_is_bounded_without_a_deadline_too(self):
+        """R2-a: the default construction used to keep the unbounded read."""
+        self.backend.drip = (b"    ", 0.05, 200)
+        self.backend.reply(200, None)
+        started = time.monotonic()
+        out = self.client(timeout=0.5).upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "timeout")
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_the_socket_timeout_never_exceeds_what_is_left(self):
+        """R2 survivor N9: `min(timeout, left)` had no test."""
+        seen = []
+
+        def opener(req, timeout=None):
+            seen.append(timeout)
+            raise ConnectionRefusedError(111, "refused")
+
+        client = _ingest_client.IngestClient(self.backend.url, "", USER, CONTAINER, HOOK, timeout=8.0, deadline=time.monotonic() + 0.3, opener=opener)
+        out = client.upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "http_error")
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(seen[0], 0.3)
+
+    def test_a_row_missing_a_key_is_not_ours_and_the_keys_must_be_given(self):
+        """R2 survivor N8: `==` alone matched a missing key against a None."""
+        row = _row("s", content_hash="x")
+        del row["metadata"]["container_id"]
+        self.backend.reply(200, _page(row))
+        out = self.client().upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "filter_suspect")
+        for layer, ext in ((None, "s"), ("fact", None), ("", "s"), ("fact", " ")):
+            with self.subTest((layer, ext)), mock.patch("sys.stderr"):
+                out = self.client().upsert(layer, ext, "c", {})
+                self.assertEqual((out.reason, out.calls), ("unknown", 0))
+                out = self.client().delete(layer, ext)
+                self.assertEqual((out.reason, out.calls), ("unknown", 0))
+
+    def test_a_degraded_identity_refuses_to_write_or_delete(self):
+        """R2 C: the check lives in the one module that writes, not in each
+        caller's memory. `_identity.project_identity(cwd)[1]` feeds it."""
+        client = self.client(identity_degraded=True)
+        for out in (client.upsert("fact", "s", "c", {}), client.delete("fact", "s")):
+            self.assertEqual((out.reason, out.calls, out.action), ("identity_unresolved", 0, None))
+        self.assertEqual(self.requests, [])
+        self.assertTrue(_hook_state.is_failure_reason("identity_unresolved"))
+
     def test_an_oversized_body_is_http_error(self):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m", "pad": "x" * 4096})
         out = self.client(max_body_bytes=1024).upsert("fact", "s", "c", {})

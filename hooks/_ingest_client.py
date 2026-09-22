@@ -174,12 +174,18 @@ def _parse_instant(value):
     return parsed
 
 
-def _read_body(resp, deadline, cap):
-    """Read a response body in chunks against the deadline and the size cap.
+def _read_body(resp, deadline, cap, timeout):
+    """Read a response body in chunks against a clock and the size cap.
 
     ``resp.read()`` would honour the socket timeout per chunk and never the
-    total; a dripping server keeps it going indefinitely.
+    total; a dripping server keeps it going indefinitely. Without a caller
+    deadline the read is still bounded, by ``timeout`` from its start: the
+    first draft bounded it only when a deadline was passed, so the default
+    construction kept the unbounded behaviour (review R2-a).
     """
+    limit = time.monotonic() + timeout
+    if deadline is not None:
+        limit = min(limit, deadline)
     chunks = []
     size = 0
     # read1: whatever one recv delivers. read(n) would wait for n bytes or
@@ -187,7 +193,7 @@ def _read_body(resp, deadline, cap):
     # wait is the very thing the deadline exists to cut.
     read = getattr(resp, "read1", None) or resp.read
     while True:
-        if deadline is not None and time.monotonic() >= deadline:
+        if time.monotonic() >= limit:
             raise socket.timeout("deadline reached while reading the body")
         chunk = read(65536)
         if not chunk:
@@ -216,6 +222,7 @@ class IngestClient:
         timeout=DEFAULT_TIMEOUT_SECONDS,
         bulk=False,
         deadline=None,
+        identity_degraded=False,
         opener=None,
         max_body_bytes=MAX_BODY_BYTES,
     ):
@@ -232,6 +239,10 @@ class IngestClient:
         self.timeout = timeout
         self.bulk = bulk
         self.deadline = deadline
+        # `_identity.project_identity(cwd)[1]`: the user_id this client would
+        # write under is a guess. Refusing here, in the one module that
+        # writes, rather than in each caller's memory (review R2 C).
+        self.identity_degraded = bool(identity_degraded)
         self.max_body_bytes = max_body_bytes
         # urllib.request.urlopen unless a test injects something else.
         self._open = opener or urllib.request.urlopen
@@ -282,12 +293,12 @@ class IngestClient:
         outcome.calls += 1  # counted before the call: a call that fails was still made
         try:
             with self._open(req, timeout=timeout) as resp:
-                raw = _read_body(resp, self.deadline, self.max_body_bytes)
+                raw = _read_body(resp, self.deadline, self.max_body_bytes, timeout)
                 headers = {k.lower(): v for k, v in resp.headers.items()}
                 response = _Response(resp.status, headers, raw)
         except urllib.error.HTTPError as exc:
             try:
-                raw = _read_body(exc, self.deadline, self.max_body_bytes)
+                raw = _read_body(exc, self.deadline, self.max_body_bytes, timeout)
             except Exception:  # noqa: BLE001 - the error body is optional
                 raw = b""
             headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
@@ -355,6 +366,17 @@ class IngestClient:
             print(f"[{self.source_name}] {outcome.detail}", file=sys.stderr)
         return verified
 
+    def _keys_ok(self, outcome, layer, external_id):
+        """`layer` / `external_id` are the lookup keys: a None here is the
+        literal string `None` on the wire and a row without the key passing
+        verification (review R2-c). A caller bug, loud."""
+        for name, value in (("layer", layer), ("external_id", external_id)):
+            if not isinstance(value, str) or not value.strip():
+                print(f"[{self.source_name}] {name} must be a non-empty string, got {value!r}", file=sys.stderr)
+                outcome.fail("unknown", f"{name}={value!r}")
+                return False
+        return True
+
     def _is_ours(self, row, layer, external_id):
         meta = row.get("metadata")
         if not isinstance(meta, dict) or not isinstance(row.get("memory_id"), str):
@@ -421,6 +443,10 @@ class IngestClient:
         outcome = Outcome()
         if not self.base_url:
             return outcome.fail("not_configured")
+        if self.identity_degraded:
+            return outcome.fail("identity_unresolved", "project identity is a guess; not writing under it")
+        if not self._keys_ok(outcome, layer, external_id):
+            return outcome
         if not isinstance(content, str) or not content.strip():
             # Nothing to write is a caller bug at this level (the hooks decide
             # `empty_sections` before calling); loud, not silent.
@@ -507,6 +533,10 @@ class IngestClient:
         outcome = Outcome()
         if not self.base_url:
             return outcome.fail("not_configured")
+        if self.identity_degraded:
+            return outcome.fail("identity_unresolved", "project identity is a guess; not deleting under it")
+        if not self._keys_ok(outcome, layer, external_id):
+            return outcome
         rows = self._lookup(outcome, layer, external_id)
         if rows is None:
             return outcome

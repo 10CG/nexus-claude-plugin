@@ -96,8 +96,9 @@ def project_identity(cwd):
 
     The slug is the git toplevel basename; outside a repository it is the cwd
     basename, and that fallback is fine. ``degraded`` is True when git could
-    not be *asked* -- it timed out, or is not installed -- so the fallback may
-    name a different project than the one the rows are keyed by. That is not
+    not be *asked* -- it timed out, is not installed, or refused to answer for
+    a directory that is a repository (``dubious ownership``) -- so the
+    fallback may name a different project than the one the rows are keyed by. That is not
     fine: ``user_id`` derives from the same call, and one git hiccup would
     file a whole run of writes under a different user_id, invisible to the
     next run and to the orphan reconciliation (which lists rows by the new
@@ -118,6 +119,12 @@ def project_identity(cwd):
         )
         if result.returncode == 0:
             toplevel = result.stdout.decode().strip() or None
+        elif b"not a git repository" not in result.stderr.lower():
+            # git is there and refused to answer -- `dubious ownership`
+            # (a checkout mounted into a container under another uid, this
+            # repo's own deployment shape), a corrupt index, permissions.
+            # That IS a repository, and the basename is not its name.
+            degraded = True
     except Exception:  # timeout, no git binary, a cwd that vanished
         toplevel = None
         degraded = True

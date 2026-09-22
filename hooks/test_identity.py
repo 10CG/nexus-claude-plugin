@@ -255,7 +255,10 @@ class TestProjectSlugAndUserId(unittest.TestCase):
         a guess. The cache keeps the flag with the slug."""
         plain = os.path.join(self.tmp.name, "NotARepo")
         os.makedirs(plain)
-        not_a_repo = subprocess.CompletedProcess(args=[], returncode=128, stdout=b"", stderr=b"fatal")
+        not_a_repo = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: not a git repository (or any of the parent directories): .git\n",
+        )
         with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
                 mock.patch("subprocess.run", return_value=not_a_repo):
             self.assertEqual(_identity.project_identity(plain), ("notarepo", False))
@@ -264,6 +267,14 @@ class TestProjectSlugAndUserId(unittest.TestCase):
             self.assertEqual(_identity.project_identity(plain), ("notarepo", True))
             self.assertEqual(_identity.project_identity(plain), ("notarepo", True))  # cached with the flag
             self.assertEqual(_identity.project_slug(plain), "notarepo")
+        # Review R2-b: git present, repository present, answer refused.
+        refused = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: detected dubious ownership in repository at '/x/therepo'\n",
+        )
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=refused):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", True))
 
     def test_user_id_env_wins(self):
         with mock.patch.dict(os.environ, {"NEXUS_DEFAULT_USER_ID": "pinned"}):
