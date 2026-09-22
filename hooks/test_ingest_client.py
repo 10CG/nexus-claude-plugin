@@ -1,0 +1,529 @@
+"""Tests for hooks/_ingest_client.py (TASK-010, the shared idempotent writer).
+
+Runnable as: python3 hooks/test_ingest_client.py   (stdlib unittest only)
+
+Every test talks to a real HTTP server on 127.0.0.1 that plays a script of
+canned replies and records what it was sent -- headers, query string, JSON
+body -- because the whole subject here is what goes over the wire: which
+rows count as ours, what a PATCH carries, what a 403 body has to look like.
+Nothing here touches the ledger or the state directory (the client has no
+state), and nothing reads the network beyond the loopback.
+
+The fixtures follow the TASK-010 verification list: empty page → POST; page
+with no verified row → filter_suspect and no write; one row → unchanged /
+stale_local / PATCH; two rows → one DELETE + dedup_merged as the reason;
+redaction before send; 403 / 429 / 422 / transport failures; the bulk header.
+"""
+
+import http.server
+import json
+import os
+import threading
+import time
+import unittest
+import urllib.parse
+from unittest import mock
+
+import _hook_state
+import _identity
+import _ingest_client
+import _redact
+
+# urllib honours proxy variables, and a developer machine's cross-border proxy
+# answers 502 for 127.0.0.1 -- which reads exactly like the backend being down.
+_PROXY_VARS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+_NO_PROXY = {"no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"}
+
+
+def setUpModule():
+    env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
+    env.update(_NO_PROXY)
+    patcher = mock.patch.dict(os.environ, env, clear=True)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
+class _Backend:
+    """A scripted fake of the memory endpoints on a real loopback socket."""
+
+    def __init__(self):
+        self.script = []
+        self.requests = []
+        self.delay = 0.0
+        backend = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _handle(handler):
+                length = int(handler.headers.get("Content-Length") or 0)
+                raw = handler.rfile.read(length) if length else b""
+                parsed = urllib.parse.urlsplit(handler.path)
+                backend.requests.append(
+                    {
+                        "method": handler.command,
+                        "path": parsed.path,
+                        "query": dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)),
+                        "headers": {k.lower(): v for k, v in handler.headers.items()},
+                        "json": json.loads(raw) if raw else None,
+                    }
+                )
+                if backend.delay:
+                    time.sleep(backend.delay)
+                if backend.script:
+                    status, body, headers = backend.script.pop(0)
+                else:
+                    status, body, headers = 599, {"detail": "unscripted request"}, {}
+                payload = body if isinstance(body, bytes) else (b"" if body is None else json.dumps(body).encode("utf-8"))
+                handler.send_response(status)
+                for key, value in headers.items():
+                    handler.send_header(key, value)
+                if "content-type" not in {k.lower() for k in headers}:
+                    handler.send_header("Content-Type", "application/json")
+                handler.send_header("Content-Length", str(len(payload)))
+                handler.end_headers()
+                if payload:
+                    try:
+                        handler.wfile.write(payload)
+                    except BrokenPipeError:
+                        pass  # the client gave up (the timeout test); nothing to report
+
+            do_GET = do_POST = do_PATCH = do_DELETE = _handle
+
+            def log_message(handler, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+    def reply(self, status, body=None, headers=None):
+        self.script.append((status, body, headers or {}))
+        return self
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+CONTAINER = "dev-box-a"
+USER = "nexus"
+HOOK = "memory-sync-hook"
+
+
+def _row(external_id, *, content_hash, layer="fact", container_id=CONTAINER, created_at="2026-09-22T10:00:00.000001Z", row_id="11111111-1111-4111-8111-111111111111", extra=None):
+    meta = {"layer": layer, "external_id": external_id, "container_id": container_id, "content_hash": content_hash}
+    meta.update(extra or {})
+    return {
+        "memory_id": f"t1::{USER}::{row_id}",
+        "id": row_id,
+        "user_id": USER,
+        "content": "stored",
+        "metadata": meta,
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+
+
+def _page(*rows):
+    return {"memories": list(rows), "total_count": len(rows), "limit": 5, "offset": 0, "has_next": False}
+
+
+class _ClientCase(unittest.TestCase):
+    def setUp(self):
+        self.backend = _Backend()
+        self.addCleanup(self.backend.close)
+
+    def client(self, **kw):
+        kw.setdefault("token", "t0k3n-secret-value")
+        return _ingest_client.IngestClient(self.backend.url, kw.pop("token"), USER, CONTAINER, HOOK, **kw)
+
+    @property
+    def requests(self):
+        return self.backend.requests
+
+
+class TestLookup(_ClientCase):
+    def test_query_is_exactly_the_four_keys_and_a_limit_of_five(self):
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "t1::nexus::new"})
+        self.client().upsert("fact", "slug-a", "content one", {})
+        get = self.requests[0]
+        self.assertEqual(get["method"], "GET")
+        self.assertEqual(get["path"], "/v1/memories")
+        self.assertEqual(
+            get["query"],
+            {"user_id": USER, "layer": "fact", "container_id": CONTAINER, "external_id": "slug-a", "limit": "5"},
+        )
+        self.assertNotIn("offset", get["query"])
+
+    def test_headers_carry_source_version_key_and_user_agent(self):
+        self.backend.reply(200, _page(_row("s", content_hash="x")))
+        self.client().upsert("fact", "s", "c", {})
+        headers = self.requests[0]["headers"]
+        self.assertEqual(headers["x-nexus-source"], _identity.source_header(HOOK))
+        self.assertTrue(headers["x-nexus-source"].startswith(HOOK + "/"))
+        self.assertEqual(headers["x-api-key"], "t0k3n-secret-value")
+        self.assertIn("user-agent", headers)
+        self.assertNotIn("x-bulk-import", headers)  # a read never carries it
+
+    def test_no_token_means_no_key_header(self):
+        self.backend.reply(200, _page(_row("s", content_hash="x")))
+        self.client(token="").upsert("fact", "s", "c", {})
+        self.assertNotIn("x-api-key", self.requests[0]["headers"])
+
+
+class TestCreate(_ClientCase):
+    def test_empty_page_posts_the_full_row(self):
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "t1::nexus::new", "id": "x"})
+        out = self.client().upsert(
+            "fact", "slug-a", "the body", {"aria.memory_slug": "slug-a", "aria.description": "d"}
+        )
+        self.assertEqual(out.reason, _hook_state.NO_REASON)
+        self.assertEqual(out.action, "created")
+        self.assertEqual(out.memory_id, "t1::nexus::new")
+        self.assertEqual(out.calls, 2)
+        post = self.requests[1]
+        self.assertEqual((post["method"], post["path"]), ("POST", "/v1/memories"))
+        body = post["json"]
+        self.assertEqual(body["user_id"], USER)
+        self.assertEqual(body["content"], "the body")
+        self.assertEqual(body["memory_type"], "semantic")
+        self.assertEqual(
+            body["metadata"],
+            {
+                "aria.memory_slug": "slug-a",
+                "aria.description": "d",
+                "layer": "fact",
+                "external_id": "slug-a",
+                "container_id": CONTAINER,
+                "content_hash": _ingest_client.content_hash("the body"),
+            },
+        )
+        self.assertEqual(post["headers"]["content-type"], "application/json")
+
+    def test_aggregation_hash_is_never_sent(self):
+        """§3.2: a row carrying it is treated as the aggregator's own and overwritten."""
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m"})
+        self.client().upsert("session_summary", "h.md", "c", {"session_id": "s1", "aggregation_hash": "abc"})
+        self.assertNotIn("aggregation_hash", self.requests[1]["json"]["metadata"])
+        self.assertEqual(self.requests[1]["json"]["metadata"]["session_id"], "s1")
+
+    def test_bulk_header_is_the_literal_true_on_writes_only(self):
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m"})
+        self.client(bulk=True).upsert("fact", "s", "c", {})
+        self.assertNotIn("x-bulk-import", self.requests[0]["headers"])
+        self.assertEqual(self.requests[1]["headers"]["x-bulk-import"], "true")
+
+    def test_without_bulk_the_header_is_absent(self):
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m"})
+        self.client().upsert("fact", "s", "c", {})
+        self.assertNotIn("x-bulk-import", self.requests[1]["headers"])
+
+    def test_a_2xx_that_is_not_a_memory_is_http_error(self):
+        for body in (b"<html>login</html>", {"accepted": 1}, [], {"memory_id": 5}):
+            with self.subTest(repr(body)[:20]):
+                backend = _Backend()
+                self.addCleanup(backend.close)
+                backend.reply(200, _page()).reply(200, body)
+                out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {})
+                self.assertEqual(out.reason, "http_error")
+                self.assertIsNone(out.action)
+
+
+class TestVerification(_ClientCase):
+    def test_a_page_with_no_row_of_ours_is_filter_suspect_and_writes_nothing(self):
+        """The list endpoint ignores unknown query keys: a renamed filter returns
+        the newest rows. Taking the first would PATCH a stranger's row."""
+        cases = {
+            "other external_id": _row("other-slug", content_hash="x"),
+            "other container": _row("s", content_hash="x", container_id="someone-else"),
+            "other layer": _row("s", content_hash="x", layer="observation"),
+            "no metadata keys": {"memory_id": "t1::u::x", "id": "x", "metadata": {}, "created_at": "2026-01-01T00:00:00Z"},
+        }
+        for label, row in cases.items():
+            with self.subTest(label):
+                backend = _Backend()
+                self.addCleanup(backend.close)
+                backend.reply(200, _page(row))
+                out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {})
+                self.assertEqual(out.reason, "filter_suspect")
+                self.assertEqual(len(backend.requests), 1)
+                self.assertIsNone(out.action)
+
+    def test_a_list_that_is_not_a_list_is_http_error(self):
+        for body in (b"<html>", {"results": []}, {"memories": "nope"}, {"memories": [1]}):
+            with self.subTest(repr(body)[:20]):
+                backend = _Backend()
+                self.addCleanup(backend.close)
+                backend.reply(200, body)
+                out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {})
+                self.assertEqual(out.reason, "http_error")
+                self.assertEqual(len(backend.requests), 1)
+
+
+class TestOneRow(_ClientCase):
+    def test_same_hash_is_unchanged_and_writes_nothing(self):
+        digest = _ingest_client.content_hash("same")
+        self.backend.reply(200, _page(_row("s", content_hash=digest)))
+        out = self.client().upsert("fact", "s", "same", {})
+        self.assertEqual((out.reason, out.action, out.calls), ("unchanged", "unchanged", 1))
+        self.assertEqual(out.memory_id, "t1::nexus::11111111-1111-4111-8111-111111111111")
+
+    def test_changed_hash_patches_content_and_only_the_source_keys(self):
+        self.backend.reply(200, _page(_row("h.md", content_hash="old", layer="session_summary", extra={"aria.updated_at": "2026-09-20T00:00:00Z"})))
+        self.backend.reply(200, {"memory_id": "t1::nexus::11111111-1111-4111-8111-111111111111"})
+        meta = {
+            "session_id": "sess-1",
+            "branch": "main",
+            "aria.source": "handoff",
+            "aria.status": "done",
+            "aria.updated_at": "2026-09-22T00:00:00Z",
+        }
+        out = self.client().upsert(
+            "session_summary", "h.md", "new body", meta, local_updated_at="2026-09-22T00:00:00Z"
+        )
+        self.assertEqual((out.reason, out.action, out.calls), (_hook_state.NO_REASON, "updated", 2))
+        patch = self.requests[1]
+        self.assertEqual(patch["method"], "PATCH")
+        self.assertEqual(patch["path"], "/v1/memories/t1%3A%3Anexus%3A%3A11111111-1111-4111-8111-111111111111")
+        self.assertEqual(set(patch["json"]), {"content", "metadata"})
+        self.assertEqual(patch["json"]["content"], "new body")
+        self.assertEqual(
+            patch["json"]["metadata"],
+            {
+                "content_hash": _ingest_client.content_hash("new body"),
+                "aria.source": "handoff",
+                "aria.status": "done",
+                "aria.updated_at": "2026-09-22T00:00:00Z",
+            },
+        )
+        for key in _ingest_client.IDENTITY_KEYS:
+            self.assertNotIn(key, patch["json"]["metadata"])
+
+    def test_an_older_local_copy_is_stale_local_and_writes_nothing(self):
+        self.backend.reply(200, _page(_row("h.md", content_hash="old", layer="session_summary", extra={"aria.updated_at": "2026-09-22T12:00:00Z"})))
+        out = self.client().upsert(
+            "session_summary", "h.md", "older body", {"session_id": "s"}, local_updated_at="2026-09-21T12:00:00Z"
+        )
+        self.assertEqual((out.reason, out.action, out.calls), ("stale_local", None, 1))
+
+    def test_updated_key_is_configurable_for_memory_files(self):
+        self.backend.reply(200, _page(_row("slug", content_hash="old", extra={"aria.modified": "2026-09-22T12:00:00+00:00"})))
+        out = self.client().upsert(
+            "fact", "slug", "body", {}, local_updated_at="2026-09-22T11:00:00Z", updated_key="aria.modified"
+        )
+        self.assertEqual(out.reason, "stale_local")
+
+    def test_unparsable_or_missing_timestamps_do_not_block_the_update(self):
+        for server_ts, local_ts in (("garbage", "2026-09-22T00:00:00Z"), (None, "2026-09-22T00:00:00Z"), ("2026-09-22T00:00:00Z", None)):
+            with self.subTest((server_ts, local_ts)):
+                backend = _Backend()
+                self.addCleanup(backend.close)
+                extra = {"aria.updated_at": server_ts} if server_ts else {}
+                backend.reply(200, _page(_row("s", content_hash="old", extra=extra))).reply(200, {"memory_id": "m"})
+                out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {}, local_updated_at=local_ts)
+                self.assertEqual(out.action, "updated")
+
+
+class TestDedup(_ClientCase):
+    def _two_rows(self, digest):
+        older = _row("s", content_hash=digest, created_at="2026-09-20T00:00:00.000001Z", row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        newer = _row("s", content_hash=digest, created_at="2026-09-21T00:00:00.000001Z", row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        return older, newer
+
+    def test_the_later_row_is_deleted_and_dedup_merged_is_the_reason_even_when_unchanged(self):
+        digest = _ingest_client.content_hash("same")
+        older, newer = self._two_rows(digest)
+        self.backend.reply(200, _page(newer, older)).reply(204, None)
+        out = self.client().upsert("fact", "s", "same", {})
+        self.assertEqual(out.reasons, ["dedup_merged", "unchanged"])
+        self.assertEqual(out.reason, "dedup_merged")  # A4-4: not `unchanged`
+        self.assertEqual(out.dedup_merged, 1)
+        self.assertEqual(out.action, "unchanged")
+        self.assertEqual(out.memory_id, older["memory_id"])
+        delete = self.requests[1]
+        self.assertEqual(delete["method"], "DELETE")
+        self.assertEqual(delete["path"], "/v1/memories/" + urllib.parse.quote(newer["memory_id"], safe=""))
+        self.assertEqual(len(self.requests), 2)
+
+    def test_after_dedup_a_changed_content_patches_the_canonical_row(self):
+        older, newer = self._two_rows("old")
+        self.backend.reply(200, _page(newer, older)).reply(204, None).reply(200, {"memory_id": older["memory_id"]})
+        out = self.client().upsert("fact", "s", "changed", {})
+        self.assertEqual(out.reason, "dedup_merged")
+        self.assertEqual(out.action, "updated")
+        self.assertEqual(self.requests[2]["path"], "/v1/memories/" + urllib.parse.quote(older["memory_id"], safe=""))
+
+    def test_a_failed_delete_stops_the_run_with_its_reason(self):
+        older, newer = self._two_rows("old")
+        self.backend.reply(200, _page(newer, older)).reply(500, {"detail": "boom"})
+        out = self.client().upsert("fact", "s", "changed", {})
+        self.assertEqual(out.reason, "http_error")
+        self.assertEqual(out.dedup_merged, 0)
+        self.assertEqual(len(self.requests), 2)  # no PATCH after a failed delete
+
+    def test_a_404_on_delete_counts_as_gone(self):
+        older, newer = self._two_rows(_ingest_client.content_hash("same"))
+        self.backend.reply(200, _page(newer, older)).reply(404, {"detail": "Memory not found"})
+        out = self.client().upsert("fact", "s", "same", {})
+        self.assertEqual(out.dedup_merged, 1)
+        self.assertEqual(out.reason, "dedup_merged")
+
+
+class TestRedaction(_ClientCase):
+    def test_content_and_every_metadata_string_are_redacted_before_send_and_counted(self):
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m"})
+        content = "db: postgresql://nexus:s3cretpw@db:5432/nexus"
+        meta = {"aria.description": "key sk-Ab3Cd4Ef5Gh6Jk7Mn8Pq9Rs0Tu1Vw2Xy", "aria.memory_slug": "slug"}
+        out = self.client().upsert("fact", "slug", content, meta)
+        self.assertEqual(out.redacted, 2)
+        body = self.requests[1]["json"]
+        self.assertEqual(body["content"], "db: postgresql://nexus:[redacted:url-userinfo]@db:5432/nexus")
+        self.assertEqual(body["metadata"]["aria.description"], "key [redacted:openai-key]")
+        self.assertNotIn("s3cretpw", json.dumps(body))
+        # the hash is of what was sent, so a redaction change re-writes the row
+        self.assertEqual(body["metadata"]["content_hash"], _ingest_client.content_hash(body["content"]))
+        self.assertEqual(_redact.find(json.dumps(body)), [])
+
+    def test_the_callers_metadata_is_not_mutated(self):
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m"})
+        meta = {"aria.description": "password: hunter22x9"}
+        self.client().upsert("fact", "slug", "c", meta)
+        self.assertEqual(meta, {"aria.description": "password: hunter22x9"})
+
+
+class TestRefusals(_ClientCase):
+    def _upsert_with(self, status, body, headers=None, on="POST"):
+        if on == "POST":
+            self.backend.reply(200, _page())
+        self.backend.reply(status, body, headers)
+        return self.client().upsert("fact", "s", "c", {})
+
+    def test_403_with_the_contract_body_is_ingest_disabled(self):
+        out = self._upsert_with(403, {"detail": {"error": "STRUCTURED_INGEST_DISABLED", "reason": "tenant off"}})
+        self.assertEqual(out.reason, "ingest_disabled")
+        self.assertTrue(out.aborts_round)
+        self.assertEqual(out.status, 403)
+
+    def test_any_other_403_is_http_error(self):
+        for body in ({"detail": "Forbidden"}, {"detail": {"error": "SCOPE_DENIED"}}, {"error": "STRUCTURED_INGEST_DISABLED"}):
+            with self.subTest(repr(body)):
+                backend = _Backend()
+                self.addCleanup(backend.close)
+                backend.reply(200, _page()).reply(403, body)
+                out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {})
+                self.assertEqual(out.reason, "http_error")
+
+    def test_429_is_rate_limited_and_keeps_retry_after(self):
+        out = self._upsert_with(429, {"detail": "Rate limit exceeded"}, {"Retry-After": "60"})
+        self.assertEqual((out.reason, out.retry_after), ("rate_limited", "60"))
+        self.assertTrue(out.aborts_round)
+
+    def test_422_is_rejected_422_and_does_not_abort_the_round(self):
+        out = self._upsert_with(422, {"detail": [{"loc": ["body", "content"], "msg": "too long"}]})
+        self.assertEqual(out.reason, "rejected_422")
+        self.assertFalse(out.aborts_round)
+
+    def test_500_is_http_error(self):
+        self.assertEqual(self._upsert_with(500, {"detail": "boom"}).reason, "http_error")
+
+    def test_a_refused_lookup_is_classified_the_same_way(self):
+        out = self._upsert_with(403, {"detail": {"error": "STRUCTURED_INGEST_DISABLED", "reason": "r"}}, on="GET")
+        self.assertEqual(out.reason, "ingest_disabled")
+        self.assertEqual(len(self.requests), 1)
+
+
+class TestTransport(_ClientCase):
+    def test_connection_refused_is_http_error(self):
+        port = self.backend.server.server_address[1]
+        self.backend.close()
+        out = _ingest_client.IngestClient(f"http://127.0.0.1:{port}/v1", "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "http_error")
+        self.assertEqual(out.calls, 1)
+
+    def test_a_stalled_reply_is_timeout(self):
+        self.backend.delay = 1.0
+        self.backend.reply(200, _page())
+        out = self.client(timeout=0.2).upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "timeout")
+        self.assertTrue(out.aborts_round)
+
+
+class TestCallerBugsAndConfig(_ClientCase):
+    def test_not_configured_makes_no_call(self):
+        out = _ingest_client.IngestClient("", "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {})
+        self.assertEqual((out.reason, out.calls), ("not_configured", 0))
+
+    def test_empty_content_is_loud_not_silent(self):
+        with mock.patch("sys.stderr") as err:
+            out = self.client().upsert("fact", "s", "   ", {})
+        self.assertEqual((out.reason, out.calls), ("unknown", 0))
+        self.assertTrue(err.write.called)
+
+    def test_session_summary_without_session_id_is_refused(self):
+        """§3.2 hard requirement: the aggregator would never see the episode."""
+        with mock.patch("sys.stderr"):
+            out = self.client().upsert("session_summary", "h.md", "c", {"branch": "main"})
+        self.assertEqual((out.reason, out.calls), ("unknown", 0))
+
+
+class TestDelete(_ClientCase):
+    def test_deletes_every_verified_row(self):
+        a = _row("s", content_hash="x", row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        b = _row("s", content_hash="x", row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(a, b)).reply(204, None).reply(404, {"detail": "gone"})
+        out = self.client().delete("fact", "s")
+        self.assertEqual((out.reason, out.action, out.deleted, out.calls), (_hook_state.NO_REASON, "deleted", 2, 3))
+        self.assertEqual([r["method"] for r in self.requests], ["GET", "DELETE", "DELETE"])
+
+    def test_nothing_to_delete(self):
+        self.backend.reply(200, _page())
+        out = self.client().delete("fact", "s")
+        self.assertEqual((out.reason, out.deleted), ("nothing_to_do", 0))
+
+    def test_a_stranger_page_is_filter_suspect_and_deletes_nothing(self):
+        self.backend.reply(200, _page(_row("someone-elses", content_hash="x")))
+        out = self.client().delete("fact", "s")
+        self.assertEqual((out.reason, out.deleted, len(self.requests)), ("filter_suspect", 0, 1))
+
+    def test_a_failed_delete_reports_and_stops(self):
+        a = _row("s", content_hash="x", row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        b = _row("s", content_hash="x", row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(a, b)).reply(500, {"detail": "x"})
+        out = self.client().delete("fact", "s")
+        self.assertEqual((out.reason, out.deleted, out.action), ("http_error", 0, None))
+
+
+class TestContract(unittest.TestCase):
+    def test_every_reason_this_module_emits_is_in_the_tables(self):
+        import re
+
+        with open(_ingest_client.__file__, encoding="utf-8") as fh:
+            source = fh.read()
+        emitted = set(re.findall(r"\.fail\(\"([a-z_0-9]+)\"", source))
+        emitted |= set(re.findall(r"reasons\.append\(\"([a-z_0-9]+)\"", source))
+        self.assertTrue(emitted)
+        self.assertTrue(emitted <= _hook_state.ALL_REASONS, emitted - _hook_state.ALL_REASONS)
+
+    def test_round_abort_reasons_are_failures(self):
+        for reason in _ingest_client.ROUND_ABORT_REASONS:
+            self.assertTrue(_hook_state.is_failure_reason(reason), reason)
+
+    def test_content_hash_is_prefixed_deterministic_and_survives_surrogates(self):
+        a = _ingest_client.content_hash("hello")
+        self.assertTrue(a.startswith("sha256:"))
+        self.assertEqual(a, _ingest_client.content_hash("hello"))
+        self.assertNotEqual(a, _ingest_client.content_hash("hello!"))
+        self.assertTrue(_ingest_client.content_hash("lone \ud800 surrogate").startswith("sha256:"))
+
+    def test_identity_keys_and_patch_prefix_pin_the_patch_rule(self):
+        self.assertEqual(set(_ingest_client.IDENTITY_KEYS), {"layer", "session_id", "branch", "container_id", "external_id"})
+        self.assertEqual(_ingest_client.PATCH_PREFIX, "aria.")
+
+
+if __name__ == "__main__":
+    unittest.main()

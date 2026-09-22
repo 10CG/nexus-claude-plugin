@@ -236,6 +236,19 @@ class TestProjectSlugAndUserId(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=OSError("no git")):
             self.assertEqual(_identity.project_slug(plain), "notarepo")
 
+    def test_slug_asks_git_once_per_process_per_cwd(self):
+        """Amendment A6-4: a SessionStart was measured at 11 `rev-parse
+        --show-toplevel` calls, each with a 5 s timeout. The second call for
+        the same cwd must come from the cache; a different cwd must not."""
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=done) as run:
+            self.assertEqual(_identity.project_slug("/x/therepo/a"), "therepo")
+            self.assertEqual(_identity.project_slug("/x/therepo/a"), "therepo")
+            self.assertEqual(run.call_count, 1)
+            _identity.project_slug("/x/therepo/b")
+            self.assertEqual(run.call_count, 2)
+
     def test_user_id_env_wins(self):
         with mock.patch.dict(os.environ, {"NEXUS_DEFAULT_USER_ID": "pinned"}):
             self.assertEqual(_identity.user_id(self.tmp.name), "pinned")

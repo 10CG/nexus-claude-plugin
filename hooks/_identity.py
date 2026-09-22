@@ -80,13 +80,28 @@ def normalize_slug(text):
     return slug or "default"
 
 
+# One git call per process per cwd. A SessionStart with one failed ledger to
+# report was measured at 12 git subprocesses (11 of them `rev-parse
+# --show-toplevel`): every ledger path, state path and the user_id each asked
+# again. Normally that is tens of milliseconds, but each call carries a 5 s
+# timeout, so a git that hangs (NFS, an index lock) could eat the hook's whole
+# 25 s deadline. Caching also keeps one run internally consistent: two calls
+# that disagreed (git timing out once) used to overwrite the ledger history
+# (Amendment A5-5). Amendment A6-4.
+_SLUG_CACHE = {}
+
+
 def project_slug(cwd):
     """Derive the project slug: git toplevel basename, else cwd basename.
 
     The only copy: session_capture.py and session_inject.py each carried a
     byte-identical one until TASK-002, which is two chances for the write side
-    and the read side to key the same project differently.
+    and the read side to key the same project differently. Memoised per
+    process by ``cwd`` (see ``_SLUG_CACHE``).
     """
+    cached = _SLUG_CACHE.get(cwd)
+    if cached is not None:
+        return cached
     toplevel = None
     try:
         result = subprocess.run(
@@ -99,7 +114,9 @@ def project_slug(cwd):
     except Exception:
         toplevel = None
     base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    return normalize_slug(base)
+    slug = normalize_slug(base)
+    _SLUG_CACHE[cwd] = slug
+    return slug
 
 
 def user_id(cwd):
