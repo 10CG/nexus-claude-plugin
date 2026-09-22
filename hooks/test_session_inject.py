@@ -25,6 +25,7 @@ import io
 import itertools
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -162,6 +163,16 @@ def _profile_row(content, *, container_id="dev-claude-308", layer="summary",
 # ════════════════════════════════════════════════════════════════════════════════
 
 class TestFailOpen(unittest.TestCase):
+
+    def setUp(self):
+        # A state dir of this test's own. Since TASK-003 a start REPORTS the
+        # previous run's failure on stdout, so a directory shared with the
+        # other subprocess tests would make "no stdout" depend on test order.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": os.path.join(tmp.name, "state")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _assert_failopen(self, stdin_text, env, label):
         stdout, code = _run_hook(stdin_text, env=env)
@@ -495,7 +506,12 @@ class TestLedger(_LedgerCase):
         for count, (exc, expected) in enumerate(cases, start=1):
             with self.subTest(expected=expected):
                 out, err = self._main(_raising(exc))  # and main() does not raise
-                self.assertEqual(out, "", "a failed run must not inject anything")
+                # From the second case on, stdout carries the REPORT of the
+                # previous failure (TASK-003) -- but never a brief.
+                if out:
+                    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+                    self.assertTrue(ctx.startswith("[nexus-memory]"), ctx[:80])
+                    self.assertEqual(len(ctx.splitlines()), 1, "a failed run must not inject anything")
                 entries = self._entries()
                 self.assertEqual(len(entries), count, "every run appends exactly one record")
                 entry = entries[-1]
@@ -1007,6 +1023,253 @@ class TestTheWorkerDiedQuietly(_LedgerCase):
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
         self.assertIn("without a result", err)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TASK-003 — SessionStart reads every hook's ledger and reports failures once.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _entry(reason, ts, ok=None, hook="session-capture"):
+    if ok is None:
+        ok = not _hook_state.is_failure_reason(reason)
+    return {"hook": hook, "ts": ts, "ok": ok, "reason": reason, "elapsed_ms": 5, "calls": 1}
+
+
+class _ReportCase(_LedgerCase):
+    """A project whose session-inject ledger already holds one clean run, so
+    this is not the very first session start (a missing capture ledger is only
+    news after a SessionEnd has had the chance to fire)."""
+
+    def setUp(self):
+        super().setUp()
+        self._write_ledger("session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")])
+
+    def _write_ledger(self, hook, entries):
+        path = _hook_state.ledger_path(hook, self.cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(entries if isinstance(entries, str) else json.dumps(entries))
+
+    def _start(self, urlopen=None):
+        out, err = self._main(urlopen or _UrlopenCapture([{"profile": [_profile_row("the brief")]}]))
+        return (json.loads(out) if out else None), err
+
+    def _system_message(self, urlopen=None):
+        parsed, _ = self._start(urlopen)
+        return (parsed or {}).get("systemMessage")
+
+
+class TestFailureReport(_ReportCase):
+
+    def test_a_failed_capture_run_is_reported_and_the_brief_survives(self):
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        parsed, _ = self._start()
+        message = parsed["systemMessage"]
+        self.assertIn("session-capture", message)
+        self.assertIn("http_error", message)
+        ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith("[nexus-memory]"), ctx[:80])
+        self.assertIn("session-capture", ctx.splitlines()[0])
+        self.assertIn("the brief", ctx)  # the injection is intact underneath
+        self.assertEqual(parsed["hookSpecificOutput"]["hookEventName"], "SessionStart")
+
+    def test_the_same_failure_is_reported_once(self):
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        self.assertIsNotNone(self._system_message())
+        self.assertIsNone(self._system_message(), "the same entry was reported twice")
+        parsed, _ = self._start()
+        self.assertFalse(parsed["hookSpecificOutput"]["additionalContext"].startswith("[nexus-memory]"))
+
+    def test_a_newer_failure_is_reported_again(self):
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        self._system_message()
+        self._write_ledger(
+            "session-capture",
+            [_entry("http_error", "2026-09-21T09:00:00Z"), _entry("timeout", "2026-09-21T18:00:00Z")],
+        )
+        message = self._system_message()
+        self.assertIsNotNone(message)
+        self.assertIn("timeout", message)
+
+    def test_the_same_reason_failing_again_later_is_news(self):
+        """The marker is the entry (its timestamp), not the reason: a hook
+        that keeps failing the same way every session keeps being reported."""
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        self._system_message()
+        self._write_ledger(
+            "session-capture",
+            [_entry("http_error", "2026-09-21T09:00:00Z"), _entry("http_error", "2026-09-21T18:00:00Z")],
+        )
+        self.assertIsNotNone(self._system_message())
+
+    def test_a_skip_class_latest_entry_is_quiet_even_after_an_older_failure(self):
+        self._write_ledger(
+            "session-capture",
+            [_entry("http_error", "2026-09-21T09:00:00Z"), _entry("not_owner", "2026-09-21T18:00:00Z")],
+        )
+        self.assertIsNone(self._system_message())
+
+    def test_a_clean_latest_entry_is_quiet(self):
+        self._write_ledger("session-capture", [_entry("none", "2026-09-21T18:00:00Z")])
+        self.assertIsNone(self._system_message())
+
+    def test_unknown_is_a_failure(self):
+        self._write_ledger("session-capture", [_entry("unknown", "2026-09-21T18:00:00Z")])
+        self.assertIn("unknown", self._system_message())
+
+    def test_this_hooks_own_previous_failure_is_reported_too(self):
+        """The reader reads its own ledger before this run appends to it, so a
+        session start that timed out last time is reported this time."""
+        self._write_ledger(
+            "session-inject",
+            [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject"),
+             _entry("timeout", "2026-09-21T10:00:00Z", hook="session-inject")],
+        )
+        message = self._system_message()
+        self.assertIn("session-inject", message)
+        self.assertIn("timeout", message)
+
+    def test_every_failing_hook_is_named(self):
+        self._write_ledger("session-capture", [_entry("rate_limited", "2026-09-21T09:00:00Z")])
+        self._write_ledger("memory-sync", [_entry("orphan_guard", "2026-09-21T09:00:00Z", hook="memory-sync")])
+        message = self._system_message()
+        for needle in ("session-capture", "rate_limited", "memory-sync", "orphan_guard"):
+            self.assertIn(needle, message)
+
+    def test_the_report_names_where_the_ledgers_are(self):
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        parsed, _ = self._start()
+        self.assertIn(_hook_state.project_dir(self.cwd), parsed["hookSpecificOutput"]["additionalContext"].splitlines()[0])
+
+
+class TestUnreadableAndMissingLedgers(_ReportCase):
+
+    def test_a_corrupt_ledger_is_reported_once_and_forgotten_when_it_recovers(self):
+        self._write_ledger("session-capture", "{not json")
+        message = self._system_message()
+        self.assertIn("session-capture", message)
+        self.assertIn("unreadable", message)
+        self.assertIsNone(self._system_message(), "corruption reported twice")
+        # It recovers (the hook rewrote it) with a clean run: quiet...
+        self._write_ledger("session-capture", [_entry("none", "2026-09-21T20:00:00Z")])
+        self.assertIsNone(self._system_message())
+        # ...and a later corruption is news again.
+        self._write_ledger("session-capture", "[1, 2")
+        self.assertIsNotNone(self._system_message())
+
+    def test_a_missing_capture_ledger_is_quiet_on_the_very_first_start(self):
+        """Fresh install: SessionEnd has not had a chance to fire yet."""
+        os.remove(_hook_state.ledger_path("session-inject", self.cwd))
+        self.assertIsNone(self._system_message())
+
+    def test_a_missing_capture_ledger_after_a_previous_session_is_reported_once(self):
+        """A session start already happened and still no SessionEnd ever
+        recorded anything: the capture hook is not firing (killed at the 1.5 s
+        shared budget, hooks.json not loaded, ...). This is the stall the
+        baseline exists for, and it is invisible in every other way."""
+        message = self._system_message()
+        self.assertIsNotNone(message)
+        self.assertIn("session-capture", message)
+        self.assertIn("never", message)
+        self.assertIsNone(self._system_message(), "missing ledger reported twice")
+
+    def test_a_ledger_that_appears_clears_the_missing_marker(self):
+        self._system_message()  # reports missing
+        self._write_ledger("session-capture", [_entry("none", "2026-09-21T20:00:00Z")])
+        self.assertIsNone(self._system_message())
+        os.remove(_hook_state.ledger_path("session-capture", self.cwd))
+        self.assertIsNotNone(self._system_message(), "gone again is news again")
+
+    def test_temp_and_state_files_are_not_ledgers(self):
+        project = _hook_state.project_dir(self.cwd)
+        os.makedirs(project, exist_ok=True)
+        with open(os.path.join(project, ".tmp-abc.json"), "w") as fh:
+            fh.write("{garbage")  # an abandoned atomic write
+        with open(os.path.join(project, "memory-sync.state.json"), "w") as fh:
+            fh.write("[1, 2")  # a state file, not a ledger
+        self._write_ledger("session-capture", [_entry("none", "2026-09-21T20:00:00Z")])
+        self.assertIsNone(self._system_message())
+
+
+class TestReportDelivery(_ReportCase):
+
+    def test_a_report_with_nothing_to_inject_still_goes_out(self):
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        parsed, _ = self._start(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        self.assertIn("session-capture", parsed["systemMessage"])
+        ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith("[nexus-memory]"))
+        self.assertEqual(len(ctx.splitlines()), 1)
+        # and this run's own ledger entry is still a clean skip
+        self.assertEqual(self._entries()[-1]["reason"], "nothing_to_do")
+
+    def test_a_report_goes_out_even_when_this_runs_retrieval_fails(self):
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        parsed, _ = self._start(_raising(_http_error(503)))
+        self.assertIn("session-capture", parsed["systemMessage"])
+        self.assertEqual(self._entries()[-1]["reason"], "http_error")
+
+    def test_a_report_goes_out_when_no_backend_is_configured(self):
+        """The failures of other hooks are worth knowing regardless of this
+        hook's own configuration, and exit 0 always."""
+        self._write_ledger("session-capture", [_entry("timeout", "2026-09-21T09:00:00Z")])
+        with mock.patch.dict(os.environ):
+            del os.environ["NEXUS_API_URL"]
+            parsed, _ = self._start(mock.Mock())
+        self.assertIn("timeout", parsed["systemMessage"])
+
+    def test_nothing_to_report_and_nothing_to_inject_is_still_silent(self):
+        self._write_ledger("session-capture", [_entry("none", "2026-09-21T20:00:00Z")])
+        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        self.assertEqual(out, "")
+
+    def test_the_reported_marker_lives_in_state_next_to_the_container_id(self):
+        """TASK-007 will keep its marker in the same state file and run
+        identity_drift over it; a state written without container_id makes
+        every later run report unknown."""
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        self._start()
+        state, reasons = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(reasons, [])
+        self.assertIn("session-capture", state["reported"])
+        self.assertEqual(state["container_id"], _identity.container_id())
+
+    def test_as_a_script_it_reports_and_exits_zero(self):
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
+        stdout, code, stderr = _run_hook(
+            json.dumps({"cwd": self.cwd}),
+            env={"NEXUS_HOOK_STATE_DIR": self.state_dir},
+            want_stderr=True,
+        )
+        self.assertEqual(code, 0, stderr)
+        parsed = json.loads(stdout)
+        self.assertIn("http_error", parsed["systemMessage"])
+
+
+class TestExpectedLedgersMatchTheManifest(unittest.TestCase):
+    def test_every_registered_session_end_hook_is_expected_to_leave_a_ledger(self):
+        """The "never recorded a run" report only covers hooks named in
+        _EXPECTED_LEDGERS. A SessionEnd hook registered in hooks.json but not
+        named here could stop firing and never be missed -- which is the exact
+        silence the baseline exists to break. New hooks (TASK-005 / 006) add
+        themselves here, and this test is what reminds them."""
+        with open(os.path.join(_HOOKS_DIR, "hooks.json"), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        commands = [
+            h["command"]
+            for entry in manifest["hooks"].get("SessionEnd", [])
+            for h in entry.get("hooks", [])
+            if h.get("type") == "command"
+        ]
+        self.assertTrue(commands)
+        for command in commands:
+            script = re.search(r"hooks/([\w.-]+\.py)", command).group(1)
+            spec = importlib.util.spec_from_file_location(
+                f"expected_ledgers_{script[:-3]}", os.path.join(_HOOKS_DIR, script)
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.assertIn(mod.HOOK, _MOD._EXPECTED_LEDGERS, f"{script} leaves ledger {mod.HOOK!r}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

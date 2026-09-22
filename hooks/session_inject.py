@@ -54,6 +54,16 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
       * hooks.json ``timeout`` sits above deadline + cap, as a backstop.
     If ``_hook_state`` cannot be imported at all (it needs ``fcntl``) the hook
     still injects and says so on stderr.
+  - FAILURE REPORT (TASK-003, workflow V(3)): this is the only user-visible
+    channel any nexus hook has, so at every start it reads EVERY hook's ledger
+    in this project's state dir and, when a hook's most recent run failed
+    (a failure-class reason, ``unknown``, an unreadable ledger, or -- once a
+    previous session has happened -- no ledger at all for a hook that should
+    have run), says so: one line in ``systemMessage`` (shown to the user) and
+    one line prepended to ``additionalContext`` (seen by Claude). Each finding
+    is reported ONCE; the marker lives in this hook's own state file, keyed by
+    hook, because an unreadable or missing ledger has no entry to mark. The
+    report never blocks the brief and never changes the exit code.
   - A 200 is not an answer. The backend degrades gracefully: a failed memory
     lookup comes back 200 with ``profile: null`` and the error under ``errors``.
     That, a body that is not JSON, and JSON of the wrong shape are all
@@ -121,6 +131,17 @@ _LEDGER_BUDGET_SECONDS = 2.0
 # with the ledger budget, stay under the host's timeout.
 _WORK_BUDGET_SECONDS = 25.0
 _USER_AGENT = "nexus-sessionstart-hook/0.3"
+
+# Hooks that must have left a ledger by the time a SECOND session starts.
+# "Never recorded a run" is reported only for these: a SessionEnd hook that
+# stopped firing (killed at the shared 1.5 s budget, manifest not loaded) is
+# invisible in every other way, and a hook not named here could stop for good
+# without anyone noticing. New SessionEnd hooks add themselves; a test walks
+# hooks.json to make sure they do.
+_EXPECTED_LEDGERS = ("session-capture",)
+_LEDGER_SUFFIX = ".json"
+_STATE_SUFFIX = ".state.json"
+_TMP_PREFIX = ".tmp-"
 
 
 class _BadResponse(Exception):
@@ -242,6 +263,70 @@ def _age(meta):
         return "?"
 
 
+def _age_of(ts):
+    """Age of a ledger timestamp (``%Y-%m-%dT%H:%M:%SZ``), for the report."""
+    try:
+        when = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return "?"
+    return _age({"valid_from": when.isoformat()})
+
+
+def _ledger_names(cwd):
+    """Every hook that has a ledger here, plus the ones that should."""
+    names = set(_EXPECTED_LEDGERS)
+    try:
+        entries = os.listdir(_hook_state.project_dir(cwd))
+    except OSError:
+        entries = []
+    for name in entries:
+        # .tmp-*.json is an abandoned atomic write; *.state.json is state.
+        if name.endswith(_LEDGER_SUFFIX) and not name.endswith(_STATE_SUFFIX) \
+                and not name.startswith(_TMP_PREFIX):
+            names.add(name[: -len(_LEDGER_SUFFIX)])
+    return sorted(names)
+
+
+def _failure_report(cwd):
+    """Look at every hook's ledger. Returns ``(findings, marks)``.
+
+    ``findings`` is a list of one-line strings, one per hook whose latest run
+    failed and has not been reported yet; ``marks`` is the full "reported"
+    map to persist (hook -> identity of what was reported), including entries
+    already reported -- a hook whose ledger became clean again drops out, so
+    the next failure is news again.
+    """
+    state, _ = _hook_state.read_state(HOOK, cwd)
+    already = state.get("reported") if isinstance(state.get("reported"), dict) else {}
+    own_entries, _ = _hook_state.read_ledger(HOOK, cwd)
+    first_start = not own_entries
+    marks = {}
+    findings = []
+    for hook in _ledger_names(cwd):
+        entries, reasons = _hook_state.read_ledger(hook, cwd)
+        exists = os.path.exists(_hook_state.ledger_path(hook, cwd))
+        if not exists:
+            if hook in _EXPECTED_LEDGERS and not first_start:
+                key, text = "missing", f"{hook} has never recorded a run (is its hook firing?)"
+            else:
+                continue  # a first start, or a hook that is simply not installed
+        elif not entries and "unknown" in reasons:
+            key, text = "unreadable", f"{hook} ledger is unreadable"
+        elif not entries:
+            continue  # exists and empty: nothing has happened yet
+        else:
+            last = entries[-1]
+            reason = last.get("reason")
+            if not (_hook_state.is_failure_reason(reason) or last.get("ok") is False):
+                continue
+            ts = str(last.get("ts", ""))
+            key, text = f"{ts}|{reason}", f"{hook} failed its last run ({reason}, {_age_of(ts)} ago)"
+        marks[hook] = key
+        if already.get(hook) != key:
+            findings.append(text)
+    return findings, marks
+
+
 def _render(rows):
     """Render the settled rows into a provenance-annotated brief (or None)."""
     if not rows:
@@ -276,6 +361,15 @@ def _collect(run):
     if isinstance(event.get("cwd"), str) and event["cwd"]:
         run["cwd"] = event["cwd"]
     cwd = run["cwd"] or os.getcwd()
+
+    # The failure report first, before anything that can return early or
+    # raise: the other hooks' failures are worth knowing regardless of how
+    # this run goes. Read here, on the worker, so it is under the deadline.
+    if _hook_state is not None:
+        try:
+            run["report"], run["marks"] = _failure_report(cwd)
+        except Exception as exc:  # noqa: BLE001 - the report must never cost the brief
+            print(f"[{HOOK}] could not read the hook ledgers: {exc!r}", file=sys.stderr)
 
     base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
     if not base_url:
@@ -338,7 +432,7 @@ def _record(reason, started, run):
         return False
     elapsed_ms = int((time.monotonic() - started) * 1000)  # the hook's work, not the wait below
     # Snapshot: if the work was abandoned, its thread may still be writing to `run`.
-    calls, cwd, extra = run["calls"], run["cwd"], dict(run["extra"])
+    calls, cwd, extra, marks = run["calls"], run["cwd"], dict(run["extra"]), run["marks"]
 
     def write():
         try:
@@ -353,6 +447,19 @@ def _record(reason, started, run):
             )
         except Exception as exc:  # record_run does not raise by contract; the net under it
             print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+        if marks is None:
+            return  # the ledgers were never read this run; leave the markers alone
+        try:
+            # container_id travels with every state write: identity_drift
+            # (TASK-007) reads it back, and a state written without it makes
+            # every later run report unknown.
+            _hook_state.update_state(
+                HOOK,
+                cwd or os.getcwd(),
+                lambda s: {**s, "reported": marks, "container_id": _identity.container_id()},
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{HOOK}] could not persist the report markers: {exc!r}", file=sys.stderr)
 
     worker = threading.Thread(target=write, name=f"{HOOK}-ledger", daemon=True)
     worker.start()
@@ -385,7 +492,7 @@ def _silence_stdout():
 def main():
     """Run the hook. Returns True when a worker thread had to be left behind."""
     started = time.monotonic()
-    run = {"cwd": None, "calls": 0, "extra": {}}
+    run = {"cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None}
     outcome = {}
 
     def work():  # never prints: a thread that may be abandoned must stay off stdio
@@ -424,6 +531,14 @@ def main():
         if run["extra"].get("backend_errors"):
             _warn(reason, f"backend reported failures in {run['extra']['backend_errors']}")
 
+    findings = run["report"]
+    if findings:
+        # One line for the user, one for Claude, then the brief (if any).
+        headline = "; ".join(findings)
+        where = _hook_state.project_dir(run["cwd"] or os.getcwd()) if _hook_state else "?"
+        context_line = f"[nexus-memory] Hook failures since last session: {headline}. Ledgers: {where}"
+        brief = context_line if not brief else f"{context_line}\n\n{brief}"
+
     if brief:
         output = {
             "hookSpecificOutput": {
@@ -431,6 +546,8 @@ def main():
                 "additionalContext": brief,
             }
         }
+        if findings:
+            output["systemMessage"] = f"nexus-memory: {'; '.join(findings)}"
         # Before the ledger, not after: nothing below this line may cost the
         # session its injection.
         try:
