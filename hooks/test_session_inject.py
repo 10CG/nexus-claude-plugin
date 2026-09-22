@@ -231,6 +231,90 @@ class TestRender(unittest.TestCase):
         kept = _MOD._settled_rows(rows)
         self.assertEqual(len(kept), 2)
 
+    # ── 10CG/nexus-claude-plugin#32: the aggregator's layer is session_summary ──
+
+    @staticmethod
+    def _aggregated_row(content, *, branch="feat/x", container_id="dev-claude-308"):
+        """A row as `workers/session_aggregator.py` writes it: the provenance
+        keys only when the session's observations agree on one, and no
+        timestamp in the metadata."""
+        meta = {"layer": "session_summary", "session_id": "s-1", "source_activity_count": 3,
+                "observation_ids": ["t::u::a"], "aggregation_hash": "h"}
+        if branch is not None:
+            meta["branch"] = branch
+        if container_id is not None:
+            meta["container_id"] = container_id
+        return {"memory_id": "m2", "content": content, "memory_type": "episodic", "metadata": meta}
+
+    def test_a_profile_of_aggregated_summaries_is_rendered(self):
+        """The bug itself: a profile holding only session_summary rows used to
+        render nothing, so the brief fell back to July's migrated summaries."""
+        rows = [self._aggregated_row("episode one"), _profile_row("raw obs", layer="observation")]
+        brief = _MOD._render(_MOD._settled_rows(rows))
+        self.assertIsNotNone(brief)
+        self.assertIn("episode one", brief)
+        self.assertNotIn("raw obs", brief)
+
+    def test_session_summary_goes_first_and_each_layer_keeps_the_backend_order(self):
+        # Backend order runs against both content and id, so a secondary sort
+        # key on either would show up as a reordering.
+        rows = [
+            _profile_row("migrated y", layer="summary"),
+            _profile_row("raw obs", layer="observation"),
+            self._aggregated_row("episode z"),
+            _profile_row("migrated b", layer="summary"),
+            self._aggregated_row("episode a"),
+        ]
+        for row, memory_id in zip(rows, ("m-4", "m-5", "m-3", "m-2", "m-1")):
+            row["memory_id"] = memory_id
+        kept = [r["content"] for r in _MOD._settled_rows(rows)]
+        self.assertEqual(kept, ["episode z", "episode a", "migrated y", "migrated b"])
+
+    def test_a_profile_of_only_observations_renders_nothing(self):
+        """The rows carry a layer, just not a settled one: that is not the
+        no-layer case, and observations must not fall through into the brief."""
+        rows = [_profile_row("obs 1", layer="observation"), _profile_row("obs 2", layer="observation")]
+        self.assertEqual(_MOD._settled_rows(rows), [])
+        self.assertIsNone(_MOD._render(_MOD._settled_rows(rows)))
+
+    def test_an_empty_branch_is_rendered_like_a_missing_one(self):
+        migrated = _profile_row("old", layer="summary", branch="")
+        episode = self._aggregated_row("new", branch="")
+        lines = _MOD._render(_MOD._settled_rows([migrated, episode])).splitlines()
+        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
+        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
+
+    def test_a_blank_or_non_string_branch_is_rendered_like_a_missing_one(self):
+        """Whitespace leaves the same empty slot an empty string did, and a
+        branch that is not a string is not a branch."""
+        for value in ("  ", "\t", 0, 7, ["main"]):
+            with self.subTest(value=value):
+                row = self._aggregated_row("x", branch=value)
+                self.assertTrue(_MOD._render(_MOD._settled_rows([row])).endswith("· ?] x"))
+
+    def test_a_layer_value_that_is_not_a_known_string_is_dropped_not_raised(self):
+        """`in` on the rank table hashes the value: a list would raise and take
+        every other row down with it."""
+        rows = [self._aggregated_row("keep"), _profile_row("list", layer=["summary"]),
+                _profile_row("number", layer=7), _profile_row("unknown", layer="fact")]
+        self.assertEqual([r["content"] for r in _MOD._settled_rows(rows)], ["keep"])
+
+    def test_branch_shows_dash_for_a_migrated_summary_and_question_mark_otherwise(self):
+        migrated = _profile_row("old", layer="summary")
+        del migrated["metadata"]["branch"]
+        mixed_session = self._aggregated_row("new", branch=None)  # no unique branch
+        brief = _MOD._render(_MOD._settled_rows([migrated, mixed_session]))
+        lines = brief.splitlines()
+        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
+        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
+
+    def test_an_aggregated_row_renders_its_provenance_with_an_unknown_age(self):
+        """Neither the aggregator's metadata nor a profile row carries a
+        timestamp, so the age is '?' until workflow D (TASK-007) reads
+        `created_at` from the list endpoint. Pinned so that change is seen."""
+        brief = _MOD._render(_MOD._settled_rows([self._aggregated_row("did it", branch="feat/us-037")]))
+        self.assertIn("[dev-claude-308 · ? · feat/us-037] did it", brief)
+
     def test_render_has_provenance(self):
         rows = [_profile_row("did the thing", container_id="dev-claude-308",
                              branch="feat/us-037")]
@@ -332,6 +416,21 @@ class TestRequestParams(unittest.TestCase):
         self.assertNotIn("metadata_filter", body2, "tier-2 fallback must omit metadata_filter")
         # And the tier-2 hit must be rendered.
         self.assertIn("project level hit", out)
+
+    def test_known_limit_own_episodes_in_tier_one_keep_tier_two_from_running(self):
+        """Pinned known limit (10CG/nexus-claude-plugin#32 interim fix): this
+        container's aggregated episode on the branch satisfies tier 1, so the
+        project-level tier 2 -- the only source of the other container's rows
+        and of the migrated summaries -- is never sent. Workflow D (change 2
+        TASK-007) replaces the tiers; this test is expected to change then."""
+        own = TestRender._aggregated_row("my own episode", branch="feat/inject")
+        tier1 = {"profile": [own], "total_latency_ms": 1}
+        tier2 = {"profile": [_profile_row("other container episode", container_id="dev-claude2")],
+                 "total_latency_ms": 1}
+        cap, out = self._run_main_capturing([tier1, tier2], {"cwd": _HOOKS_DIR})
+        self.assertEqual(len(cap.requests), 1)
+        self.assertIn("my own episode", out)
+        self.assertNotIn("other container episode", out)
 
     def test_output_shape_and_provenance(self):
         resp = {"profile": [_profile_row("did a refactor", container_id="dev-claude-308",

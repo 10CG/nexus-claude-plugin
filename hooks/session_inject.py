@@ -35,6 +35,22 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
     returned profile is empty, a SECOND request is sent WITHOUT metadata_filter
     (project-level recall). This is the simplified stand-in for the full
     primary/same-branch-cross-container/project three-tier recall.
+    Known limit since the layer whitelist (10CG/nexus-claude-plugin#32): tier
+    1 used to come back empty almost always (migrated summaries carry no
+    branch, observations are filtered out), so tier 2 ran and rendered the
+    migrated summaries. Now this container's own aggregated episodes fill
+    tier 1 -- on the current branch, or across all branches when the branch
+    is unknown, since the filter is then ``container_id`` alone -- and tier 2
+    is not sent. Tier 2 is the usual source of the migrated summaries, of this
+    container's other branches, and of the other container's rows -- "usual"
+    because a hybrid tenant's sentence channel sends no filter at all, so rows
+    of any of those kinds can arrive in tier 1 anyway. A start then sees its
+    own episodes and typically not the other container's -- before the
+    whitelist it saw neither. Workflow D (change 2 TASK-007) replaces these tiers with
+    per-container grouping and peer look-ups and ships in the same release
+    (TASK-008); until then an installed client stays on the snapshot it was
+    installed from, but the marketplace source pins no ref, so a fresh
+    install or an update takes main HEAD. A test pins it.
   - HTTP headers MUST include a User-Agent (SPIKE #8: requests through the CF
     proxy with no UA are blocked by CF 1010 Bot Fight Mode), plus X-API-Key,
     Content-Type, and X-Nexus-Source: sessionstart-hook/<plugin version>.
@@ -68,11 +84,19 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
     lookup comes back 200 with ``profile: null`` and the error under ``errors``.
     That, a body that is not JSON, and JSON of the wrong shape are all
     ``http_error``; only an honest empty profile is ``nothing_to_do``.
-  - Render: ONLY settled summaries (metadata.layer == "summary" preferred; if no
-    profile item carries a ``layer`` key at all, take all of them). Each line is
-    prefixed ``[<container_id> · <age> · <branch>]`` provenance (§6 — guard the
+  - Render: ONLY settled summaries -- ``session_summary`` rows (what the
+    backend's session aggregator writes, and what its layer preference ranks
+    first) ahead of ``summary`` rows (the claude-mem migration), each group in
+    the order the backend returned it; if no profile item carries a ``layer``
+    key at all, take all of them. Filtering on ``summary`` alone dropped every
+    aggregated row (10CG/nexus-claude-plugin#32). Each line is prefixed
+    ``[<container_id> · <age> · <branch>]`` provenance (§6 — guard the
     warm-start from half-finished observations + make cross-container origin
-    legible). No results -> no stdout (fail-open silent).
+    legible). A migrated ``summary`` never had a branch and shows ``-``; a
+    ``session_summary`` shows ``?`` for its age, because neither its metadata
+    nor a profile row carries a timestamp (workflow D, TASK-007, moves to the
+    list endpoint and its ``created_at``). No results -> no stdout (fail-open
+    silent).
 """
 
 import json
@@ -154,6 +178,15 @@ class _BadResponse(Exception):
 # the exception text under `errors[<task>]`.
 _PROFILE_TASKS = ("profile", "recent")
 
+# The layers the brief renders, best first. `session_summary` is what the
+# backend's session aggregator writes (and what `services/context.py`'s layer
+# preference ranks first); `summary` is the claude-mem migration (no branch,
+# no session_id). Matching `summary` alone dropped every aggregated row
+# (10CG/nexus-claude-plugin#32). `observation` stays out on purpose: raw
+# activity granularity is noise in a warm-start.
+_SETTLED_LAYERS = ("session_summary", "summary")
+_SETTLED_RANK = {layer: rank for rank, layer in enumerate(_SETTLED_LAYERS)}
+
 
 def _current_branch(cwd):
     """Return the current git branch, or None if not a git repo / git failed."""
@@ -228,17 +261,33 @@ def _rows_from(ctx, run):
     return _settled_rows(profile)
 
 
-def _settled_rows(profile):
-    """Filter profile rows to settled summaries.
+def _settled_rank(row):
+    """The row's position in ``_SETTLED_LAYERS``, or ``None`` if not rendered."""
+    layer = (row.get("metadata") or {}).get("layer")
+    # isinstance first: a dict lookup hashes, and a list-valued layer from a
+    # confused writer would raise and take the whole brief down with it.
+    return _SETTLED_RANK.get(layer) if isinstance(layer, str) else None
 
-    layer=="summary" preferred; if NO row carries a ``layer`` metadata key at
-    all, take every row (no layer dimension present -> nothing to filter on).
+
+def _settled_rows(profile):
+    """Filter profile rows to settled summaries, ``session_summary`` first.
+
+    If NO row carries a ``layer`` metadata key at all, take every row (no layer
+    dimension present -> nothing to filter on).
     """
     rows = [r for r in profile if isinstance(r, dict)]
     has_layer = any("layer" in (r.get("metadata") or {}) for r in rows)
     if not has_layer:
         return rows
-    return [r for r in rows if (r.get("metadata") or {}).get("layer") == "summary"]
+    ranked = []
+    for row in rows:
+        rank = _settled_rank(row)
+        if rank is not None:
+            ranked.append((rank, row))
+    # Sorted on the rank alone, and sort is stable: within a layer the
+    # backend's order is kept.
+    ranked.sort(key=lambda pair: pair[0])
+    return [row for _, row in ranked]
 
 
 def _age(meta):
@@ -335,7 +384,13 @@ def _render(rows):
     for r in rows:
         meta = r.get("metadata") or {}
         container = meta.get("container_id", "?")
-        branch = meta.get("branch", "?")
+        branch = meta.get("branch")
+        if not isinstance(branch, str) or not branch.strip():
+            # A migrated summary never had a branch: "-" says "none", where
+            # "?" would suggest one went missing. Empty, blank and non-string
+            # values are missing too; rendered as they came they left an empty
+            # (or nonsense) slot in the bracket.
+            branch = "-" if meta.get("layer") == "summary" else "?"
         age = _age(meta)
         content = (r.get("content") or "").strip().replace("\n", " ")
         if len(content) > 300:
