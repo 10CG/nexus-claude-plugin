@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+from datetime import datetime, timezone
 from unittest import mock
 
 import _hook_state
@@ -342,6 +343,226 @@ class TestOneRow(_ClientCase):
                 backend.reply(200, _page(_row("s", content_hash="old", extra=extra))).reply(200, {"memory_id": "m"})
                 out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert("fact", "s", "c", {}, local_updated_at=local_ts)
                 self.assertEqual(out.action, "updated")
+
+
+class TestMetadataOnlyChange(_ClientCase):
+    """A8-1 follow-up (owner ruling 2026-09-22). The hash covers the content
+    only, so an edit confined to the ``aria.*`` keys -- a memory file whose
+    description changed but whose body did not, a handoff flipped from active
+    to done -- came back ``unchanged`` (a skip-class reason, never shown) and
+    the server kept the old values. It must PATCH, and without ``content``:
+    the backend re-embeds whenever a PATCH carries content."""
+
+    MEMORY_ID = "t1::nexus::11111111-1111-4111-8111-111111111111"
+
+    def _one_row(self, content, *, layer="fact", external_id="slug", extra=None):
+        digest = _ingest_client.content_hash(content)
+        self.backend.reply(200, _page(_row(external_id, layer=layer, content_hash=digest, extra=extra)))
+
+    def test_a_description_only_edit_patches_the_metadata_without_content(self):
+        # aria.memory_slug is equal on both sides: one differing key is enough.
+        stored = {"aria.memory_slug": "slug", "aria.description": "old description", "aria.modified": "2026-09-20T00:00:00Z"}
+        self._one_row("same body", extra=stored)
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert(
+            "fact",
+            "slug",
+            "same body",
+            {"aria.memory_slug": "slug", "aria.description": "new description", "aria.modified": "2026-09-22T00:00:00Z"},
+            local_updated_at="2026-09-22T00:00:00Z",
+            updated_key="aria.modified",
+        )
+        self.assertEqual((out.reason, out.action, out.calls), (_hook_state.NO_REASON, "updated", 2))
+        patch = self.requests[1]
+        self.assertEqual(patch["method"], "PATCH")
+        self.assertEqual(set(patch["json"]), {"metadata"})  # no content, so no re-embedding
+        self.assertEqual(
+            patch["json"]["metadata"],
+            {
+                "content_hash": _ingest_client.content_hash("same body"),
+                "aria.memory_slug": "slug",
+                "aria.description": "new description",
+                "aria.modified": "2026-09-22T00:00:00Z",
+            },
+        )
+
+    def test_a_handoff_status_flip_patches_the_metadata_without_content(self):
+        stored = {"aria.status": "active", "aria.phase": "B", "aria.updated_at": "2026-09-20T00:00:00Z"}
+        self._one_row("# H\n## 6\n## 2", layer="session_summary", external_id="docs/handoff/h.md", extra=stored)
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        meta = {
+            "session_id": "sess-1",
+            "branch": "main",
+            "aria.status": "done",
+            "aria.phase": "session",
+            "aria.updated_at": "2026-09-22T00:00:00Z",
+        }
+        out = self.client().upsert(
+            "session_summary", "docs/handoff/h.md", "# H\n## 6\n## 2", meta, local_updated_at="2026-09-22T00:00:00Z"
+        )
+        self.assertEqual(out.action, "updated")
+        patch = self.requests[1]["json"]
+        self.assertEqual(set(patch), {"metadata"})
+        self.assertEqual((patch["metadata"]["aria.status"], patch["metadata"]["aria.phase"]), ("done", "session"))
+        for key in _ingest_client.IDENTITY_KEYS:
+            self.assertNotIn(key, patch["metadata"])
+
+    def test_equal_values_of_every_json_type_are_unchanged_and_write_nothing(self):
+        """The comparison runs on every sync: a value that stops comparing
+        equal after the JSON round trip would PATCH on every run."""
+        stored = {
+            "aria.description": "d",
+            "aria.truncated": True,
+            "aria.count": 3,
+            "aria.tags": ["a", "b"],
+            "aria.nested": {"k": None},
+        }
+        self._one_row("body", extra=stored)
+        out = self.client().upsert("fact", "slug", "body", dict(stored))
+        self.assertEqual((out.reason, out.action, out.calls), ("unchanged", "unchanged", 1))
+
+    def test_the_comparison_is_on_the_redacted_value(self):
+        """The server holds what was sent, i.e. the redacted form; comparing
+        it with the raw local value would differ on every run for any
+        description that carries a secret shape."""
+        raw = "rotate it: password: hunter22x9"
+        sent, hits = _redact.redact_text(raw)
+        self.assertEqual(hits, 1)  # the fixture has to exercise the redactor
+        self._one_row("body", extra={"aria.description": sent})
+        out = self.client().upsert("fact", "slug", "body", {"aria.description": raw})
+        self.assertEqual((out.reason, out.calls), ("unchanged", 1))
+
+    def test_a_metadata_only_edit_from_an_older_local_copy_is_stale_local(self):
+        self._one_row("body", extra={"aria.description": "newer on server", "aria.modified": "2026-09-22T12:00:00Z"})
+        out = self.client().upsert(
+            "fact",
+            "slug",
+            "body",
+            {"aria.description": "older local", "aria.modified": "2026-09-21T00:00:00Z"},
+            local_updated_at="2026-09-21T00:00:00Z",
+            updated_key="aria.modified",
+        )
+        self.assertEqual((out.reason, out.calls), ("stale_local", 1))
+
+    def test_a_metadata_only_patch_is_redacted_before_send(self):
+        """The PATCH body is built from the redacted metadata, as the POST is;
+        built from the caller's own dict it would store the secret."""
+        raw = "rotate it: password: hunter22x9"
+        self._one_row("body", extra={"aria.description": "old description"})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "slug", "body", {"aria.description": raw})
+        self.assertEqual((out.action, out.redacted), ("updated", 1))
+        sent = self.requests[1]["json"]
+        self.assertEqual(sent["metadata"]["aria.description"], _redact.redact_text(raw)[0])
+        self.assertEqual(_redact.find(json.dumps(sent)), [])
+
+    def test_values_the_json_round_trip_reshapes_still_compare_equal(self):
+        """A tuple comes back as a list and an int key as a string; compared
+        raw they would differ on every run, and every run would PATCH."""
+        self._one_row("body", extra={"aria.tags": ["a", "b"], "aria.by_id": {"1": "x"}})
+        out = self.client().upsert("fact", "slug", "body", {"aria.tags": ("a", "b"), "aria.by_id": {1: "x"}})
+        self.assertEqual((out.reason, out.calls), ("unchanged", 1))
+
+    def test_equal_timestamps_do_not_make_a_metadata_edit_stale(self):
+        """Only an OLDER local copy is stale. A handoff whose status flipped
+        without touching updated-at, or a memory file whose description changed
+        under an explicit `modified:`, arrives with equal timestamps."""
+        ts = "2026-09-22T00:00:00Z"
+        self._one_row("body", extra={"aria.description": "old", "aria.modified": ts})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert(
+            "fact", "slug", "body", {"aria.description": "new", "aria.modified": ts},
+            local_updated_at=ts, updated_key="aria.modified",
+        )
+        self.assertEqual(out.action, "updated")
+
+    def test_a_key_the_stored_row_lacks_is_a_change(self):
+        """A source key the caller starts sending must reach the rows written
+        before it existed."""
+        self._one_row("body", extra={"aria.description": "d"})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "slug", "body", {"aria.description": "d", "aria.origin_session": "s-1"})
+        self.assertEqual(out.action, "updated")
+        self.assertEqual(self.requests[1]["json"]["metadata"]["aria.origin_session"], "s-1")
+
+    def test_a_key_the_stored_row_lacks_is_a_change_even_when_its_value_is_none(self):
+        """The row says nothing about the key; sending null says something.
+        Pinned because dropping the membership test would read the two as
+        equal, and the row would never learn the key exists."""
+        self._one_row("body", extra={"aria.description": "d"})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "slug", "body", {"aria.description": "d", "aria.origin_session": None})
+        self.assertEqual(out.action, "updated")
+        self.assertIn("aria.origin_session", self.requests[1]["json"]["metadata"])
+
+    def test_a_body_the_caller_made_unsendable_is_a_caller_bug_not_an_exception(self):
+        """Raising here would be swallowed by the hooks' blanket handler, and
+        the server's 500 would be `http_error` -- a round stop that parks the
+        caller's cursor on this document for every round after."""
+        cases = {
+            "not JSON": ("body", {"aria.when": datetime(2026, 9, 22, tzinfo=timezone.utc)}),
+            "NaN": ("body", {"aria.score": float("nan")}),
+            "NUL in content": ("a\x00b", {}),
+            "NUL inside a metadata list": ("body", {"aria.tags": ["ok", "a\x00b"]}),
+            "lone surrogate": ("a\ud800b", {}),
+        }
+        for label, (content, meta) in cases.items():
+            with self.subTest(label):
+                backend = _Backend()
+                self.addCleanup(backend.close)
+                backend.reply(200, _page())  # empty page -> POST attempt
+                with mock.patch("sys.stderr"):
+                    out = _ingest_client.IngestClient(backend.url, "", USER, CONTAINER, HOOK).upsert(
+                        "fact", "s", content, meta
+                    )
+                self.assertEqual((out.reason, out.action, out.calls), ("unknown", None, 1))
+                self.assertFalse(out.aborts_round, "a caller bug is per document, not a round stop")
+                self.assertEqual([r["method"] for r in backend.requests], ["GET"])
+
+    def test_the_nul_scan_reaches_as_deep_as_redaction_leaves_things(self):
+        """Redaction replaces subtrees past its own depth, NUL included, so
+        only what it leaves has to be scanned -- but it counts from the
+        metadata and this scan counts from the body. With equal caps the two
+        levels in between are a hole: the copy still carries the NUL, the
+        server answers 500, and that is `http_error`, which parks workflow C's
+        cursor on the document."""
+        # 63 is the whole window, measured: at 62 either cap reaches the
+        # string, and from 64 on redaction has already replaced it.
+        deep = "a\x00b"
+        for _ in range(63):
+            deep = {"n": deep}
+        self.backend.reply(200, _page())
+        with mock.patch("sys.stderr"):
+            out = self.client().upsert("fact", "s", "body", {"aria.deep": deep})
+        self.assertEqual((out.reason, out.calls), ("unknown", 1))
+
+    def test_a_document_that_writes_the_escape_sequence_is_still_sent(self):
+        """The NUL guard reads the body, not the serialised text: json escapes
+        a NUL to the six characters `\\u0000`, which a note *about* escape
+        sequences also contains -- and this repo's own memory has such notes."""
+        self.backend.reply(200, _page()).reply(201, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "s", "jsonb rejects \\u0000 in text", {"aria.description": "\\u0000"})
+        self.assertEqual((out.reason, out.action), (_hook_state.NO_REASON, "created"))
+        self.assertEqual(self.requests[1]["json"]["content"], "jsonb rejects \\u0000 in text")
+
+    def test_a_key_the_caller_stops_sending_is_not_a_change(self):
+        """Shallow merge keeps omitted keys, so dropping a flag cannot clear
+        it; only the keys the caller sends are compared. Pinned so nobody reads
+        the comparison as covering keys that exist only on the server."""
+        self._one_row("body", extra={"aria.truncated": True})
+        out = self.client().upsert("fact", "slug", "body", {})
+        self.assertEqual(out.reason, "unchanged")
+
+    def test_sending_false_for_a_stored_true_patches_it(self):
+        """...which is how a caller clears a flag: send it as False."""
+        self._one_row("body", extra={"aria.truncated": True})
+        self.backend.reply(200, {"memory_id": self.MEMORY_ID})
+        out = self.client().upsert("fact", "slug", "body", {"aria.truncated": False})
+        self.assertEqual(out.action, "updated")
+        self.assertEqual(
+            self.requests[1]["json"],
+            {"metadata": {"content_hash": _ingest_client.content_hash("body"), "aria.truncated": False}},
+        )
 
 
 class TestDedup(_ClientCase):
