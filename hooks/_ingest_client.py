@@ -129,11 +129,16 @@ def _has_nul(value, _depth=0):
     six characters ``\\u0000``, and so a document that merely *writes* those
     six characters -- notes about escape sequences do -- would match and be
     refused, where the server stores it fine (a real backend confirmed both
-    halves). Bounded like ``_redact.redact_object``: a cycle cannot be an
-    outbound body, but it must not hang the hook either."""
+    halves). Bounded like ``_redact.redact_object``, but with room to spare:
+    that one counts from the metadata and replaces anything deeper with a
+    marker (NUL included), while this scan starts two levels above it, at the
+    body. An equal cap would leave a window where the redacted copy still
+    carries a NUL that this scan no longer reaches -- the server answers 500,
+    which is ``http_error``, which parks workflow C's cursor on the document.
+    A cycle cannot be an outbound body, but it must not hang the hook."""
     if isinstance(value, str):
         return "\x00" in value
-    if _depth >= 64:
+    if _depth >= 70:
         return False
     if isinstance(value, dict):
         return any(_has_nul(k, _depth + 1) or _has_nul(v, _depth + 1) for k, v in value.items())

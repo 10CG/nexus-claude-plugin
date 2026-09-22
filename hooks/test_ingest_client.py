@@ -519,6 +519,23 @@ class TestMetadataOnlyChange(_ClientCase):
                 self.assertFalse(out.aborts_round, "a caller bug is per document, not a round stop")
                 self.assertEqual([r["method"] for r in backend.requests], ["GET"])
 
+    def test_the_nul_scan_reaches_as_deep_as_redaction_leaves_things(self):
+        """Redaction replaces subtrees past its own depth, NUL included, so
+        only what it leaves has to be scanned -- but it counts from the
+        metadata and this scan counts from the body. With equal caps the two
+        levels in between are a hole: the copy still carries the NUL, the
+        server answers 500, and that is `http_error`, which parks workflow C's
+        cursor on the document."""
+        # 63 is the whole window, measured: at 62 either cap reaches the
+        # string, and from 64 on redaction has already replaced it.
+        deep = "a\x00b"
+        for _ in range(63):
+            deep = {"n": deep}
+        self.backend.reply(200, _page())
+        with mock.patch("sys.stderr"):
+            out = self.client().upsert("fact", "s", "body", {"aria.deep": deep})
+        self.assertEqual((out.reason, out.calls), ("unknown", 1))
+
     def test_a_document_that_writes_the_escape_sequence_is_still_sent(self):
         """The NUL guard reads the body, not the serialised text: json escapes
         a NUL to the six characters `\\u0000`, which a note *about* escape
