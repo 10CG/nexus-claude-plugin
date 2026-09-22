@@ -39,12 +39,23 @@ The protocol, per document (contract ``docs/architecture/memory-layers.md``
    session.
 
 Every 2xx is checked for the shape the API promises (Amendment A5-4): a
-proxy's login page is a 200 too. ``403`` with ``detail.error ==
+proxy's login page is a 200 too. GET must answer a memory list, POST and
+PATCH a memory, and DELETE **204** (the route declares it; a 200 with a body
+is not the API deleting anything -- the first draft counted such a reply as
+"deleted 2 rows, run clean", A8-5). ``403`` with ``detail.error ==
 STRUCTURED_INGEST_DISABLED`` is ``ingest_disabled`` (the tenant switch, §3.5;
 not retried), ``429`` is ``rate_limited`` (``Retry-After`` kept for the
 ledger; not retried), ``422`` is ``rejected_422``; network failures map
 through ``_hook_state.reason_for_exception``. Nothing here raises for a
 remote condition: every path returns an ``Outcome`` the caller records.
+
+Time is bounded twice. ``timeout`` is urllib's, which is per socket
+operation, not per request: a server that drips four bytes every 50 ms kept
+a "0.2 s" request open for 52 s. So the client also takes an absolute
+``deadline`` (``time.monotonic()`` value) from the hook's own budget: a call
+that would start past it is refused as ``timeout`` without a request, the
+socket timeout never exceeds what is left, and the body is read in chunks
+against the same clock. The body is also capped in size.
 
 Stdlib only. This module imports ``_hook_state`` unconditionally (the reason
 tables live there); a platform without ``fcntl`` cannot ingest, which the
@@ -53,7 +64,9 @@ hooks report on stderr rather than crash over.
 
 import hashlib
 import json
+import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,6 +78,7 @@ import _redact
 
 DEFAULT_TIMEOUT_SECONDS = 8.0
 LOOKUP_LIMIT = 5
+MAX_BODY_BYTES = 4 * 1024 * 1024
 STRUCTURED_INGEST_DISABLED = "STRUCTURED_INGEST_DISABLED"
 
 # What a PATCH never carries (see the module docstring, step 4).
@@ -139,6 +153,10 @@ class _Response:
             return None
 
 
+class _Oversize(Exception):
+    """A body past MAX_BODY_BYTES: not an answer this client will parse."""
+
+
 def _parse_instant(value):
     """An aware datetime from an ISO-8601 string, else ``None``. Accepts the
     trailing ``Z`` the API emits and naive values (taken as UTC)."""
@@ -156,11 +174,36 @@ def _parse_instant(value):
     return parsed
 
 
+def _read_body(resp, deadline, cap):
+    """Read a response body in chunks against the deadline and the size cap.
+
+    ``resp.read()`` would honour the socket timeout per chunk and never the
+    total; a dripping server keeps it going indefinitely.
+    """
+    chunks = []
+    size = 0
+    # read1: whatever one recv delivers. read(n) would wait for n bytes or
+    # the whole declared Content-Length, and against a dripping server that
+    # wait is the very thing the deadline exists to cut.
+    read = getattr(resp, "read1", None) or resp.read
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise socket.timeout("deadline reached while reading the body")
+        chunk = read(65536)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > cap:
+            raise _Oversize(f"body exceeds {cap} bytes")
+        chunks.append(chunk)
+
+
 class IngestClient:
     """One instance per hook run. ``source_name`` is the name half of
     ``X-Nexus-Source`` and must be on the backend's allowlist
     (``mcp_attribution._KNOWN_CLIENTS``) or every request lands under
-    ``source=unknown``."""
+    ``source=unknown``. ``deadline`` is an absolute ``time.monotonic()`` value
+    from the hook's own budget; ``None`` means only the per-call timeout."""
 
     def __init__(
         self,
@@ -172,8 +215,15 @@ class IngestClient:
         *,
         timeout=DEFAULT_TIMEOUT_SECONDS,
         bulk=False,
+        deadline=None,
         opener=None,
+        max_body_bytes=MAX_BODY_BYTES,
     ):
+        # A None here is not "no filter", it is `container_id=None` on the
+        # wire and a row without the key passing verification (A8-7). Loud.
+        for name, value in (("user_id", user_id), ("container_id", container_id), ("source_name", source_name)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string, got {value!r}")
         self.base_url = (base_url or "").rstrip("/")
         self.token = token or ""
         self.user_id = user_id
@@ -181,12 +231,20 @@ class IngestClient:
         self.source_name = source_name
         self.timeout = timeout
         self.bulk = bulk
+        self.deadline = deadline
+        self.max_body_bytes = max_body_bytes
         # urllib.request.urlopen unless a test injects something else.
         self._open = opener or urllib.request.urlopen
 
     # ── HTTP ─────────────────────────────────────────────────────────────
 
-    def _headers(self, write):
+    def remaining(self):
+        """Seconds left on the deadline, or ``None`` without one."""
+        if self.deadline is None:
+            return None
+        return self.deadline - time.monotonic()
+
+    def _headers(self, write, has_body):
         headers = {
             # CF 1010 Bot Fight Mode blocks UA-less requests through the proxy.
             "User-Agent": f"nexus-{self.source_name}/{_identity.plugin_version()}",
@@ -195,36 +253,48 @@ class IngestClient:
         }
         if self.token:
             headers["X-API-Key"] = self.token
-        if write:
+        if has_body:
             headers["Content-Type"] = "application/json"
-            if self.bulk:
-                # The backend reads `.lower() == "true"` -- the literal word,
-                # not `1`, or the write lands in the interactive bucket.
-                headers["X-Bulk-Import"] = "true"
+        if write and self.bulk:
+            # The backend reads `.lower() == "true"` -- the literal word,
+            # not `1`, or the write lands in the interactive bucket.
+            headers["X-Bulk-Import"] = "true"
         return headers
 
     def _call(self, outcome, method, path, body=None, query=None):
         """One request. Returns a ``_Response`` for any HTTP status (4xx and
         5xx included -- they are answers, and the caller classifies them), or
-        ``None`` after recording the failure reason for a transport error."""
+        ``None`` after recording the failure reason for a transport error or
+        an exhausted deadline (in which case no request is made)."""
+        timeout = self.timeout
+        left = self.remaining()
+        if left is not None:
+            if left <= 0:
+                outcome.fail("timeout", f"{method} {path}: deadline exhausted before the request")
+                return None
+            timeout = min(timeout, left)
         url = f"{self.base_url}{path}"
         if query:
             url += "?" + urllib.parse.urlencode(query)
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method=method, headers=self._headers(data is not None or method == "DELETE"))
+        write = method in ("POST", "PATCH", "DELETE")
+        req = urllib.request.Request(url, data=data, method=method, headers=self._headers(write, data is not None))
         outcome.calls += 1  # counted before the call: a call that fails was still made
         try:
-            with self._open(req, timeout=self.timeout) as resp:
-                raw = resp.read()
+            with self._open(req, timeout=timeout) as resp:
+                raw = _read_body(resp, self.deadline, self.max_body_bytes)
                 headers = {k.lower(): v for k, v in resp.headers.items()}
                 response = _Response(resp.status, headers, raw)
         except urllib.error.HTTPError as exc:
             try:
-                raw = exc.read()
-            except Exception:  # noqa: BLE001 - the body is optional
+                raw = _read_body(exc, self.deadline, self.max_body_bytes)
+            except Exception:  # noqa: BLE001 - the error body is optional
                 raw = b""
             headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
             response = _Response(exc.code, headers, raw)
+        except _Oversize as exc:
+            outcome.fail("http_error", f"{method} {path}: {exc}")
+            return None
         except Exception as exc:  # noqa: BLE001 - every transport failure has a reason
             outcome.fail(_hook_state.reason_for_exception(exc), repr(exc))
             return None
@@ -278,40 +348,64 @@ class IngestClient:
         if rows and not verified:
             outcome.fail("filter_suspect", f"lookup returned {len(rows)} row(s), none with our keys")
             return None
+        if len(rows) >= LOOKUP_LIMIT:
+            # More duplicates than one page holds: dedup keeps the earliest
+            # of THIS page and converges over runs, but say so (A8-8).
+            outcome.detail = f"lookup page full ({len(rows)} rows) for {external_id!r}; dedup continues next run"
+            print(f"[{self.source_name}] {outcome.detail}", file=sys.stderr)
         return verified
 
     def _is_ours(self, row, layer, external_id):
         meta = row.get("metadata")
         if not isinstance(meta, dict) or not isinstance(row.get("memory_id"), str):
             return False
+        # Strings only: a row with no container_id must not match a client
+        # whose container_id is somehow None (the constructor refuses that,
+        # this is the second lock).
         return (
-            meta.get("layer") == layer
-            and meta.get("external_id") == external_id
-            and meta.get("container_id") == self.container_id
+            isinstance(meta.get("layer"), str)
+            and isinstance(meta.get("external_id"), str)
+            and isinstance(meta.get("container_id"), str)
+            and meta["layer"] == layer
+            and meta["external_id"] == external_id
+            and meta["container_id"] == self.container_id
         )
 
     def _delete_row(self, outcome, memory_id, what):
-        """Soft-delete one row. A 404 is success: the row is gone."""
+        """Soft-delete one row. Only the route's own answer counts: 204, or
+        404 for a row that is already gone. A 200 with a body is somebody
+        else's page, not a deletion (A8-5)."""
         response = self._call(outcome, "DELETE", "/memories/" + urllib.parse.quote(memory_id, safe=""))
         if response is None:
             return False
-        if response.status == 404:
+        if response.status in (204, 404):
             return True
+        if 200 <= response.status < 300:
+            outcome.fail("http_error", f"{what}: HTTP {response.status} with a body is not the API's 204")
+            return False
         return not self._refused(outcome, response, what)
 
     def _dedup(self, outcome, rows):
         """Keep the earliest row, delete the rest. Returns the canonical row,
         or ``None`` when a delete failed (the rest is retried next run)."""
-        ordered = sorted(rows, key=lambda r: (_parse_instant(r.get("created_at")) or datetime.max.replace(tzinfo=timezone.utc), str(r.get("id", ""))))
+        ordered = sorted(
+            rows,
+            key=lambda r: (
+                _parse_instant(r.get("created_at")) or datetime.max.replace(tzinfo=timezone.utc),
+                str(r.get("id", "")),
+            ),
+        )
         canonical, extras = ordered[0], ordered[1:]
         for row in extras:
             if not self._delete_row(outcome, row["memory_id"], "dedup delete"):
                 return None
             outcome.dedup_merged += 1
-        if outcome.dedup_merged:
-            # A destructive action, and evidence the idempotency protocol lost a
-            # race once: in the failure table, so it is reported (A4-4).
-            outcome.fail("dedup_merged", f"deleted {outcome.dedup_merged} duplicate row(s)")
+            if outcome.dedup_merged == 1:
+                # A destructive action, and evidence the idempotency protocol
+                # lost a race once: in the failure table, so it is reported
+                # (A4-4). Recorded at the first deletion, so a later failure
+                # in the same loop does not erase it from `reasons` (A8-6).
+                outcome.fail("dedup_merged")
         return canonical
 
     def upsert(self, layer, external_id, content, metadata, *, local_updated_at=None, updated_key="aria.updated_at"):
@@ -406,8 +500,9 @@ class IngestClient:
 
     def delete(self, layer, external_id):
         """Soft-delete every row this container wrote for ``external_id``.
-        Returns an ``Outcome``; ``outcome.deleted`` counts the rows removed.
-        The ``pending_delete`` bookkeeping belongs to the caller's state: this
+        Returns an ``Outcome``; ``outcome.deleted`` counts the rows the server
+        confirmed gone (204, or 404 for an already-gone row). The
+        ``pending_delete`` bookkeeping belongs to the caller's state: this
         only reports whether the server now agrees the rows are gone."""
         outcome = Outcome()
         if not self.base_url:

@@ -50,6 +50,7 @@ class _Backend:
         self.script = []
         self.requests = []
         self.delay = 0.0
+        self.drip = None  # (chunk, delay_seconds, chunks): stream the body slowly
         backend = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -74,6 +75,20 @@ class _Backend:
                     status, body, headers = backend.script.pop(0)
                 else:
                     status, body, headers = 599, {"detail": "unscripted request"}, {}
+                if backend.drip:
+                    chunk, pause, count = backend.drip
+                    handler.send_response(status)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(chunk) * count))
+                    handler.end_headers()
+                    try:
+                        for _ in range(count):
+                            handler.wfile.write(chunk)
+                            handler.wfile.flush()
+                            time.sleep(pause)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 payload = body if isinstance(body, bytes) else (b"" if body is None else json.dumps(body).encode("utf-8"))
                 handler.send_response(status)
                 for key, value in headers.items():
@@ -523,6 +538,125 @@ class TestContract(unittest.TestCase):
     def test_identity_keys_and_patch_prefix_pin_the_patch_rule(self):
         self.assertEqual(set(_ingest_client.IDENTITY_KEYS), {"layer", "session_id", "branch", "container_id", "external_id"})
         self.assertEqual(_ingest_client.PATCH_PREFIX, "aria.")
+
+
+class TestReviewRound1(_ClientCase):
+    """What the pre-merge adversarial review found (Amendment A8)."""
+
+    def _two_rows(self, digest):
+        older = _row("s", content_hash=digest, created_at="2026-09-20T00:00:00.000001Z", row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        newer = _row("s", content_hash=digest, created_at="2026-09-21T00:00:00.000001Z", row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        return older, newer
+
+    def test_a_200_page_is_not_a_deletion(self):
+        """A8-5 (critical): a login page answering 200 was counted as
+        'deleted 2 rows, run clean' and the caller would have cleared
+        pending_delete for rows still on the server."""
+        a = _row("s", content_hash="x", row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        b = _row("s", content_hash="x", row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(a, b)).reply(200, b"<html>login</html>", {"Content-Type": "text/html"})
+        out = self.client().delete("fact", "s")
+        self.assertEqual((out.reason, out.deleted, out.action, out.calls), ("http_error", 0, None, 2))
+
+    def test_a_200_on_dedup_delete_does_not_count_as_merged(self):
+        older, newer = self._two_rows("old")
+        self.backend.reply(200, _page(newer, older)).reply(200, {"detail": "ok"})
+        out = self.client().upsert("fact", "s", "changed", {})
+        self.assertEqual((out.reason, out.dedup_merged, out.action), ("http_error", 0, None))
+        self.assertNotIn("dedup_merged", out.reasons)
+        self.assertEqual(len(self.requests), 2)  # no PATCH after a delete that did not happen
+
+    def test_a_dripping_body_is_cut_at_the_deadline(self):
+        """A8-3: urllib's timeout is per socket operation; four bytes every
+        50 ms kept a '0.2 s' request open for 52 s."""
+        self.backend.drip = (b"    ", 0.05, 200)  # 10 seconds of drip
+        self.backend.reply(200, None)
+        started = time.monotonic()
+        client = self.client(timeout=0.2, deadline=time.monotonic() + 0.6)
+        out = client.upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "timeout")
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertTrue(out.aborts_round)
+
+    def test_an_exhausted_deadline_makes_no_request(self):
+        client = self.client(deadline=time.monotonic() - 1)
+        out = client.upsert("fact", "s", "c", {})
+        self.assertEqual((out.reason, out.calls), ("timeout", 0))
+        self.assertEqual(self.requests, [])
+
+    def test_reasons_are_collapsed_by_worst_reason_not_first_wins(self):
+        """A8 survivor M12: the only multi-reason fixture had the failure
+        first, so `reasons[0]` passed. Here first-wins says dedup_merged
+        (does not abort the round) and the collapse says http_error (does)."""
+        older, newer = self._two_rows("old")
+        self.backend.reply(200, _page(newer, older)).reply(204, None).reply(500, {"detail": "boom"})
+        out = self.client().upsert("fact", "s", "changed", {})
+        self.assertEqual(out.reasons, ["dedup_merged", "http_error"])
+        self.assertEqual(out.reason, "http_error")
+        self.assertTrue(out.aborts_round)
+        self.assertEqual(out.dedup_merged, 1)
+
+    def test_a_partial_dedup_keeps_dedup_merged_in_the_reasons(self):
+        """A8-6: the reason used to be appended after the loop, so a second
+        delete failing erased the first deletion from `reasons`."""
+        digest = _ingest_client.content_hash("same")
+        rows = [
+            _row("s", content_hash=digest, created_at=f"2026-09-2{i}T00:00:00Z", row_id=f"{c * 8}-1111-4111-8111-111111111111")
+            for i, c in ((0, "a"), (1, "b"), (2, "c"))
+        ]
+        self.backend.reply(200, _page(*rows)).reply(204, None).reply(500, {"detail": "boom"})
+        out = self.client().upsert("fact", "s", "same", {})
+        self.assertEqual(out.dedup_merged, 1)
+        self.assertEqual(out.reasons, ["dedup_merged", "http_error"])
+
+    def test_the_constructor_refuses_a_missing_identity(self):
+        """A8-7: `container_id=None` went on the wire as the literal string
+        and a row without the key passed verification."""
+        for kw in ({"user_id": None}, {"user_id": ""}, {"container_id": None}, {"container_id": " "}, {"source_name": ""}):
+            with self.subTest(kw):
+                args = {"user_id": USER, "container_id": CONTAINER, "source_name": HOOK}
+                args.update(kw)
+                with self.assertRaises(ValueError):
+                    _ingest_client.IngestClient(self.backend.url, "", **args)
+
+    def test_a_row_whose_keys_are_not_strings_is_not_ours(self):
+        row = _row("s", content_hash="x")
+        row["metadata"]["container_id"] = 123
+        self.backend.reply(200, _page(row))
+        out = self.client().upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "filter_suspect")
+
+    def test_a_full_page_is_reported_and_still_deduplicated(self):
+        """A8-8: with more duplicates than a page holds, dedup keeps the
+        earliest of the page and converges over runs -- but says so."""
+        digest = _ingest_client.content_hash("same")
+        rows = [
+            _row("s", content_hash=digest, created_at=f"2026-09-1{i}T00:00:00Z", row_id=f"{c * 8}-1111-4111-8111-111111111111")
+            for i, c in ((5, "e"), (4, "d"), (3, "c"), (2, "b"), (1, "a"))
+        ]
+        self.backend.reply(200, _page(*rows))
+        for _ in range(4):
+            self.backend.reply(204, None)
+        with mock.patch("sys.stderr") as err:
+            out = self.client().upsert("fact", "s", "same", {})
+        self.assertEqual((out.reason, out.dedup_merged, out.action), ("dedup_merged", 4, "unchanged"))
+        self.assertEqual(out.memory_id, rows[-1]["memory_id"])  # the earliest of the page
+        self.assertIn("page full", out.detail)
+        self.assertTrue(err.write.called)
+
+    def test_delete_carries_no_content_type_and_bulk_on_writes(self):
+        """A8-9: `Content-Type: application/json` with no body."""
+        self.backend.reply(200, _page(_row("s", content_hash="x"))).reply(204, None)
+        self.client(bulk=True).delete("fact", "s")
+        delete = self.requests[1]
+        self.assertEqual(delete["method"], "DELETE")
+        self.assertNotIn("content-type", delete["headers"])
+        self.assertEqual(delete["headers"]["x-bulk-import"], "true")
+
+    def test_an_oversized_body_is_http_error(self):
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m", "pad": "x" * 4096})
+        out = self.client(max_body_bytes=1024).upsert("fact", "s", "c", {})
+        self.assertEqual((out.reason, out.action), ("http_error", None))
 
 
 if __name__ == "__main__":

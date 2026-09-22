@@ -88,21 +88,28 @@ def normalize_slug(text):
 # 25 s deadline. Caching also keeps one run internally consistent: two calls
 # that disagreed (git timing out once) used to overwrite the ledger history
 # (Amendment A5-5). Amendment A6-4.
-_SLUG_CACHE = {}
+_SLUG_CACHE = {}  # cwd -> (slug, degraded)
 
 
-def project_slug(cwd):
-    """Derive the project slug: git toplevel basename, else cwd basename.
+def project_identity(cwd):
+    """``(slug, degraded)``: the project slug and whether it is a guess.
 
-    The only copy: session_capture.py and session_inject.py each carried a
-    byte-identical one until TASK-002, which is two chances for the write side
-    and the read side to key the same project differently. Memoised per
-    process by ``cwd`` (see ``_SLUG_CACHE``).
+    The slug is the git toplevel basename; outside a repository it is the cwd
+    basename, and that fallback is fine. ``degraded`` is True when git could
+    not be *asked* -- it timed out, or is not installed -- so the fallback may
+    name a different project than the one the rows are keyed by. That is not
+    fine: ``user_id`` derives from the same call, and one git hiccup would
+    file a whole run of writes under a different user_id, invisible to the
+    next run and to the orphan reconciliation (which lists rows by the new
+    id). A writer must record ``identity_unresolved`` and skip, not guess
+    (TASK-010 pre-merge review A8-4). Memoised per process by ``cwd``: one
+    git call per run, and one answer per run (Amendment A6-4).
     """
     cached = _SLUG_CACHE.get(cwd)
     if cached is not None:
         return cached
     toplevel = None
+    degraded = False
     try:
         result = subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -111,12 +118,24 @@ def project_slug(cwd):
         )
         if result.returncode == 0:
             toplevel = result.stdout.decode().strip() or None
-    except Exception:
+    except Exception:  # timeout, no git binary, a cwd that vanished
         toplevel = None
+        degraded = True
     base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    slug = normalize_slug(base)
-    _SLUG_CACHE[cwd] = slug
-    return slug
+    identity = (normalize_slug(base), degraded)
+    _SLUG_CACHE[cwd] = identity
+    return identity
+
+
+def project_slug(cwd):
+    """Derive the project slug: git toplevel basename, else cwd basename.
+
+    The only copy: session_capture.py and session_inject.py each carried a
+    byte-identical one until TASK-002, which is two chances for the write side
+    and the read side to key the same project differently. See
+    ``project_identity`` for the degraded case a writer must check.
+    """
+    return project_identity(cwd)[0]
 
 
 def user_id(cwd):

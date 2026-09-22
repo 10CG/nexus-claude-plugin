@@ -249,6 +249,22 @@ class TestProjectSlugAndUserId(unittest.TestCase):
             _identity.project_slug("/x/therepo/b")
             self.assertEqual(run.call_count, 2)
 
+    def test_project_identity_says_when_the_slug_is_a_guess(self):
+        """A8-4: outside a repository the basename is the answer; when git
+        could not be asked it is a guess, and a writer must not key rows by
+        a guess. The cache keeps the flag with the slug."""
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        not_a_repo = subprocess.CompletedProcess(args=[], returncode=128, stdout=b"", stderr=b"fatal")
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=not_a_repo):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", False))
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", True))
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", True))  # cached with the flag
+            self.assertEqual(_identity.project_slug(plain), "notarepo")
+
     def test_user_id_env_wins(self):
         with mock.patch.dict(os.environ, {"NEXUS_DEFAULT_USER_ID": "pinned"}):
             self.assertEqual(_identity.user_id(self.tmp.name), "pinned")
