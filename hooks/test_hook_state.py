@@ -133,6 +133,11 @@ class TestReasonTables(_TempStateDir):
                     # Amendments A4-4 / A4-5 (owner rulings 2026-09-21): both
                     # started in the skip table.
                     "dedup_merged", "pointer_unresolved",
+                    # session-capture-priority-truncation, owner ruling 4: a
+                    # SessionEnd run whose tiered selection failed and fell
+                    # back to the plain tail is reported, even though the
+                    # upload itself succeeded.
+                    "capture_tiering_degraded",
                 }
             ),
         )
@@ -873,6 +878,57 @@ class TestStateAtomicity(_TempStateDir):
         self.assertFalse(_hook_state.state_exists("sync", self.cwd))
         _hook_state.write_state("sync", {}, self.cwd)
         self.assertTrue(_hook_state.state_exists("sync", self.cwd))
+
+
+class TestCaptureTieringDegradedIsTheFloor(_TempStateDir):
+    """Gate 9 of session-capture-priority-truncation.
+
+    Membership alone is not the contract: worst_reason ranks failures by
+    _REASON_PRIORITY and then by position, and a member of that table
+    outranks EVERY failure outside it. Appending the new reason to the table
+    would have made a degraded-but-successful upload outrank file_unparsable,
+    lock_unavailable and unknown (13 real failures) -- measured, not guessed.
+    So it stays out of the table and sits under a floor: any other failure in
+    the same run wins; a skip or a clean run does not.
+    """
+
+    NEW = "capture_tiering_degraded"
+
+    def test_it_is_a_failure_reason_outside_the_priority_table(self):
+        self.assertIn(self.NEW, _hook_state.FAILURE_REASONS)
+        self.assertNotIn(self.NEW, _hook_state.SKIP_REASONS)
+        self.assertNotIn(self.NEW, _hook_state._REASON_PRIORITY)
+        self.assertIn(self.NEW, _hook_state._REASON_FLOOR)
+
+    def test_every_other_failure_outranks_it(self):
+        cases = (
+            (["file_unparsable"], "file_unparsable"),   # outside the table, listed after
+            (["lock_unavailable"], "lock_unavailable"),  # appended by record_run itself
+            (["unknown"], "unknown"),                    # appended by a corrupt ledger
+            (["http_error"], "http_error"),              # inside the table
+        )
+        for others, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(_hook_state.worst_reason([self.NEW, *others]), expected)
+                self.assertEqual(_hook_state.worst_reason([*others, self.NEW]), expected)
+
+    def test_it_still_beats_a_skip_and_stands_alone(self):
+        self.assertEqual(_hook_state.worst_reason([self.NEW, "nothing_to_do"]), self.NEW)
+        self.assertEqual(_hook_state.worst_reason(["nothing_to_do", self.NEW]), self.NEW)
+        self.assertEqual(_hook_state.worst_reason([self.NEW]), self.NEW)
+        self.assertEqual(_hook_state.worst_reason([self.NEW, _hook_state.NO_REASON]), self.NEW)
+
+    def test_record_run_keeps_a_degraded_lock_ahead_of_it(self):
+        """The floor is what record_run relies on: lock_unavailable is appended
+        there, after the caller's reason, and must still win."""
+        with mock.patch.object(_hook_state, "_locked") as locked:
+            def degraded(path, reasons):
+                reasons.append("lock_unavailable")
+                from contextlib import nullcontext
+                return nullcontext()
+            locked.side_effect = degraded
+            entry = _hook_state.record_run("session-capture", ok=False, reason=self.NEW, cwd=self.cwd)
+        self.assertEqual(entry["reason"], "lock_unavailable")
 
 
 if __name__ == "__main__":
