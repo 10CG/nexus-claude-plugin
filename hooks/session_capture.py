@@ -84,6 +84,7 @@ Design contract (proposal nexus-replace-claude-mem workflow C):
     hook's own HTTP timeout is 8 s.
 """
 
+import collections
 import json
 import os
 import subprocess
@@ -236,6 +237,159 @@ def _is_low_signal(action, activity_data):
         ad = activity_data if isinstance(activity_data, dict) else {}
         return _is_readonly_command(ad.get("summary", ""))
     return False
+
+
+# ── Capture budget: tiered selection when the pool exceeds _MAX_ACTIVITIES ──────
+# (OpenSpec change session-capture-priority-truncation, plugin#28.) The budget
+# itself is right -- the backend runs one LLM extraction per activity, so the
+# cap is a cost line -- but truncating to the TAIL (`extracted[-200:]`) threw
+# away the head of the session, and the head is where the intent lives. Offline
+# replay of 20 real transcripts: high-value activities dropped 426 -> 15.
+#
+# Three tiers, collected in order. The first tier that does not fit keeps BOTH
+# ENDS of itself (the same shape as the aggregator's own "keep the ends, elide
+# the middle" roll-up), and the survivors are merged back into session order.
+
+# Tier 1. NOT the same set as the "High-signal (kept)" list in _is_low_signal's
+# docstring: that list is what survives the source filter, and it INCLUDES
+# every non-read-only command_run. This one is what the budget protects first,
+# and command_run is never in it -- a command_run that provably writes is
+# tier 2 (_WRITE_MARKERS), everything else is tier 3. _LOW_SIGNAL_ACTIONS
+# (above) is the far end of the same spectrum: dropped before any budget
+# applies. delete_file is listed for the day _classify_tool emits it; today
+# nothing does (I-D), so no fixture may be built on it.
+_HIGH_VALUE_ACTIONS = frozenset(
+    {"user_message", "commit", "run_test", "create_file", "edit_file", "delete_file"}
+)
+
+# Tier 2: a command_run whose command PROVABLY has a write side effect. This is
+# a POSITIVE table on purpose -- `not _is_readonly_command` is the wrong
+# predicate: what reaches the selector is "could not be proven read-only"
+# (unknown heads, anything piped or chained), i.e. every surviving
+# command_run, and tier 3 would be empty. Key = tokens[0]; None = the bare
+# head is enough (rm / mv / cp / mkdir / chmod); a set = tokens[1] must be in
+# it. Only what tokens[1] can tell apart is listed: `nomad job run` and
+# `nomad job status` share tokens[1], and bare `alembic current` / `heads` are
+# read-only. A head missing from the table lands in tier 3 = exactly the old
+# behaviour (nothing regresses, it just is not rescued). An over-match is not
+# free either: when the pool exceeds the limit every wrong tier-2 entry takes
+# one tier-3 slot, and tier 3 holds real writes hiding behind a chain
+# (`cd deploy && git push`). Maintenance: extend it when a toolchain appears;
+# git add / stash / pull / fetch are deliberately not listed yet.
+_WRITE_MARKERS = {
+    "rm": None,
+    "mv": None,
+    "cp": None,
+    "mkdir": None,
+    "chmod": None,
+    "git": frozenset({"push", "merge", "rebase", "reset", "checkout"}),
+    "alembic": frozenset({"upgrade", "downgrade", "revision", "stamp"}),
+    "docker": frozenset({"push", "build"}),
+    "npm": frozenset({"publish"}),
+}
+
+
+def _has_write_marker(command):
+    """True iff `command` opens with a head (and, where the table says so, a
+    subcommand) from _WRITE_MARKERS. Only tokens[0] and tokens[1] are looked
+    at -- a write behind `&&` or `sudo` is invisible here and stays tier 3."""
+    if not isinstance(command, str):
+        return False
+    tokens = command.split()
+    if not tokens or tokens[0] not in _WRITE_MARKERS:
+        return False
+    subcommands = _WRITE_MARKERS[tokens[0]]
+    if subcommands is None:
+        return True
+    return len(tokens) > 1 and tokens[1] in subcommands
+
+
+def _tier(action, activity_data):
+    """1 = protected, 2 = provable write, 3 = everything else (unenumerated)."""
+    if action in _HIGH_VALUE_ACTIONS:
+        return 1
+    if action == "command_run" and isinstance(activity_data, dict):
+        # `summary` is optional by construction (_extract_from_entry sets it
+        # only when non-empty), hence the membership test.
+        summary = activity_data["summary"] if "summary" in activity_data else ""
+        if _has_write_marker(summary):
+            return 2
+    return 3
+
+
+def select_activities(extracted, limit=_MAX_ACTIVITIES):
+    """Choose at most `limit` of `extracted`, protecting the high-value tiers.
+
+    Returns ``(selected, strategy, dropped_by_action)``:
+
+    * ``selected`` -- elements of ``extracted`` (the same objects, in the same
+      ``(action, activity_data)`` shape), in their ORIGINAL order. When
+      ``len(extracted) <= limit`` it is ``extracted`` itself, untouched: that
+      path carries most real deliveries and must not re-order anything.
+    * ``strategy`` -- ``"layered"``, or ``"degenerate"`` iff tier 1 alone
+      exceeds ``limit``. A lower tier keeping both ends does NOT change it.
+      This function never returns ``"fallback_tail"``: that value is written
+      by _parse_transcript when this function fails (fail-open).
+    * ``dropped_by_action`` -- ``{action: count}`` of what was not selected;
+      ``{}`` when nothing was.
+
+    Tiers (_HIGH_VALUE_ACTIONS / _WRITE_MARKERS): 1 = high-value actions,
+    2 = command_run with a write marker, 3 = the rest. Collected in tier
+    order; the first tier that does not fit keeps ``remaining // 2`` from
+    its front and the rest from its back (both ends, middle dropped -- an odd
+    remainder still fills the budget exactly), and once the budget is spent
+    nothing further is taken. A remainder of 0 is an explicit empty
+    selection, never a slice: ``tier[-0:]`` is the whole tier (I-B).
+
+    ORDER IS LOAD-BEARING DOWNSTREAM. The result is a NON-CONTIGUOUS
+    subsequence of the session -- there are holes where the middle of a tier
+    was dropped -- but what is kept stays in session order, and the backend
+    depends on that: it processes the POSTed list serially, one LLM call per
+    activity (nexus ``workers/activity_processor.py:697``, the
+    ``enumerate(activity_ids)`` loop), so ``Memory.created_at`` ends up
+    strictly increasing, and ``workers/session_aggregator.py:287`` orders by
+    it to build the "what it set out to do / what it concluded" roll-up.
+    Parallelising that loop would silently break this without touching any
+    file named here.
+
+    Public surface: imported across repos by
+    ``nexus:scripts/replay_session_capture.py`` (together with
+    ``read_activities`` and ``_MAX_ACTIVITIES``). Renaming or re-shaping it
+    means updating that script in the same change.
+    """
+    if len(extracted) <= limit:
+        return extracted, "layered", {}
+
+    tiers = {1: [], 2: [], 3: []}
+    for index, item in enumerate(extracted):
+        action, activity_data = item
+        tiers[_tier(action, activity_data)].append((index, item))
+
+    chosen = []
+    strategy = "layered"
+    remaining = limit
+    for tier in (1, 2, 3):
+        if remaining <= 0:
+            break  # I-B: an explicit stop, never a slice with a 0 or negative bound
+        members = tiers[tier]
+        if len(members) <= remaining:
+            chosen.extend(members)
+            remaining -= len(members)
+            continue
+        head = remaining // 2
+        tail = remaining - head  # >= 1 here (remaining >= 1), so the back slice is real
+        chosen.extend(members[:head])
+        chosen.extend(members[len(members) - tail:])  # head + tail < len: no overlap
+        remaining = 0
+        if tier == 1:
+            strategy = "degenerate"
+
+    chosen.sort(key=lambda pair: pair[0])
+    kept = {index for index, _ in chosen}
+    dropped_by_action = dict(collections.Counter(
+        action for index, (action, _) in enumerate(extracted) if index not in kept
+    ))
+    return [item for _, item in chosen], strategy, dropped_by_action
 
 
 class _BadResponse(Exception):
