@@ -1413,10 +1413,11 @@ class TestCaptureBudgetFailsOpen(_LedgerCase):
             self.assertEqual(_MOD._with_tiering_verdict("none", degraded), "capture_tiering_degraded")
             self.assertEqual(_MOD._with_tiering_verdict("nothing_to_do", {"tiering_error": None}), "nothing_to_do")
 
-    def test_a_malformed_pool_element_is_caught_by_block_one_and_still_uploaded(self):
+    def test_a_malformed_pool_element_is_caught_by_block_one_and_the_builder_still_runs(self):
         """Block 1 without a mock: the selector's own unpacking raises on a
-        pool element that is not a pair, and the capture must survive it --
-        including the fallback's breakdown, which counts the same pool."""
+        pool element that is not a pair, and the parse must survive it --
+        including the fallback's breakdown, which counts the same pool -- so
+        that the builder can still run on the result (no POST here)."""
         pool = [("edit_file", {"tool": "Edit", "summary": f"/a/{i}.py"}) for i in range(205)]
         pool.insert(3, "not-a-pair")  # in the head, so the tail fallback drops it
         stats = {"lines": 206, "parsed": 206, "messages": 206, "tiering_error": None}
@@ -1440,10 +1441,20 @@ class TestCaptureBudgetFailsOpen(_LedgerCase):
 
 
 class TestReadActivitiesIsTheSharedReader(unittest.TestCase):
-    """read_activities / select_activities / _MAX_ACTIVITIES are imported across
-    repos by nexus:scripts/replay_session_capture.py. nexus CI checks out no
-    submodules, so that script's own import test can only skip; this is the
-    plugin-side guard on the shape."""
+    """read_activities / select_activities / _MAX_ACTIVITIES / _HIGH_VALUE_ACTIONS
+    are imported across repos by nexus:scripts/replay_session_capture.py.
+    nexus CI checks out no submodules, so that script's own import test can
+    only skip; this is the plugin-side guard on the names and their shapes."""
+
+    def test_the_four_shared_names_exist_with_their_shapes(self):
+        self.assertTrue(callable(_MOD.read_activities))
+        self.assertTrue(callable(_MOD.select_activities))
+        self.assertIs(type(_MOD._MAX_ACTIVITIES), int)
+        self.assertIsInstance(_MOD._HIGH_VALUE_ACTIONS, frozenset)
+        self.assertEqual(
+            _MOD._HIGH_VALUE_ACTIONS,
+            {"user_message", "commit", "run_test", "create_file", "edit_file", "delete_file"},
+        )
 
     def test_read_activities_returns_the_full_pool_and_the_four_stats_keys(self):
         lines = _overflow_edits() + [_assistant_tool_use("Read", {"file_path": "/r/x.py"})]

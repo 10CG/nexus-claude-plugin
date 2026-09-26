@@ -370,8 +370,8 @@ def select_activities(extracted, limit=_MAX_ACTIVITIES):
 
     Public surface: imported across repos by
     ``nexus:scripts/replay_session_capture.py`` (together with
-    ``read_activities`` and ``_MAX_ACTIVITIES``). Renaming or re-shaping it
-    means updating that script in the same change.
+    ``read_activities``, ``_MAX_ACTIVITIES`` and ``_HIGH_VALUE_ACTIONS``).
+    Renaming or re-shaping it means updating that script in the same change.
     """
     if len(extracted) <= limit:
         return extracted, "layered", {}
@@ -555,9 +555,10 @@ def read_activities(path):
     keys by index, so every key is present from the start.
 
     Public surface, no underscore on purpose: imported across repos by
-    nexus:scripts/replay_session_capture.py (with select_activities and
-    _MAX_ACTIVITIES) so the offline replay runs the production reader rather
-    than a copy of it. Renaming or re-shaping it means updating that script.
+    nexus:scripts/replay_session_capture.py (with select_activities,
+    _MAX_ACTIVITIES and _HIGH_VALUE_ACTIONS) so the offline replay runs the
+    production reader rather than a copy of it. Renaming or re-shaping it
+    means updating that script.
     """
     full = []
     stats = {"lines": 0, "parsed": 0, "messages": 0, "tiering_error": None}
@@ -602,8 +603,11 @@ def _parse_transcript(path):
     read_activities's dict plus ``dropped`` = {total, by_action, strategy}:
     ``total`` counts what the CAP dropped -- len(full) - len(extracted); the
     pool is already past _is_low_signal, so source-filter drops are never in
-    it -- ``by_action`` sums to ``total`` and is ``{}`` when that is 0, and
-    ``strategy`` is one of ``layered`` / ``degenerate`` / ``fallback_tail``.
+    it -- ``by_action`` sums to ``total`` under ``layered`` / ``degenerate``
+    and is ``{}`` when ``total`` is 0; under ``fallback_tail`` it is
+    best-effort (``{}`` when the pool itself cannot be broken down, see
+    below), so only ``total`` is guaranteed -- and ``strategy`` is one of
+    ``layered`` / ``degenerate`` / ``fallback_tail``.
     Three values, final here. The wire payload has a fourth,
     ``telemetry_failed``, written only by _build_activities's own fallback;
     this dict never holds it.
@@ -819,8 +823,9 @@ def _with_tiering_verdict(reason, stats):
     ``nothing_to_do`` and the clean run -- so a run whose selector fell back
     is recorded with ``capture_tiering_degraded`` and reported at the next
     SessionStart while it is still the hook's latest ledger entry (the
-    reporter reads only the last one; a clean run after it goes unreported
-    -- owner ruling 4: the degradation is user-visible; the run's ledger
+    reporter reads only the last one: if a clean or skipped run lands after
+    it first, the degradation is never reported -- owner ruling 4: the
+    degradation is user-visible; the run's ledger
     entry says ok=false even though the upload succeeded).
     ``file_unparsable`` is not folded: it is a failure in
     its own right and the detail is in the extra. A POST that raises never

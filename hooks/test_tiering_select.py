@@ -274,6 +274,22 @@ class TestGate8WriteMarkers(unittest.TestCase):
                 selected, _, _ = sc.select_activities([e, _push(0)], limit=1)
                 self.assertEqual(_summaries(selected), ["git push origin b0"])
 
+    def test_the_tier_predicate_on_bare_heads_and_subcommands(self):
+        """Classification itself, not selection: a bare-head marker (table
+        value None) is tier 2 on its own; a set-valued head only with a
+        listed subcommand. Selection-only assertions let an inversion of the
+        None branch through (post_implementation R2 mutant i)."""
+        def tier(cmd):
+            return sc._tier("command_run", {"tool": "Bash", "summary": cmd})
+        for cmd in ("rm -rf build", "mv a b", "cp a b", "mkdir -p out", "chmod +x f", "rm"):
+            self.assertEqual(tier(cmd), 2, cmd)
+        for cmd in ("git push", "alembic upgrade head", "docker build .", "npm publish"):
+            self.assertEqual(tier(cmd), 2, cmd)
+        for cmd in ("git", "git status", "alembic", "alembic current", "docker ps", "npm install", "python3 x.py"):
+            self.assertEqual(tier(cmd), 3, cmd)
+        self.assertEqual(sc._tier("user_message", {"text": "hi"}), 1)
+        self.assertEqual(sc._tier("read_file", {"summary": "/x"}), 3)
+
     def test_marker_table_shape(self):
         self.assertIsInstance(sc._WRITE_MARKERS, dict)
         for head, subs in sc._WRITE_MARKERS.items():
