@@ -93,6 +93,13 @@ FAILURE_REASONS = frozenset(
         # reason: a renamed template or a broken frontmatter must not stop
         # ingestion silently.
         "pointer_unresolved",
+        # session-capture-priority-truncation (owner ruling 4, 2026-09-25):
+        # the SessionEnd capture's tiered selection raised and the run fell
+        # back to the plain tail. The upload itself succeeded and the run is
+        # still reported, once per degraded run, because a selector that
+        # keeps failing quietly is the tiering not existing. Kept OUT of
+        # _REASON_PRIORITY and under _REASON_FLOOR: see worst_reason.
+        "capture_tiering_degraded",
     }
 )
 
@@ -131,6 +138,15 @@ _REASON_PRIORITY = (
     "rate_limited",
     "timeout",
 )
+
+# Failures that lose to every OTHER failure in the same run. worst_reason's
+# rule is "the priority table, then the first given", and a member of the
+# table outranks every non-member -- so appending capture_tiering_degraded
+# to the table would have made "the tail was uploaded fine" outrank
+# file_unparsable, lock_unavailable and unknown (measured: 13 real failures
+# sit outside the table). A floor is the other direction: it still wins over
+# skips and clean runs, and over nothing else.
+_REASON_FLOOR = frozenset({"capture_tiering_degraded"})
 
 
 def is_failure_reason(reason):
@@ -173,7 +189,8 @@ def worst_reason(reasons):
     ``unchanged``, say — but a ledger entry holds a single scalar and the
     SessionStart reporter reads only that. Without one rule for collapsing,
     each hook would pick its own and some would drop the failure. Failures win;
-    among failures, the first given wins.
+    among failures the priority table wins, then the first given -- except
+    that a _REASON_FLOOR member yields to any other failure.
     """
     if isinstance(reasons, str):  # a bare string would iterate per character
         reasons = [reasons]
@@ -190,6 +207,9 @@ def worst_reason(reasons):
         for preferred in _REASON_PRIORITY:
             if preferred in failures:
                 return preferred
+        for failure in failures:
+            if failure not in _REASON_FLOOR:
+                return failure
         return failures[0]
     return reasons[0]
 

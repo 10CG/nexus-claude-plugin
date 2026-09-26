@@ -38,8 +38,16 @@ Design contract (proposal nexus-replace-claude-mem workflow C):
     user_message / commit / run_test / edit_file / create_file / delete_file /
     non-read-only command_run (build/deploy/migration). The filter is fail-open:
     a predicate error keeps the activity rather than aborting capture.
-  - Activity extraction (bounded — most-recent ``_MAX_ACTIVITIES`` kept, and the
-    ActivityStreamRequest schema caps at 1000):
+  - Activity extraction, bounded to ``_MAX_ACTIVITIES`` by a TIERED selection
+    (``select_activities``: high-value actions first, then command_run with a
+    write marker, then the rest; the tier that overflows keeps both its ends;
+    session order preserved -- not the most-recent tail, which threw away the
+    head of every long session). The ActivityStreamRequest schema caps at
+    1000. What the cap dropped rides on every activity as
+    ``activity_data["internal"]["capture_dropped"]`` ({total, by_action,
+    strategy}; ``internal`` is the key the backend keeps out of the LLM
+    prompt). If the selector itself raises, the run falls back to the plain
+    tail and is recorded / reported as ``capture_tiering_degraded``.
       * assistant message tool_use block -> mapped action via _classify_tool:
           Edit  -> edit_file        Write -> create_file      Read  -> read_file
           Bash 'git commit'  -> commit
@@ -125,9 +133,12 @@ HOOK = "session-capture"  # names the ledger file
 # renaming it here sends every capture to source="unknown".
 SOURCE_NAME = "session-capture-hook"
 
-# Bounded capture: keep at most the most-recent _MAX_ACTIVITIES extracted
-# activities. The backend ActivityStreamRequest caps at 1000; we stay well under
-# so a long session never produces an oversized 422-bound payload.
+# Bounded capture: at most _MAX_ACTIVITIES extracted activities, chosen by
+# select_activities (tiered; see the capture budget section) -- no longer the
+# most-recent tail. The backend ActivityStreamRequest caps at 1000; we stay
+# well under so a long session never produces an oversized 422-bound payload.
+# Also imported by nexus:scripts/replay_session_capture.py as the "OLD" side
+# of its before/after comparison: renaming it breaks that script.
 _MAX_ACTIVITIES = 200
 _HTTP_TIMEOUT_SECONDS = 8
 # How long the ledger write may hold up the exit. Normally it takes
@@ -520,19 +531,31 @@ def _extract_from_entry(entry):
     return
 
 
-def _parse_transcript(path):
-    """Parse a JSONL transcript. Returns ``(extracted, stats)``.
+def read_activities(path):
+    """Read a JSONL transcript into its FULL activity pool. Returns ``(full, stats)``.
 
-    ``extracted`` is the most-recent _MAX_ACTIVITIES (action,
-    activity_data_partial) pairs. Defensive: each line is JSON-decoded
-    independently; a bad/blank/non-dict line is skipped, never fatal.
+    ``full`` is every (action, activity_data_partial) pair that survives the
+    low-signal source filter, in session order and with NO cap -- the cap is
+    _parse_transcript's job (select_activities). Defensive: each line is
+    JSON-decoded independently; a bad/blank/non-dict line is skipped, never
+    fatal. An unreadable FILE, on the other hand, raises: this function is
+    deliberately wrapped in no try/except, because its OSError is the one
+    path by which _collect tells ``file_unparsable`` (a reported failure)
+    from ``nothing_to_do`` (a quiet skip).
 
-    ``stats`` counts non-blank ``lines``, lines that ``parsed`` as JSON, and
-    ``messages`` (user / assistant entries), so the caller can tell a session
-    with nothing worth capturing from a transcript it could not read.
+    ``stats`` counts non-blank ``lines``, lines that ``parsed`` as JSON and
+    ``messages`` (user / assistant entries) -- what _unreadable reads -- and
+    carries ``tiering_error`` (None here; _parse_transcript fills it with an
+    exception class name when the selector fails). Downstream reads these
+    keys by index, so every key is present from the start.
+
+    Public surface, no underscore on purpose: imported across repos by
+    nexus:scripts/replay_session_capture.py (with select_activities and
+    _MAX_ACTIVITIES) so the offline replay runs the production reader rather
+    than a copy of it. Renaming or re-shaping it means updating that script.
     """
-    extracted = []
-    stats = {"lines": 0, "parsed": 0, "messages": 0}
+    full = []
+    stats = {"lines": 0, "parsed": 0, "messages": 0, "tiering_error": None}
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
@@ -556,10 +579,52 @@ def _parse_transcript(path):
                         continue
                 except Exception:
                     pass
-                extracted.append((action, ad))
-    # Bound to the most-recent activities (tail of the session).
-    if len(extracted) > _MAX_ACTIVITIES:
-        extracted = extracted[-_MAX_ACTIVITIES:]
+                full.append((action, ad))
+    return full, stats
+
+
+def _count_actions(items):
+    """``{action: count}`` over (action, activity_data) pairs; ``{}`` for none."""
+    return dict(collections.Counter(action for action, _ in items))
+
+
+def _parse_transcript(path):
+    """Parse a JSONL transcript. Returns ``(extracted, stats)``.
+
+    ``extracted`` is at most _MAX_ACTIVITIES (action, activity_data_partial)
+    pairs chosen by select_activities: the high-value tiers protected, both
+    ends kept when a tier overflows, session order preserved. ``stats`` is
+    read_activities's dict plus ``dropped`` = {total, by_action, strategy}:
+    ``total`` counts what the CAP dropped -- len(full) - len(extracted); the
+    pool is already past _is_low_signal, so source-filter drops are never in
+    it -- ``by_action`` sums to ``total`` and is ``{}`` when that is 0, and
+    ``strategy`` is one of ``layered`` / ``degenerate`` / ``fallback_tail``.
+    Three values, final here. The wire payload has a fourth,
+    ``telemetry_failed``, written only by _build_activities's own fallback;
+    this dict never holds it.
+
+    Fail-open, block 1: the selector is new logic between the reader and the
+    POST, and a bug in it must not cost the capture. If it raises, the run
+    falls back to the plain tail (the pre-tiering behaviour, byte for byte),
+    ``dropped`` is recomputed for that tail so the builder still reads a
+    complete dict (block 3), and ``stats["tiering_error"]`` carries the
+    exception class name -- outside ``dropped``, which is copied onto the
+    wire whole. The reader call itself stays OUTSIDE the try: see
+    read_activities.
+    """
+    full, stats = read_activities(path)
+    try:
+        extracted, strategy, by_action = select_activities(full)
+    except Exception as exc:  # fail-open block 1: never lose the capture to the selector
+        extracted = full[-_MAX_ACTIVITIES:]
+        strategy = "fallback_tail"
+        by_action = _count_actions(full[:len(full) - len(extracted)])
+        stats["tiering_error"] = type(exc).__name__
+    stats["dropped"] = {
+        "total": len(full) - len(extracted),  # cap drops only: the pool is past _is_low_signal
+        "by_action": by_action,
+        "strategy": strategy,
+    }
     return extracted, stats
 
 
@@ -576,9 +641,34 @@ def _unreadable(stats):
     return stats["parsed"] >= _SHAPE_SUSPECT_MIN_LINES and not stats["messages"]
 
 
-def _build_activities(extracted, container_id, branch, session_id):
+def _capture_dropped_payload(dropped):
+    """The per-activity telemetry: what the capture budget dropped this run.
+
+    A fresh dict per call -- the caller injects one copy per activity on
+    purpose (see _build_activities), and no two rows may share an object.
+    Read by index: stats["dropped"] always carries all three keys, so a
+    missing one is a bug here, not something to paper over.
+    """
+    return {
+        "total": dropped["total"],
+        "by_action": dict(dropped["by_action"]),
+        "strategy": dropped["strategy"],
+    }
+
+
+def _build_activities(extracted, container_id, branch, session_id, dropped):
     """Wrap extracted (action, partial) pairs into ActivityItem dicts with
-    uniform provenance injected into each activity_data."""
+    uniform provenance injected into each activity_data, plus the capture
+    budget's telemetry under ``activity_data["internal"]["capture_dropped"]``.
+
+    ``internal`` is the one key the backend keeps out of the LLM prompt
+    (nexus workers/activity_processor.py:192, utils/formatters.py:138);
+    every other activity_data key is rendered "key: value" into it, and a
+    bare "total: 63" reads like a fact to extract. The whole activity_data
+    is also copied into memories.metadata and served by GET /v1/memories and
+    POST /v1/context/retrieve, which is why the key's shape is a documented
+    contract (nexus docs/architecture/memory-layers.md §4).
+    """
     activities = []
     for action, partial in extracted:
         ad = dict(partial)
@@ -587,6 +677,25 @@ def _build_activities(extracted, container_id, branch, session_id):
             ad["branch"] = branch
         if session_id:
             ad["session_id"] = session_id
+        # Injected on EVERY activity, and rebuilt on every iteration rather
+        # than built once and shared (owner ruling 2): a row-level query must
+        # read the run's drop count off whichever row it lands on -- "which
+        # row was first" stops being answerable once a session is re-sent --
+        # and a shared object would let one row's mutation leak into all.
+        try:
+            payload = _capture_dropped_payload(dropped)
+        except Exception:  # fail-open block 2: telemetry must never cost the upload
+            # Selection was fine and the run IS a success: no reason, no
+            # extra, no local trace (owner-acknowledged, Amendment A1-16).
+            # The only trace is strategy=telemetry_failed on the wire -- the
+            # key is still written, so a MISSING key keeps meaning "a client
+            # older than this" and nothing else.
+            try:
+                total = dropped["total"]
+            except Exception:
+                total = None
+            payload = {"total": total, "by_action": {}, "strategy": "telemetry_failed"}
+        ad["internal"] = {"capture_dropped": payload}
         item = {"action": action, "activity_data": ad}
         if session_id:
             item["session_id"] = session_id
@@ -664,17 +773,56 @@ def _collect(run):
     except OSError:
         # It is a file (checked above) and it would not open. Not a quiet session.
         return "file_unparsable"
-    activities = _build_activities(extracted, container_id, branch, session_id)
+    # (4a) The budget's health goes into the ledger extra right here -- before
+    # the builder, the two early returns and the POST -- so a POST that fails
+    # (or a builder that raises) cannot lose it. Two-valued like the wire key:
+    # "ok" is written too, so a clean run is told apart from a run that never
+    # got this far. Flattened into the ledger entry by record_run.
+    run["extra"].update(
+        tiering="ok" if stats["tiering_error"] is None else "degraded",
+        exc=stats["tiering_error"],
+    )
+    activities = _build_activities(extracted, container_id, branch, session_id, stats["dropped"])
     run["extra"].update(activities=len(activities), lines=stats["lines"], parsed=stats["parsed"])
     if not activities:
         if _unreadable(stats):
-            return "file_unparsable"
-        return "nothing_to_do"  # nothing to send -> no request
+            return "file_unparsable"  # a failure already: not folded, the detail is in the extra
+        # Nothing to send -> no request. A degraded selection on an EMPTY pool
+        # cannot happen on its own (the selector returns early below the
+        # limit); it is reachable by patching, and is folded like the clean
+        # run so the fold has no hole.
+        return _with_tiering_verdict("nothing_to_do", stats)
 
     run["calls"] += 1  # counted before the call: a call that fails was still made
     run["extra"]["accepted"] = _post(base_url, token, agent_id, activities)
     # SessionEnd injects no context -> no stdout on success.
-    return _hook_state.NO_REASON if _hook_state else "none"
+    return _with_tiering_verdict(_hook_state.NO_REASON if _hook_state else "none", stats)
+
+
+def _with_tiering_verdict(reason, stats):
+    """(4b) Fold a degraded selection into a reason that is not a failure yet.
+
+    Called only at the two return points that are not failures already --
+    ``nothing_to_do`` and the clean run -- so a run whose selector fell back
+    is recorded with ``capture_tiering_degraded`` and reported at the next
+    SessionStart, once per degraded run (owner ruling 4: the degradation is
+    user-visible; the run's ledger entry says ok=false even though the
+    upload succeeded). ``file_unparsable`` is not folded: it is a failure in
+    its own right and the detail is in the extra. A POST that raises never
+    reaches here: main() maps the exception (http_error wins) and the extra
+    written in (4a) still says degraded.
+
+    Failure-over-skip is worst_reason's structural rule (``if failures:``),
+    not a property of its priority table -- the new reason is deliberately
+    NOT in that table (see _hook_state._REASON_FLOOR). The ``if _hook_state``
+    guard mirrors the clean-run return: without the ledger module there is
+    no table to consult, and the literal is what worst_reason would pick.
+    """
+    if stats["tiering_error"] is None:
+        return reason
+    if _hook_state:
+        return _hook_state.worst_reason([reason, "capture_tiering_degraded"])
+    return "capture_tiering_degraded"
 
 
 def _record(reason, started, run):

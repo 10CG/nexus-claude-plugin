@@ -496,7 +496,8 @@ class TestEmptyActivities(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# Class Cap — bounded activity extraction (most-recent N, never exceeds 1000).
+# Class Cap — bounded activity extraction (at most N, tier-protected by
+# select_activities; never exceeds 1000).
 # ════════════════════════════════════════════════════════════════════════════════
 
 class TestCap(unittest.TestCase):
@@ -783,6 +784,9 @@ class TestLedger(_LedgerCase):
         self.assertIs(type(entry["elapsed_ms"]), int)
         self.assertEqual(entry["activities"], len(cap.requests[0][1]["activities"]))
         self.assertEqual(entry["activities"], 2)
+        # The capture budget's health is written on every run that parsed a
+        # transcript, before the POST, so a clean run says so explicitly.
+        self.assertEqual((entry["tiering"], entry["exc"]), ("ok", None))
 
     def test_a_failed_post_is_recorded_with_its_own_reason(self):
         cases = (
@@ -1253,6 +1257,145 @@ class TestTheWorkerDiedQuietly(_LedgerCase):
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
         self.assertIn("without a result", err)
+
+
+# ── session-capture-priority-truncation: the capture budget fails open ─────────
+# Gate 6 (a-e) walks main(), so it lives here under setUpModule's fake HOME and
+# _LedgerCase's private state dir. Method names must not contain the substring
+# "test_tiering_select" (the CI gate matches file stems as substrings of test
+# ids, so that file's coverage would be faked from here).
+
+def _overflow_edits(n=250):
+    return [_assistant_tool_use("Edit", {"file_path": f"/a/{i}.py"}) for i in range(n)]
+
+
+class TestCaptureBudgetFailsOpen(_LedgerCase):
+
+    def _overflow_event(self):
+        return {"cwd": self.cwd, "session_id": "s1", "transcript_path": self._transcript(_overflow_edits())}
+
+    def test_a_broken_selector_falls_back_to_the_tail_and_is_reported(self):
+        """Gate 6(a): the old behaviour, plus a failure reason -- four things."""
+        cap = _UrlopenCapture()
+        with mock.patch.object(_MOD, "select_activities", side_effect=RuntimeError("boom")):
+            out, _ = self._main(cap, event=self._overflow_event())
+        self.assertEqual(out, "")
+        activities = cap.requests[0][1]["activities"]
+        self.assertEqual(len(activities), _MOD._MAX_ACTIVITIES)
+        self.assertEqual(
+            [a["activity_data"]["summary"] for a in activities],
+            [f"/a/{i}.py" for i in range(250 - _MOD._MAX_ACTIVITIES, 250)],
+            "the fallback is the plain tail, byte for byte the old cap",
+        )
+        for a in activities:
+            payload = a["activity_data"]["internal"]["capture_dropped"]
+            self.assertEqual(payload["strategy"], "fallback_tail")
+            self.assertEqual((payload["total"], payload["by_action"]), (50, {"edit_file": 50}))
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["ok"]), ("capture_tiering_degraded", False))
+        self.assertEqual((entry["tiering"], entry["exc"]), ("degraded", "RuntimeError"))
+        self.assertEqual(entry["calls"], 1)
+
+    def test_a_broken_telemetry_injector_does_not_block_the_upload(self):
+        """Gate 6(b): selection was fine, only the payload builder blew up."""
+        cap = _UrlopenCapture()
+        with mock.patch.object(_MOD, "_capture_dropped_payload", side_effect=RuntimeError("boom")) as injector:
+            self._main(cap, event=self._overflow_event())
+        activities = cap.requests[0][1]["activities"]
+        self.assertEqual(len(activities), _MOD._MAX_ACTIVITIES)
+        self.assertEqual(injector.call_count, len(activities), "called once per activity, never cached")
+        for a in activities:
+            self.assertIn("capture_dropped", a["activity_data"]["internal"])
+            payload = a["activity_data"]["internal"]["capture_dropped"]
+            self.assertEqual(payload, {"total": 50, "by_action": {}, "strategy": "telemetry_failed"})
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["ok"]), (_hook_state.NO_REASON, True))
+        self.assertEqual((entry["tiering"], entry["exc"]), ("ok", None), "block 2 leaves no local trace")
+
+    def test_the_telemetry_is_injected_once_per_activity(self):
+        cap = _UrlopenCapture()
+        with mock.patch.object(_MOD, "_capture_dropped_payload", wraps=_MOD._capture_dropped_payload) as injector:
+            self._main(cap, event=self._overflow_event())
+        activities = cap.requests[0][1]["activities"]
+        self.assertEqual(injector.call_count, len(activities))
+        self.assertEqual(
+            {json.dumps(a["activity_data"]["internal"]["capture_dropped"], sort_keys=True) for a in activities},
+            {json.dumps({"total": 50, "by_action": {"edit_file": 50}, "strategy": "degenerate"}, sort_keys=True)},
+        )
+
+    def test_after_a_selector_failure_the_stats_are_still_complete(self):
+        """Gate 6(c): the fallback path fills stats["dropped"] itself, so the
+        builder cannot KeyError on the very run that is already degraded."""
+        path = self._transcript(_overflow_edits())
+        with mock.patch.object(_MOD, "select_activities", side_effect=RuntimeError("boom")):
+            extracted, stats = _MOD._parse_transcript(path)
+        self.assertEqual(set(stats["dropped"]), {"total", "by_action", "strategy"})
+        self.assertEqual(stats["dropped"], {"total": 50, "by_action": {"edit_file": 50}, "strategy": "fallback_tail"})
+        self.assertEqual(stats["tiering_error"], "RuntimeError")
+        self.assertEqual(len(_MOD._build_activities(extracted, "c", None, "s1", stats["dropped"])), 200)
+
+    def test_a_failed_post_after_a_selector_failure_reports_the_post_and_keeps_the_degradation(self):
+        """Gate 6(d): the extra is written BEFORE the POST, so an http_error run
+        still carries tiering=degraded; and http_error wins the reason."""
+        with mock.patch.object(_MOD, "select_activities", side_effect=RuntimeError("boom")):
+            self._main(_raising(_http_error(500)), event=self._overflow_event())
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["ok"], entry["calls"]), ("http_error", False, 1))
+        self.assertEqual((entry["tiering"], entry["exc"]), ("degraded", "RuntimeError"))
+
+    def test_an_unreadable_transcript_stays_file_unparsable_even_when_the_selector_fails(self):
+        """Gate 6(e): the file_unparsable return point is not folded."""
+        lines = [{"kind": "turn", "speaker": "human", "text": "hi"}] * _MOD._SHAPE_SUSPECT_MIN_LINES
+        urlopen = mock.Mock()
+        with mock.patch.object(_MOD, "select_activities", side_effect=RuntimeError("boom")):
+            self._main(urlopen, event={"cwd": self.cwd, "transcript_path": self._transcript(lines)})
+        urlopen.assert_not_called()
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["ok"]), ("file_unparsable", False))
+        self.assertEqual((entry["tiering"], entry["exc"]), ("degraded", "RuntimeError"))
+
+    def test_a_quiet_session_with_a_selector_failure_is_still_reported(self):
+        """The nothing_to_do return point IS folded (only reachable by patching:
+        an empty pool never makes the selector raise on its own)."""
+        lines = [{"type": "summary", "summary": "x"}] * (_MOD._SHAPE_SUSPECT_MIN_LINES - 1)
+        urlopen = mock.Mock()
+        with mock.patch.object(_MOD, "select_activities", side_effect=RuntimeError("boom")):
+            self._main(urlopen, event={"cwd": self.cwd, "transcript_path": self._transcript(lines)})
+        urlopen.assert_not_called()
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["ok"], entry["calls"]), ("capture_tiering_degraded", False, 0))
+        self.assertEqual(entry["tiering"], "degraded")
+
+    def test_an_unopenable_transcript_is_file_unparsable_through_read_activities(self):
+        """read_activities is wrapped in no try/except of its own: its OSError
+        has to reach the caller's guard, which is the only file_unparsable path."""
+        urlopen = mock.Mock()
+        with mock.patch.object(_MOD, "read_activities", side_effect=PermissionError("denied")):
+            self._main(urlopen)
+        urlopen.assert_not_called()
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["ok"]), ("file_unparsable", False))
+        self.assertNotIn("tiering", entry, "nothing was parsed, so nothing was written")
+
+
+class TestReadActivitiesIsTheSharedReader(unittest.TestCase):
+    """read_activities / select_activities / _MAX_ACTIVITIES are imported across
+    repos by nexus:scripts/replay_session_capture.py. nexus CI checks out no
+    submodules, so that script's own import test can only skip; this is the
+    plugin-side guard on the shape."""
+
+    def test_read_activities_returns_the_full_pool_and_the_four_stats_keys(self):
+        lines = _overflow_edits() + [_assistant_tool_use("Read", {"file_path": "/r/x.py"})]
+        path = _write_transcript(lines)
+        self.addCleanup(os.unlink, path)
+        full, stats = _MOD.read_activities(path)
+        self.assertIsInstance(full, list)
+        self.assertIsInstance(stats, dict)
+        self.assertEqual(len(full), 250, "no cap here: the whole pool, minus low-signal")
+        self.assertEqual(set(stats), {"lines", "parsed", "messages", "tiering_error"})
+        self.assertEqual((stats["lines"], stats["parsed"], stats["messages"], stats["tiering_error"]), (251, 251, 251, None))
+        self.assertTrue(all(isinstance(item, tuple) and len(item) == 2 for item in full))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

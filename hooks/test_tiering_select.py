@@ -18,6 +18,9 @@ Fixtures are one distinct activity per index, so "which ones survived" is
 decidable and the middle of a tier can be told from its ends.
 """
 
+import json
+import os
+import tempfile
 import unittest
 
 import session_capture as sc
@@ -318,6 +321,108 @@ class TestSelectorContract(unittest.TestCase):
         self.assertEqual(dropped, {"command_run": 4})  # 1 of tier 2 (its middle) + all 3 of tier 3
         self.assertNotIn("edit_file", dropped)
         self.assertNotIn("user_message", dropped)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TASK-002 -- gates 4 / 5: the wired path (_parse_transcript -> stats["dropped"]
+# -> _build_activities -> activity_data["internal"]["capture_dropped"]).
+# Direct calls only: no main(), no _collect(), so no ledger and no HOME.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _tool_line(tool, tool_input):
+    return {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "name": tool, "input": tool_input}]}}
+
+
+def _user_line(text):
+    return {"type": "user", "message": {"role": "user", "content": text}}
+
+
+class _TranscriptCase(unittest.TestCase):
+
+    def _transcript(self, lines):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(json.dumps(line) + "\n")
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _overflow_lines(self):
+        """Tier 1 alone exceeds the limit, and it is MIXED: the dropped middle
+        must contain more than one action, or the gate-4 sum collapses to a
+        single key and proves nothing."""
+        lines = []
+        for i in range(90):
+            lines.append(_tool_line("Edit", {"file_path": f"/a/{i}.py"}))
+            lines.append(_user_line(f"message {i}"))
+            lines.append(_tool_line("Bash", {"command": f"git commit -m 'c{i}'"}))
+        for i in range(10):
+            lines.append(_tool_line("Bash", {"command": f"python3 x{i}.py"}))
+        return lines  # 270 tier 1 + 10 tier 3 = 280 > 200
+
+
+class TestGate4DroppedCountsAddUp(_TranscriptCase):
+
+    def test_by_action_sums_to_total_across_several_actions(self):
+        selected, stats = sc._parse_transcript(self._transcript(self._overflow_lines()))
+        dropped = stats["dropped"]
+        self.assertEqual(set(dropped), {"total", "by_action", "strategy"})
+        self.assertEqual(dropped["total"], 280 - sc._MAX_ACTIVITIES)
+        self.assertEqual(dropped["total"], 280 - len(selected))
+        self.assertEqual(sum(dropped["by_action"].values()), dropped["total"])
+        self.assertEqual(
+            set(dropped["by_action"]), {"edit_file", "user_message", "commit", "command_run"},
+            "the dropped middle of a mixed tier 1 must show every action it held",
+        )
+        self.assertEqual(dropped["strategy"], "degenerate")
+        self.assertIsNone(stats["tiering_error"])
+        activities = sc._build_activities(selected, "c1", "main", "s1", dropped)
+        self.assertEqual(len(activities), sc._MAX_ACTIVITIES)
+        for item in activities:
+            payload = item["activity_data"]["internal"]["capture_dropped"]
+            self.assertEqual(payload["total"], dropped["total"])
+            self.assertEqual(sum(payload["by_action"].values()), payload["total"])
+            self.assertEqual(payload["strategy"], "degenerate")
+
+
+class TestGate5UntruncatedRunsStillCarryTheKey(_TranscriptCase):
+
+    def test_zero_drops_are_written_not_omitted(self):
+        lines = [_tool_line("Edit", {"file_path": "/a/1.py"}), _user_line("hello"),
+                 _tool_line("Bash", {"command": "git push"})]
+        selected, stats = sc._parse_transcript(self._transcript(lines))
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(stats["dropped"], {"total": 0, "by_action": {}, "strategy": "layered"})
+        self.assertIsNone(stats["tiering_error"])
+        activities = sc._build_activities(selected, "c1", "main", "s1", stats["dropped"])
+        self.assertEqual(len(activities), 3)
+        for item in activities:
+            # Key presence is asserted on its own, then read by index: a
+            # `.get("capture_dropped", {}).get("total", 0) == 0` would pass
+            # against a hook that never wrote the key at all.
+            self.assertIn("internal", item["activity_data"])
+            self.assertIn("capture_dropped", item["activity_data"]["internal"])
+            payload = item["activity_data"]["internal"]["capture_dropped"]
+            self.assertEqual(set(payload), {"total", "by_action", "strategy"})
+            self.assertEqual(payload["total"], 0)
+            self.assertEqual(payload["by_action"], {})
+            self.assertEqual(payload["strategy"], "layered")
+
+    def test_each_activity_gets_its_own_payload_object(self):
+        lines = [_tool_line("Edit", {"file_path": f"/a/{i}.py"}) for i in range(4)]
+        selected, stats = sc._parse_transcript(self._transcript(lines))
+        activities = sc._build_activities(selected, "c1", None, "s1", stats["dropped"])
+        payloads = [item["activity_data"]["internal"]["capture_dropped"] for item in activities]
+        self.assertEqual(len({id(p) for p in payloads}), len(activities), "injected per activity, not shared")
+        self.assertEqual(len({id(p["by_action"]) for p in payloads}), len(activities))
+
+    def test_stats_strategy_never_says_telemetry_failed(self):
+        """stats["dropped"]["strategy"] is the selector's verdict (3 values);
+        telemetry_failed exists only on the wire, written by _build_activities."""
+        for lines in (self._overflow_lines(), [_tool_line("Edit", {"file_path": "/a/1.py"})]):
+            _, stats = sc._parse_transcript(self._transcript(lines))
+            self.assertIn(stats["dropped"]["strategy"], {"layered", "degenerate", "fallback_tail"})
 
 
 if __name__ == "__main__":
