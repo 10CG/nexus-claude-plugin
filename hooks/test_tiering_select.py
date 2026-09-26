@@ -242,16 +242,23 @@ class TestGate8WriteMarkers(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
 
     def test_each_tier_two_example_outranks_each_tier_three_example(self):
+        # The winner goes FIRST: with limit=1 the fallback of "both ends" is
+        # the tail, so a classifier that ranks everything tier 2 would still
+        # pick a trailing winner and this test would not notice
+        # (post_implementation R1 mutant d). Both orders are asserted.
         for two in self.TIER_TWO:
             for three in self.TIER_THREE:
                 with self.subTest(two=two, three=three):
+                    selected, _, _ = sc.select_activities([_cmd(two), _cmd(three)], limit=1)
+                    self.assertEqual(_summaries(selected), [two])
                     selected, _, _ = sc.select_activities([_cmd(three), _cmd(two)], limit=1)
                     self.assertEqual(_summaries(selected), [two])
 
     def test_unknown_heads_are_tier_three_not_tier_two(self):
         """`not _is_readonly_command` would rank every surviving command_run
         as tier 2 and leave tier 3 empty; an unknown head must lose to a marker."""
-        pool = [_cmd("python3 x.py"), _cmd("uv run pytest -q"), _cmd("forgejo GET /x"), _push(0)]
+        # Winner first, distractors after it (see the note in the test above).
+        pool = [_push(0), _cmd("python3 x.py"), _cmd("uv run pytest -q"), _cmd("forgejo GET /x")]
         selected, _, _ = sc.select_activities(pool, limit=1)
         self.assertEqual(_summaries(selected), ["git push origin b0"])
 

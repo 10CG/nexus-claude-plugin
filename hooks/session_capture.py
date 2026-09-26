@@ -268,7 +268,9 @@ def _is_low_signal(action, activity_data):
 # tier 2 (_WRITE_MARKERS), everything else is tier 3. _LOW_SIGNAL_ACTIONS
 # (above) is the far end of the same spectrum: dropped before any budget
 # applies. delete_file is listed for the day _classify_tool emits it; today
-# nothing does (I-D), so no fixture may be built on it.
+# nothing does (I-D), so no fixture may be built on it. Also imported by
+# nexus:scripts/replay_session_capture.py (its high-value drop counts are
+# computed over this set): renaming it breaks that script.
 _HIGH_VALUE_ACTIONS = frozenset(
     {"user_message", "commit", "run_test", "create_file", "edit_file", "delete_file"}
 )
@@ -351,15 +353,18 @@ def select_activities(extracted, limit=_MAX_ACTIVITIES):
     remainder still fills the budget exactly), and once the budget is spent
     nothing further is taken. A remainder of 0 is an explicit empty
     selection, never a slice: ``tier[-0:]`` is the whole tier (I-B).
+    ``limit`` is expected to be >= 1 (the hook passes _MAX_ACTIVITIES); with
+    ``limit <= 0`` nothing is selected and the strategy stays ``layered``.
 
     ORDER IS LOAD-BEARING DOWNSTREAM. The result is a NON-CONTIGUOUS
     subsequence of the session -- there are holes where the middle of a tier
     was dropped -- but what is kept stays in session order, and the backend
     depends on that: it processes the POSTed list serially, one LLM call per
     activity (nexus ``workers/activity_processor.py:697``, the
-    ``enumerate(activity_ids)`` loop), so ``Memory.created_at`` ends up
-    strictly increasing, and ``workers/session_aggregator.py:287`` orders by
-    it to build the "what it set out to do / what it concluded" roll-up.
+    ``enumerate(activity_ids)`` loop in ``process_activity_batch``), so
+    ``Memory.created_at`` ends up strictly increasing, and
+    ``workers/session_aggregator.py:287`` (``_collect_observations``) orders
+    by it to build the "what it set out to do / what it concluded" roll-up.
     Parallelising that loop would silently break this without touching any
     file named here.
 
@@ -618,8 +623,14 @@ def _parse_transcript(path):
     except Exception as exc:  # fail-open block 1: never lose the capture to the selector
         extracted = full[-_MAX_ACTIVITIES:]
         strategy = "fallback_tail"
-        by_action = _count_actions(full[:len(full) - len(extracted)])
         stats["tiering_error"] = type(exc).__name__
+        try:
+            by_action = _count_actions(full[:len(full) - len(extracted)])
+        except Exception:
+            # The pool itself is malformed -- unreachable from read_activities,
+            # which only ever appends pairs. The breakdown is bookkeeping;
+            # the upload is not. `total` below still counts.
+            by_action = {}
     stats["dropped"] = {
         "total": len(full) - len(extracted),  # cap drops only: the pool is past _is_low_signal
         "by_action": by_action,
@@ -662,12 +673,14 @@ def _build_activities(extracted, container_id, branch, session_id, dropped):
     budget's telemetry under ``activity_data["internal"]["capture_dropped"]``.
 
     ``internal`` is the one key the backend keeps out of the LLM prompt
-    (nexus workers/activity_processor.py:192, utils/formatters.py:138);
-    every other activity_data key is rendered "key: value" into it, and a
-    bare "total: 63" reads like a fact to extract. The whole activity_data
-    is also copied into memories.metadata and served by GET /v1/memories and
-    POST /v1/context/retrieve, which is why the key's shape is a documented
-    contract (nexus docs/architecture/memory-layers.md §4).
+    (nexus workers/activity_processor.py:192 in ``_format_activity_log``,
+    utils/formatters.py:138 in ``format_memory``); every other activity_data
+    key is rendered "key: value" into it, and a bare "total: 63" reads like
+    a fact to extract. The whole activity_data is also copied into
+    memories.metadata and served by GET /v1/memories and
+    POST /v1/context/retrieve, which is why the key's shape is a contract --
+    recorded in nexus docs/architecture/memory-layers.md §4 by this change's
+    TASK-003, which also bumps the gitlink to the commit that ships it.
     """
     activities = []
     for action, partial in extracted:
@@ -805,9 +818,11 @@ def _with_tiering_verdict(reason, stats):
     Called only at the two return points that are not failures already --
     ``nothing_to_do`` and the clean run -- so a run whose selector fell back
     is recorded with ``capture_tiering_degraded`` and reported at the next
-    SessionStart, once per degraded run (owner ruling 4: the degradation is
-    user-visible; the run's ledger entry says ok=false even though the
-    upload succeeded). ``file_unparsable`` is not folded: it is a failure in
+    SessionStart while it is still the hook's latest ledger entry (the
+    reporter reads only the last one; a clean run after it goes unreported
+    -- owner ruling 4: the degradation is user-visible; the run's ledger
+    entry says ok=false even though the upload succeeded).
+    ``file_unparsable`` is not folded: it is a failure in
     its own right and the detail is in the extra. A POST that raises never
     reaches here: main() maps the exception (http_error wins) and the extra
     written in (4a) still says degraded.

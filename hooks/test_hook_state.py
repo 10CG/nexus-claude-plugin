@@ -880,7 +880,6 @@ class TestStateAtomicity(_TempStateDir):
         self.assertTrue(_hook_state.state_exists("sync", self.cwd))
 
 
-
 class TestCaptureTieringDegradedIsTheFloor(_TempStateDir):
     """Gate 9 of session-capture-priority-truncation.
 
@@ -930,6 +929,7 @@ class TestCaptureTieringDegradedIsTheFloor(_TempStateDir):
             locked.side_effect = degraded
             entry = _hook_state.record_run("session-capture", ok=False, reason=self.NEW, cwd=self.cwd)
         self.assertEqual(entry["reason"], "lock_unavailable")
+
 
 if __name__ == "__main__":
     unittest.main()

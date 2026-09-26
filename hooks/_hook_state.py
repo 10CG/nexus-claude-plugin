@@ -96,7 +96,8 @@ FAILURE_REASONS = frozenset(
         # session-capture-priority-truncation (owner ruling 4, 2026-09-25):
         # the SessionEnd capture's tiered selection raised and the run fell
         # back to the plain tail. The upload itself succeeded and the run is
-        # still reported, once per degraded run, because a selector that
+        # still recorded as a failure (reported at the next SessionStart
+        # while it is the hook's latest entry), because a selector that
         # keeps failing quietly is the tiering not existing. Kept OUT of
         # _REASON_PRIORITY and under _REASON_FLOOR: see worst_reason.
         "capture_tiering_degraded",

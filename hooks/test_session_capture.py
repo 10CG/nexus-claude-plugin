@@ -1377,6 +1377,67 @@ class TestCaptureBudgetFailsOpen(_LedgerCase):
         self.assertEqual((entry["reason"], entry["ok"]), ("file_unparsable", False))
         self.assertNotIn("tiering", entry, "nothing was parsed, so nothing was written")
 
+    def test_the_unreadable_return_point_is_not_routed_through_the_fold(self):
+        """Gate 6(e), structurally. With the floor in place a FOLDED
+        file_unparsable still comes out as file_unparsable, so the outcome
+        alone cannot tell the two apart (post_implementation R1: mutant g
+        survived every test). So assert the routing: the unreadable branch
+        never reaches _with_tiering_verdict."""
+        lines = [{"kind": "turn", "speaker": "human", "text": "hi"}] * _MOD._SHAPE_SUSPECT_MIN_LINES
+        with mock.patch.object(_MOD, "select_activities", side_effect=RuntimeError("boom")), \
+                mock.patch.object(_MOD, "_with_tiering_verdict", wraps=_MOD._with_tiering_verdict) as fold:
+            self._main(mock.Mock(), event={"cwd": self.cwd, "transcript_path": self._transcript(lines)})
+        fold.assert_not_called()
+        self.assertEqual(self._entries()[-1]["reason"], "file_unparsable")
+
+    def test_the_two_non_failure_return_points_are_routed_through_the_fold(self):
+        """The other half of the routing contract: exactly these two."""
+        cases = (
+            ([{"type": "summary", "summary": "x"}] * 3, "nothing_to_do"),
+            (_overflow_edits(), _hook_state.NO_REASON),
+        )
+        for lines, base in cases:
+            with self.subTest(base=base):
+                with mock.patch.object(_MOD, "_with_tiering_verdict", wraps=_MOD._with_tiering_verdict) as fold:
+                    self._main(_UrlopenCapture(), event={
+                        "cwd": self.cwd, "session_id": "s1", "transcript_path": self._transcript(lines)})
+                fold.assert_called_once()
+                self.assertEqual(fold.call_args.args[0], base)
+
+    def test_without_the_ledger_module_the_fold_still_names_the_degradation(self):
+        """The `if _hook_state` guard: no reason table to consult, so the
+        literal -- which is what worst_reason would have picked."""
+        degraded = {"tiering_error": "RuntimeError"}
+        with mock.patch.object(_MOD, "_hook_state", None):
+            self.assertEqual(_MOD._with_tiering_verdict("nothing_to_do", degraded), "capture_tiering_degraded")
+            self.assertEqual(_MOD._with_tiering_verdict("none", degraded), "capture_tiering_degraded")
+            self.assertEqual(_MOD._with_tiering_verdict("nothing_to_do", {"tiering_error": None}), "nothing_to_do")
+
+    def test_a_malformed_pool_element_is_caught_by_block_one_and_still_uploaded(self):
+        """Block 1 without a mock: the selector's own unpacking raises on a
+        pool element that is not a pair, and the capture must survive it --
+        including the fallback's breakdown, which counts the same pool."""
+        pool = [("edit_file", {"tool": "Edit", "summary": f"/a/{i}.py"}) for i in range(205)]
+        pool.insert(3, "not-a-pair")  # in the head, so the tail fallback drops it
+        stats = {"lines": 206, "parsed": 206, "messages": 206, "tiering_error": None}
+        with mock.patch.object(_MOD, "read_activities", return_value=(pool, stats)):
+            extracted, stats = _MOD._parse_transcript("/ignored")
+        self.assertEqual(len(extracted), _MOD._MAX_ACTIVITIES)
+        self.assertEqual(stats["tiering_error"], "ValueError")
+        self.assertEqual(stats["dropped"]["strategy"], "fallback_tail")
+        self.assertEqual(stats["dropped"]["total"], 6)
+        self.assertEqual(stats["dropped"]["by_action"], {}, "a malformed head cannot be broken down, only counted")
+        self.assertEqual(len(_MOD._build_activities(extracted, "c", None, "s1", stats["dropped"])), 200)
+
+    def test_block_two_survives_a_dropped_dict_it_cannot_read_at_all(self):
+        """The inner except of block 2: when even dropped["total"] is
+        unreadable the payload still carries the key, with total=None."""
+        activities = _MOD._build_activities([("edit_file", {"tool": "Edit", "summary": "/a.py"})], "c", None, "s1", {})
+        self.assertEqual(
+            activities[0]["activity_data"]["internal"]["capture_dropped"],
+            {"total": None, "by_action": {}, "strategy": "telemetry_failed"},
+        )
+
 
 class TestReadActivitiesIsTheSharedReader(unittest.TestCase):
     """read_activities / select_activities / _MAX_ACTIVITIES are imported across
