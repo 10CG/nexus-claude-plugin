@@ -174,7 +174,7 @@ _USER_AGENT = "nexus-sessionstart-hook/0.3"
 # invisible in every other way, and a hook not named here could stop for good
 # without anyone noticing. New SessionEnd hooks add themselves; a test walks
 # hooks.json to make sure they do.
-_EXPECTED_LEDGERS = ("session-capture",)
+_EXPECTED_LEDGERS = ("session-capture", "handoff-sync")
 _LEDGER_SUFFIX = ".json"
 _STATE_SUFFIX = ".state.json"
 _TMP_PREFIX = ".tmp-"

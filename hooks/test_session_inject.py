@@ -1137,11 +1137,16 @@ def _entry(reason, ts, ok=None, hook="session-capture"):
 class _ReportCase(_LedgerCase):
     """A project whose session-inject ledger already holds one clean run, so
     this is not the very first session start (a missing capture ledger is only
-    news after a SessionEnd has had the chance to fire)."""
+    news after a SessionEnd has had the chance to fire). handoff-sync (change
+    2 TASK-005, the second _EXPECTED_LEDGERS member) is seeded clean too, so
+    existing tests that assert quiet stay quiet by default; a test that wants
+    to exercise handoff-sync's own reporting overwrites this with its own
+    _write_ledger("handoff-sync", ...) call."""
 
     def setUp(self):
         super().setUp()
         self._write_ledger("session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")])
+        self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
 
     def _write_ledger(self, hook, entries):
         path = _hook_state.ledger_path(hook, self.cwd)

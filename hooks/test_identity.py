@@ -319,6 +319,79 @@ class TestProjectSlugAndUserId(unittest.TestCase):
                 )
 
 
+class TestProjectRoot(unittest.TestCase):
+    """TASK-005 (change 2): handoff_sync.py needs an actual directory to
+    list `docs/handoff` under, not just project_identity's slug."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_returns_the_toplevel_from_a_subdirectory(self):
+        repo = os.path.join(self.tmp.name, "therepo")
+        sub = os.path.join(repo, "deep", "nested")
+        os.makedirs(sub)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        self.assertEqual(_identity.project_root(sub), (repo, False))
+        self.assertEqual(_identity.project_root(repo), (repo, False))
+
+    def test_not_a_repo_is_none_not_degraded(self):
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True):
+            self.assertEqual(_identity.project_root(plain), (None, False))
+
+    def test_git_failure_is_degraded_true(self):
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
+            self.assertEqual(_identity.project_root(plain), (None, True))
+
+    def test_a_refused_answer_is_degraded_true(self):
+        """`dubious ownership`: git is there, the directory IS a repository,
+        and it still refuses to answer -- this repo's own deployment shape
+        (a checkout mounted under another uid)."""
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        refused = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: detected dubious ownership in repository at '/x/therepo'\n",
+        )
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=refused):
+            self.assertEqual(_identity.project_root(plain), (None, True))
+
+    def test_shares_the_one_git_call_with_project_identity(self):
+        """Amendment A6-4: asking both for the same cwd must cost one
+        subprocess, not two -- the whole reason this shares a cache."""
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=done) as run:
+            self.assertEqual(_identity.project_identity("/x/therepo/a"), ("therepo", False))
+            self.assertEqual(_identity.project_root("/x/therepo/a"), ("/x/therepo", False))
+            self.assertEqual(run.call_count, 1)
+            # The other order must be equally cheap: whichever is called
+            # first populates the cache for the other.
+            _identity.project_root("/x/therepo/b")
+            self.assertEqual(run.call_count, 2)
+            _identity.project_identity("/x/therepo/b")
+            self.assertEqual(run.call_count, 2)
+
+    def test_project_identity_return_value_is_unchanged_by_the_refactor(self):
+        """The digest requires project_identity's own return value and
+        behaviour to survive sharing its git call with project_root."""
+        not_a_repo = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: not a git repository (or any of the parent directories): .git\n",
+        )
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=not_a_repo):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", False))
+
+
 class TestCurrentBranch(unittest.TestCase):
     """TASK-005: session_capture.py and session_inject.py each carried a
     byte-identical copy of this derivation until it moved here."""

@@ -101,6 +101,25 @@ class TestSessionEndBudget(unittest.TestCase):
         commands = [hook["command"] for _, hook in _commands("SessionEnd")]
         self.assertTrue(any("session_capture.py" in c for c in commands), commands)
 
+    def test_the_handoff_sync_hook_gives_up_before_the_host_does(self):
+        """Same guarantee as the capture hook, for the second SessionEnd
+        hook (change 2 TASK-005): every declared SessionEnd timeout must
+        clear ITS work budget + ledger cap too, not just the capture hook's
+        -- both share the same host-side timeout field per entry."""
+        spec = importlib.util.spec_from_file_location(
+            "handoff_sync_for_manifest_test", os.path.join(_HOOKS_DIR, "handoff_sync.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for _, hook in _commands("SessionEnd"):
+            self.assertGreater(
+                hook["timeout"], mod._WORK_BUDGET_SECONDS + mod._LEDGER_BUDGET_SECONDS, hook
+            )
+
+    def test_the_handoff_sync_hook_is_one_of_them(self):
+        commands = [hook["command"] for _, hook in _commands("SessionEnd")]
+        self.assertTrue(any("handoff_sync.py" in c for c in commands), commands)
+
 
 class TestSessionStartBound(unittest.TestCase):
     def _inject_module(self):
