@@ -101,9 +101,7 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
 
 import json
 import os
-import subprocess
 import sys
-import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -125,6 +123,20 @@ except Exception as exc:  # a broken or partial install
     if __name__ != "__main__":
         raise
     print(f"[session-inject] cannot import _identity: {exc!r}", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    import _hook_runner
+except Exception as exc:  # a broken or partial install
+    # Same contract as the _identity guard above: loud when imported by a
+    # test, quiet exit(0) when run as a hook (a traceback here is exit 1,
+    # which Claude Code reports as a hook error on every single session
+    # start). main() cannot run its deadline / ledger-budget races without
+    # this module, so it is treated as required, not as optional
+    # bookkeeping like _hook_state below.
+    if __name__ != "__main__":
+        raise
+    print(f"[session-inject] cannot import _hook_runner: {exc!r}", file=sys.stderr)
     sys.exit(0)
 
 try:
@@ -189,21 +201,16 @@ _SETTLED_RANK = {layer: rank for rank, layer in enumerate(_SETTLED_LAYERS)}
 
 
 def _current_branch(cwd):
-    """Return the current git branch, or None if not a git repo / git failed."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return None
-        branch = result.stdout.decode().strip()
-        if not branch or branch == "HEAD":  # detached HEAD -> no branch scoping
-            return None
-        return branch
-    except Exception:
-        return None
+    """Return the current git branch, or None if not a git repo / git failed.
+
+    Delegates to _identity.current_branch (TASK-005): this hook and
+    session_capture.py each carried a byte-identical copy of the derivation
+    until now. Kept as a module-level name (not inlined as
+    ``_identity.current_branch`` at the one call site) because tests patch
+    ``mod._current_branch`` directly, and _collect must keep calling the
+    module-level name for that patch to take effect.
+    """
+    return _identity.current_branch(cwd)
 
 
 def _retrieve(base_url, token, user_id, metadata_filter, timeout):
@@ -470,13 +477,13 @@ def _record(reason, started, run):
     """Append this run to the ledger, within a budget. Never raises.
     Returns True when the write had to be left behind.
 
-    The write happens on a daemon thread that is abandoned after
-    ``_LEDGER_BUDGET_SECONDS``. Catching exceptions is not enough: the ledger
-    takes a blocking lock, and a write that STALLS keeps this process alive
-    until the host's timeout kills it -- and the host only uses the stdout of a
-    hook that exited 0, so the stall would cost the very output that was
-    written first to keep it safe. An abandoned daemon thread dies with the
-    interpreter.
+    The write happens on a daemon thread (``_hook_runner.write_with_budget``)
+    that is abandoned after ``_LEDGER_BUDGET_SECONDS``. Catching exceptions is
+    not enough: the ledger takes a blocking lock, and a write that STALLS
+    keeps this process alive until the host's timeout kills it -- and the
+    host only uses the stdout of a hook that exited 0, so the stall would
+    cost the very output that was written first to keep it safe. An
+    abandoned daemon thread dies with the interpreter.
     """
     if _hook_state is None:
         print(
@@ -516,17 +523,14 @@ def _record(reason, started, run):
         except Exception as exc:  # noqa: BLE001
             print(f"[{HOOK}] could not persist the report markers: {exc!r}", file=sys.stderr)
 
-    worker = threading.Thread(target=write, name=f"{HOOK}-ledger", daemon=True)
-    worker.start()
-    worker.join(_LEDGER_BUDGET_SECONDS)
-    if worker.is_alive():
+    left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
+    if left_behind:
         print(
             f"[{HOOK}] ledger write still running after {_LEDGER_BUDGET_SECONDS}s; "
             f"leaving it behind, this run ({reason}) may go unrecorded",
             file=sys.stderr,
         )
-        return True
-    return False
+    return left_behind
 
 
 def _silence_stdout():
@@ -548,22 +552,15 @@ def main():
     """Run the hook. Returns True when a worker thread had to be left behind."""
     started = time.monotonic()
     run = {"cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None}
-    outcome = {}
-
-    def work():  # never prints: a thread that may be abandoned must stay off stdio
-        try:
-            outcome["result"] = _collect(run)
-        except Exception as exc:
-            outcome["error"] = exc
 
     # The work runs against a deadline of its own. urllib's timeout is per
     # socket operation, not per request -- one "6 s" request was measured at
     # 24 s against a server that drips bytes -- and a hook the host has to kill
     # leaves no record and, for SessionStart, no brief. So leave first.
-    worker = threading.Thread(target=work, name=f"{HOOK}-work", daemon=True)
-    worker.start()
-    worker.join(_WORK_BUDGET_SECONDS)
-    left_behind = worker.is_alive()
+    # _collect never prints: a thread that may be abandoned must stay off stdio.
+    outcome, left_behind = _hook_runner.run_with_deadline(
+        lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
+    )
 
     reason, brief = "unknown", None
     if left_behind:
@@ -624,16 +621,4 @@ if __name__ == "__main__":
         # FAIL-OPEN: ANY failure (config, network, timeout, parse, git) -> exit 0
         # with no stdout. Never block session startup over memory retrieval.
         pass
-    if left_behind:
-        # A daemon thread is still running. Ordinary interpreter shutdown can
-        # die with "could not acquire lock for <stderr>" if that thread happens
-        # to be printing at that instant -- a non-zero exit, which for
-        # SessionStart costs the brief. Everything that matters has been
-        # flushed, so leave without the ceremony.
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        except Exception:
-            pass
-        os._exit(0)
-    sys.exit(0)
+    _hook_runner.finish(left_behind)

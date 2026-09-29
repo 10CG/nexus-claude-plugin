@@ -926,7 +926,7 @@ class TestSharedModulesUnavailable(_LedgerCase):
     def _copy_hook_without(self, *missing):
         target = os.path.join(self.tmp.name, "partial-install")
         os.makedirs(target)
-        for name in ("session_capture.py", "_identity.py", "_hook_state.py"):
+        for name in ("session_capture.py", "_identity.py", "_hook_runner.py", "_hook_state.py"):
             if name not in missing:
                 shutil.copy(os.path.join(_HOOKS_DIR, name), target)
         return os.path.join(target, "session_capture.py")

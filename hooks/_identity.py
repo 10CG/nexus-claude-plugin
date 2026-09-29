@@ -37,6 +37,15 @@ Two different identities are in play and they are NOT interchangeable:
     from the toplevel — running a hook from a subdirectory would list zero
     local files against a full set of server rows and read that as "everything
     was deleted".
+
+``current_branch``
+    The provenance branch tag on every observation / episode row, and half of
+    D's per-container episode grouping key (``container_id``, ``branch``).
+    session_capture.py and session_inject.py each carried a byte-identical
+    copy until TASK-005 (the branch half of the TASK-002 project_slug
+    consolidation) — a divergence here would silently split one branch into
+    two groups the same way a diverging project_slug used to split one
+    project.
 """
 
 import json
@@ -148,6 +157,34 @@ def project_slug(cwd):
 def user_id(cwd):
     """The Nexus user_id rows are keyed by — same source as project_slug."""
     return os.environ.get("NEXUS_DEFAULT_USER_ID") or project_slug(cwd)
+
+
+def current_branch(cwd):
+    """The current git branch for ``cwd``, or None.
+
+    None covers three cases callers must not distinguish: not a git
+    repository, a detached HEAD (nothing to scope by), and git failing or
+    timing out — a hung git (NFS, a stale index lock) must not cost a hook
+    more than this call's own 5 s budget. Not memoised like
+    ``project_identity``: every existing caller asks once per run already,
+    so there is no repeated-call cost here to amortise (contrast
+    ``_SLUG_CACHE``'s docstring, where a single ledger-reporting run was
+    measured asking 11 times).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        branch = result.stdout.decode().strip()
+        if not branch or branch == "HEAD":  # detached HEAD -> no branch
+            return None
+        return branch
+    except Exception:
+        return None
 
 
 def container_id():

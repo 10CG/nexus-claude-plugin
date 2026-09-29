@@ -319,6 +319,59 @@ class TestProjectSlugAndUserId(unittest.TestCase):
                 )
 
 
+class TestCurrentBranch(unittest.TestCase):
+    """TASK-005: session_capture.py and session_inject.py each carried a
+    byte-identical copy of this derivation until it moved here."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _repo_with_a_commit(self, branch="feat/current-branch-test"):
+        """A real repo, on a KNOWN branch name (not whatever `git init`'s
+        default happens to be locally) with one commit -- `rev-parse
+        --abbrev-ref HEAD` fails on a branch with no commits yet."""
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", repo, "checkout", "-q", "-b", branch], check=True, capture_output=True
+        )
+        with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        subprocess.run(["git", "-C", repo, "add", "README.md"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git", "-C", repo,
+                "-c", "user.name=test", "-c", "user.email=test@example.com",
+                "commit", "-q", "-m", "init",
+            ],
+            check=True, capture_output=True,
+        )
+        return repo, branch
+
+    def test_returns_the_branch_name(self):
+        repo, branch = self._repo_with_a_commit()
+        self.assertEqual(_identity.current_branch(repo), branch)
+
+    def test_detached_head_is_none(self):
+        repo, _branch = self._repo_with_a_commit()
+        commit = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True
+        ).stdout.decode().strip()
+        subprocess.run(["git", "-C", repo, "checkout", "-q", commit], check=True, capture_output=True)
+        self.assertIsNone(_identity.current_branch(repo))
+
+    def test_not_a_repo_is_none(self):
+        plain = os.path.join(self.tmp.name, "not-a-repo")
+        os.makedirs(plain)
+        self.assertIsNone(_identity.current_branch(plain))
+
+    def test_git_missing_is_none(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("no such file: git")):
+            self.assertIsNone(_identity.current_branch(self.tmp.name))
+
+
 class TestPluginVersion(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
