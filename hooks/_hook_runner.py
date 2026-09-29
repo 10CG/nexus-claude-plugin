@@ -105,13 +105,25 @@ def write_with_budget(write, budget, name):
     left behind (still running at the deadline -- e.g. blocked on another
     process's held lock).
 
-    ``write``'s own exceptions must not escape this function: a write that
-    raises past whatever handling it already has would otherwise surface
-    through ``threading.excepthook`` at interpreter shutdown -- exactly the
-    non-zero-exit risk ``finish`` (below) exists to route around. Every
-    current caller already catches its own exceptions inside ``write`` (and
-    reports them on stderr, so nothing is lost); this is the net under a
-    future one that does not.
+    ``write``'s own exceptions are caught here and named on stderr, never
+    left to escape this function silently (R1-c14). ``run_with_deadline``
+    below already stores any exception the target raises in its own
+    ``outcome["error"]`` instead of letting it propagate, so catching it a
+    second time here is not protecting the interpreter from a crash it was
+    never going to have: an earlier revision of this docstring argued the
+    opposite -- that skipping this catch would surface a traceback via
+    ``threading.excepthook`` "at interpreter shutdown" and risk a non-zero
+    exit -- but a bare thread's uncaught exception is in fact reported by
+    that hook immediately, when it happens, not at shutdown, and does not
+    touch the process's own exit code either way. The reason to catch it
+    HERE, specifically, is that this function discards ``run_with_deadline``'s
+    ``outcome`` entirely (only ``left_behind`` matters to its own callers):
+    without a print in this except clause, a ``write()`` that raises would
+    vanish with no trace, the very failure mode ``_hook_state.record_run``'s
+    own module docstring warns a hook's ledger must never produce. Every
+    current caller's own ``write()`` already catches its own exceptions and
+    reports them on stderr too (so this is normally a net under a net); a
+    future caller that does not is still covered.
 
     Built on ``run_with_deadline`` rather than duplicating its thread
     start/join: the two races are the same mechanism at different budgets,
@@ -122,8 +134,8 @@ def write_with_budget(write, budget, name):
     def guarded():
         try:
             write()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - the last-resort net; see above
+            print(f"[{name}] write() raised: {exc!r}", file=sys.stderr)
 
     _, left_behind = run_with_deadline(guarded, budget, name)
     return left_behind

@@ -110,13 +110,18 @@ def _run_main(mod, event, extra_env):
         sys.stdin = old_stdin
 
 
-def _run_hook(stdin_text, env=None, want_stderr=False):
-    """Drive the real script as a subprocess; return (stdout_bytes, exit_code)."""
+def _run_hook(stdin_text, env=None, want_stderr=False, script=None):
+    """Drive the real script as a subprocess; return (stdout_bytes, exit_code).
+
+    ``script`` (R1-c31) overrides which file is run -- a partial-install
+    copy in a temp dir, for the import-guard tests, instead of the real
+    ``_HOOK_SCRIPT``.
+    """
     run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
     if env:
         run_env.update(env)
     result = subprocess.run(
-        [sys.executable, _HOOK_SCRIPT],
+        [sys.executable, script or _HOOK_SCRIPT],
         input=stdin_text.encode(),
         capture_output=True,
         timeout=20,
@@ -325,6 +330,59 @@ class TestLocate(_HandoffDirCase):
             fh.write("# About this directory\n")
         self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
 
+    def test_a_lowercase_readme_is_excluded_case_insensitively(self):
+        """Ruling 6 (TASK-005 R1 fix round, R1-c12): the exclusion of
+        latest.md / README.md must not be a literal-case match -- a project
+        that only keeps a lowercase readme.md is the same "no handoff kept
+        here" shape as one with README.md, not a broken one reported every
+        session."""
+        self._mkdir()
+        with open(os.path.join(self.handoff_dir, "readme.md"), "w", encoding="utf-8") as fh:
+            fh.write("# About this directory\n")
+        with open(os.path.join(self.handoff_dir, "Latest.MD"), "w", encoding="utf-8") as fh:
+            fh.write("nothing useful\n")
+        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+
+    def test_pointer_target_with_a_directory_prefix_resolves_via_basename(self):
+        """R1-c28: the Aria collector pattern's target group is normalised
+        to its basename, so a pointer written as a relative PATH (not just a
+        bare filename) still resolves. A SECOND, newer candidate is present
+        specifically so a basename-normalisation regression is visible: with
+        only one candidate, a failure to normalise would still "work" by
+        accident, via the newest-updated-at FALLBACK selecting the same file
+        the pointer meant to name -- indistinguishable from the pointer
+        actually being followed (caught by mutation: dropping
+        `os.path.basename` here left this test green until this fixture
+        gained a second, newer file)."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")  # newer, not pointed to
+        with open(os.path.join(self.handoff_dir, "latest.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Latest\n\n**Latest**: [a.md](docs/handoff/a.md)\n")
+        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+
+    def test_an_unreadable_directory_is_pointer_unresolved_not_quiet(self):
+        """Ruling 5 (TASK-005 R1 fix round, R1-c06): a docs/handoff directory
+        that exists but could not be LISTED (permission denied here) is not
+        the same as one that does not exist -- "cannot tell" must surface as
+        the existing failure-class reason, with a stderr line naming the
+        error, rather than the quiet no_handoff most projects hit."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md")
+        os.chmod(self.handoff_dir, 0o000)
+        self.addCleanup(os.chmod, self.handoff_dir, 0o755)  # so TemporaryDirectory cleanup can remove it
+        try:
+            os.listdir(self.handoff_dir)
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("running as a user unaffected by chmod 000 (e.g. root)")
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("docs/handoff", stderr.getvalue())
+
     # -- Amendment A4-5 pair: the SAME directory shape, contents-only diff --
 
     def test_a4_5_leg_empty_dir_is_no_handoff(self):
@@ -370,23 +428,92 @@ class TestContent(unittest.TestCase):
         self.assertNotIn("Something Else", content)
 
     def test_cap_cuts_section_two_first(self):
-        section6 = "## §6 Next session\n\n" + ("A" * 3000)
-        section2 = "## §2 Carry\n\n" + ("B" * 3000)
+        """R1-c24: strengthened past "does not contain the tail" (a mutant
+        that drops §2 wholesale once it does not fit whole would still pass
+        THAT alone) to also require §2's own EARLIEST lines survive -- a
+        truncated carry-forward list must lose its tail, not its entirety
+        or its head. Realistic multi-line content (not one 3000-char line):
+        R1-c02/c11 changed `_cap` to retreat to a line boundary rather than
+        cut mid-line, and a single giant unbroken line has no boundary to
+        retreat to short of dropping the whole thing."""
+        section6 = "## §6 Next session\n\n" + "\n".join(
+            f"six line {i} " + "A" * 40 for i in range(60)
+        )
+        section2 = "## §2 Carry\n\n" + "\n".join(
+            f"two line {i} " + "B" * 40 for i in range(80)
+        )
         content, reason = _MOD._build_content(f"# T\n\n{section6}\n\n{section2}\n")
         self.assertIsNone(reason)
         self.assertLessEqual(len(content), _MOD._CONTENT_CAP)
-        self.assertIn("A" * 100, content)       # section 6 survives whole
-        self.assertNotIn("B" * 3000, content)   # section 2's tail was cut
+        self.assertIn("six line 0 " + "A" * 40, content)    # section 6 survives whole...
+        self.assertIn("six line 59 " + "A" * 40, content)   # ...every line of it
+        self.assertIn("## §2 Carry", content)                # section 2's heading survives
+        self.assertIn("two line 0 " + "B" * 40, content)     # ...and its earliest lines
+        self.assertNotIn("two line 79 " + "B" * 40, content)  # but not its tail
         self.assertIn("truncated", content)
 
     def test_cap_cuts_section_six_too_when_h1_and_six_alone_exceed_it(self):
-        section6 = "## §6 Next session\n\n" + ("A" * 5000)
-        section2 = "## §2 Carry\n\n" + ("B" * 500)
+        section6 = "## §6 Next session\n\n" + "\n".join(
+            f"six line {i} " + "A" * 40 for i in range(120)
+        )
+        section2 = "## §2 Carry\n\n" + "\n".join(
+            f"two line {i} " + "B" * 40 for i in range(10)
+        )
         content, reason = _MOD._build_content(f"# T\n\n{section6}\n\n{section2}\n")
         self.assertIsNone(reason)
         self.assertLessEqual(len(content), _MOD._CONTENT_CAP)
-        self.assertNotIn("B" * 500, content)    # section 2 dropped entirely
+        self.assertIn("six line 0 " + "A" * 40, content)     # section 6's own earliest lines survive
+        self.assertNotIn("two line 0 " + "B" * 40, content)  # section 2 dropped entirely
         self.assertIn("truncated", content)
+
+    def test_cap_holds_when_h1_alone_meets_the_cap(self):
+        """Ruling 9 (TASK-005 R1 fix round, R1-c11): an H1 line long enough
+        by itself to reach _CONTENT_CAP used to come back verbatim,
+        uncapped -- there was nothing left in the section6 budget to even
+        fit the truncation marker."""
+        h1 = "# " + ("T" * (_MOD._CONTENT_CAP + 200))
+        section6 = "## §6 Next session\n\nsix body"
+        section2 = "## §2 Carry\n\ntwo body"
+        content, reason = _MOD._build_content(f"{h1}\n\n{section6}\n\n{section2}\n")
+        self.assertIsNone(reason)
+        self.assertLessEqual(len(content), _MOD._CONTENT_CAP)
+        self.assertIn("truncated", content)
+
+    def test_a_credential_spanning_the_cut_point_does_not_reach_the_wire(self):
+        """R1-c02/c11: the OLD hard mid-line cut could land inside a value
+        _redact would otherwise catch whole -- the fragment before the cut
+        then matches no rule at all. The padding count below (14 lines
+        before the secret line) is not arbitrary: computed once, offline,
+        from the OLD `_cap`'s own cut arithmetic for this exact fixture, it
+        is the count that puts the OLD hard-cut boundary strictly inside
+        the userinfo password -- confirmed by reproducing this test against
+        the pre-fix `_cap` (see the R1 fix round's verification), where it
+        left a live fragment of the secret on the wire. The assertion below
+        does not hardcode that mechanism, only the OUTCOME any correct `_cap`
+        must uphold: the credential is either intact (so _ingest_client's
+        redaction can catch it whole) or entirely absent, never a partial
+        fragment on either side of the truncation marker.
+        """
+        secret = "hunter2-genuinely-secret-value-0123456789"
+        padding_line = lambda i: f"two line {i} " + "B" * 40  # noqa: E731 - local, single use
+        before = [padding_line(i) for i in range(14)]  # see docstring: lands the OLD cut mid-secret
+        after = [padding_line(i) for i in range(14, 24)]
+        secret_line = f"See db: postgresql://nexus:{secret}@db-host:5432/nexus"
+        section2 = "## §2 Carry\n\n" + "\n".join(before + [secret_line] + after)
+        section6 = "## §6 Next session\n\n" + "\n".join(
+            f"six line {i} " + "A" * 40 for i in range(60)
+        )
+        content, reason = _MOD._build_content(f"# T\n\n{section6}\n\n{section2}\n")
+        self.assertIsNone(reason)
+        self.assertLessEqual(len(content), _MOD._CONTENT_CAP)
+        if secret_line in content:
+            self.assertEqual(len(_redact.find(secret_line)), 1)  # whole line: redaction can still catch it
+        else:
+            # Dropped -- but it must be dropped WHOLE. A fragment of the
+            # secret with no closing delimiter for _redact to match against
+            # is exactly what the OLD hard mid-line cut used to leave on
+            # the wire (confirmed against the pre-fix `_cap`).
+            self.assertNotIn(secret[:15], content)
 
     def test_empty_body_is_empty_sections(self):
         self.assertEqual(_MOD._build_content("   \n\n  "), (None, "empty_sections"))
@@ -410,10 +537,151 @@ class TestContent(unittest.TestCase):
         self.assertEqual(body, "body")
 
     def test_a_bom_is_tolerated(self):
-        text = "﻿---\ntrack-id: t\n---\n# H\n\n## §6 X\n\nbody\n"
+        text = "\ufeff---\ntrack-id: t\n---\n# H\n\n## §6 X\n\nbody\n"
         frontmatter, body = _MOD._split_frontmatter(text)
         self.assertEqual(frontmatter["track-id"], "t")
         self.assertIn("## §6 X", body)
+
+    def test_the_bom_constant_is_the_real_codepoint(self):
+        """R1-c32: pins the escape to the codepoint it must decode to, so a
+        tool that silently strips/mangles it again is caught here even if
+        the source diff itself looks fine."""
+        self.assertEqual(_MOD._BOM, "\ufeff")
+        self.assertEqual(ord(_MOD._BOM), 0xFEFF)
+
+    def test_quoted_frontmatter_values_are_unquoted(self):
+        """R1-c28: one level of matching quotes is stripped from a value."""
+        text = "---\nowner-container: \"simonfish/bfe8285d\"\nstatus: 'active'\n---\nbody"
+        frontmatter, _body = _MOD._split_frontmatter(text)
+        self.assertEqual(frontmatter["owner-container"], "simonfish/bfe8285d")
+        self.assertEqual(frontmatter["status"], "active")
+
+    def test_frontmatter_must_start_on_the_very_first_line(self):
+        """R1-c28: a leading blank line before the opening ``---`` means the
+        document has no frontmatter at all -- a legacy handoff predating the
+        convention, not a malformed one."""
+        text = "\n---\ntrack-id: t\n---\nbody"
+        frontmatter, body = _MOD._split_frontmatter(text)
+        self.assertEqual(frontmatter, {})
+        self.assertEqual(body, text)
+
+    def test_the_200_char_floor_between_empty_and_unparsed(self):
+        """R1-c29: the digest's ``>= _MIN_NONTRIVIAL_BODY`` split, pinned
+        exactly at the boundary so a `>` vs `>=` typo would be caught."""
+        at_floor = "x" * _MOD._MIN_NONTRIVIAL_BODY
+        self.assertEqual(len(at_floor.strip()), _MOD._MIN_NONTRIVIAL_BODY)
+        self.assertEqual(_MOD._build_content(at_floor), (None, "sections_unparsed"))
+        just_under = "x" * (_MOD._MIN_NONTRIVIAL_BODY - 1)
+        self.assertEqual(_MOD._build_content(just_under), (None, "empty_sections"))
+
+    def test_a_heading_only_section_six_is_empty(self):
+        """Ruling 3 (TASK-005 R1 fix round, R1-c01): a section heading with
+        nothing but blank lines under it is not content -- a freshly created
+        template (only heading-only §6/§2) must land on empty_sections, a
+        skip, exactly like a wholly blank body."""
+        body = "# T\n\n## §6 Next session 入口 + 优先级建议\n\n## §2 未完成 / Carry-forward 清单\n"
+        self.assertEqual(_MOD._build_content(body), (None, "empty_sections"))
+
+    def test_a_heading_only_section_six_on_a_long_body_is_sections_unparsed(self):
+        """The same heading-only emptiness, but with enough OTHER prose in
+        the body to cross _MIN_NONTRIVIAL_BODY: a broken/renamed template,
+        not a quiet empty one -- must be reported, not skipped."""
+        filler = "prose that is not under either known heading. " * 6
+        body = f"# T\n\n{filler}\n\n## §6 Next session\n\n## §2 unfinished\n\n"
+        self.assertGreaterEqual(len(body.strip()), _MOD._MIN_NONTRIVIAL_BODY)
+        self.assertEqual(_MOD._build_content(body), (None, "sections_unparsed"))
+
+    def test_a_subsection_line_under_section_six_still_counts_as_content(self):
+        """The presence check (ruling 3) must not regress `test_order_is_h1_
+        then_section_six_then_section_two`'s subsection sweep-up: a bare
+        `### §6.1` heading line under §6, with nothing else, is still a
+        non-blank line and must keep the section present."""
+        body = "# T\n\n## §6 Next session\n\n### §6.1 a subsection\n\n## §2 Carry\n\ntwo body\n"
+        content, reason = _MOD._build_content(body)
+        self.assertIsNone(reason)
+        self.assertIn("§6.1", content)
+
+
+class TestOptOut(unittest.TestCase):
+    """R1-c05: `nexus-ingest: skip` recognised past exact-lowercase-match."""
+
+    def test_exact_lowercase_skip_opts_out(self):
+        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip"}))
+
+    def test_mixed_and_upper_case_skip_opts_out(self):
+        self.assertTrue(_MOD._opted_out({"nexus-ingest": "Skip"}))
+        self.assertTrue(_MOD._opted_out({"nexus-ingest": "SKIP"}))
+
+    def test_an_inline_comment_after_skip_still_opts_out(self):
+        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip  # has a secret in §6"}))
+        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip # reason"}))
+
+    def test_missing_key_does_not_opt_out(self):
+        self.assertFalse(_MOD._opted_out({}))
+
+    def test_unrecognised_values_do_not_opt_out(self):
+        """false/no/off are left ingesting -- an explicitly OPEN question
+        (Amendment A9), not a guess made by this fix."""
+        for value in ("false", "no", "off", "true", "none"):
+            with self.subTest(value=value):
+                self.assertFalse(_MOD._opted_out({"nexus-ingest": value}))
+
+
+class TestMetadata(unittest.TestCase):
+    """_build_metadata: aria.* keys and `branch` are OMITTED (not sent as an
+    explicit null) when the source value is absent -- a PATCH is a shallow
+    merge, and an explicit null would clobber a value already on the server
+    (R1-c25: these negative branches had no fixture at all)."""
+
+    def test_branch_is_omitted_when_none(self):
+        meta = _MOD._build_metadata("s1", None, {}, "aaaaaaaa")
+        self.assertNotIn("branch", meta)
+
+    def test_branch_is_present_when_known(self):
+        meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa")
+        self.assertEqual(meta["branch"], "main")
+
+    def test_each_aria_key_is_omitted_when_its_frontmatter_value_is_absent(self):
+        meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa")
+        for key in ("aria.track_id", "aria.phase", "aria.status", "aria.updated_at"):
+            self.assertNotIn(key, meta)
+        # aria.owner_container is keyed off the uuid ARGUMENT, not frontmatter
+        # (see the function's own docstring) -- its own omission case is
+        # exercised separately below.
+        self.assertEqual(meta["aria.owner_container"], "aaaaaaaa")
+
+    def test_owner_container_is_omitted_when_the_uuid_argument_is_falsy(self):
+        meta = _MOD._build_metadata("s1", "main", {}, None)
+        self.assertNotIn("aria.owner_container", meta)
+
+    def test_each_aria_key_is_present_when_its_frontmatter_value_is_given(self):
+        frontmatter = {
+            "track-id": "t1", "phase": "B", "status": "active",
+            "updated-at": "2026-09-20T10:00:00Z",
+        }
+        meta = _MOD._build_metadata("s1", "main", frontmatter, "aaaaaaaa")
+        self.assertEqual(meta["aria.track_id"], "t1")
+        self.assertEqual(meta["aria.phase"], "B")
+        self.assertEqual(meta["aria.status"], "active")
+        self.assertEqual(meta["aria.updated_at"], "2026-09-20T10:00:00Z")
+
+
+class TestPointerTargetReadSafety(_HandoffDirCase):
+    """R1-c13: latest.md is checked with os.path.isfile before it is
+    opened, and its read is capped -- a FIFO or a huge file must not block
+    the hook or exhaust memory just to find one pointer line."""
+
+    def test_a_non_regular_latest_md_reads_as_no_pointer(self):
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        fifo_path = os.path.join(self.handoff_dir, "latest.md")
+        os.mkfifo(fifo_path)  # a directory would also fail isfile(); a FIFO is the risk this guards
+        self.addCleanup(os.remove, fifo_path)
+        # Reads as "no pointer" (falls back to newest updated-at), NOT a
+        # blocking open() -- the assertion is really that this call returns
+        # at all, promptly, under the test runner's own default timeout.
+        self.assertEqual(_MOD._pointer_target(self.handoff_dir), None)
+        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -731,16 +999,229 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="sess-1")
         self.assertEqual(self._last_entry()["reason"], "none")
+        self.assertNotIn("identity_changed", self._last_entry())  # no drift this run: key absent
 
         with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
             self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
             self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "identity_changed")
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "identity_changed")
+        self.assertTrue(entry["identity_changed"])
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-box-b")  # a clean write: persisted
 
         with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
             self.backend.reply(200, _page()).reply(201, {"memory_id": "m3"})
             self._run(session_id="sess-1")
         self.assertNotEqual(self._last_entry()["reason"], "identity_changed")  # reported once, not every run
+
+    def _drift_then_fail(self, act):
+        """Shared setup for the three ruling-2 (R1-c04) tests below: a clean
+        first run under CONTAINER, then ``act()`` -- which must patch
+        container_id to something else itself, queue whatever backend
+        response(s) it needs, and drive the second (failing) run. Returns
+        that second run's ledger entry. The container_id / deadline patches
+        live inside ``act`` rather than around this whole method so they
+        never touch the FIRST (deliberately clean) run."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "none")
+        act()
+        return self._last_entry()
+
+    def test_identity_drift_with_a_500_does_not_persist_the_new_id(self):
+        """Ruling 2 (TASK-005 R1 fix round, R1-c04): http_error aborts the
+        round, so the drift must stay unresolved for the NEXT run too --
+        and, since http_error outranks identity_changed in worst_reason,
+        the drift signal must still show up in the ledger `extra`."""
+
+        def act():
+            with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
+                self.backend.reply(200, _page()).reply(500, {"detail": "boom"})
+                self._run(session_id="sess-1")
+
+        entry = self._drift_then_fail(act)
+        self.assertEqual(entry["reason"], "http_error")
+        self.assertTrue(entry["identity_changed"])
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), CONTAINER)  # NOT persisted
+
+        # Next run, still dev-box-b, backend healthy: the drift must still
+        # be detected -- it was never actually recorded as resolved.
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m3"})
+            self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "identity_changed")
+
+    def test_identity_drift_with_403_ingest_disabled_does_not_persist_the_new_id(self):
+        def act():
+            with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
+                self.backend.reply(200, _page()).reply(
+                    403, {"detail": {"error": "STRUCTURED_INGEST_DISABLED", "reason": "tenant off"}}
+                )
+                self._run(session_id="sess-1")
+
+        entry = self._drift_then_fail(act)
+        self.assertEqual(entry["reason"], "ingest_disabled")
+        self.assertTrue(entry["identity_changed"])
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), CONTAINER)
+
+    def test_identity_drift_with_a_client_timeout_does_not_persist_the_new_id(self):
+        """The client's OWN deadline refusal (no request even sent), not the
+        outer work-budget abandonment -- see test_a_deadline_already_
+        exhausted_refuses_without_a_request for that half of R1-c26."""
+
+        def act():
+            with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 1_000_000.0):
+                self._run(session_id="sess-1")  # deadline already exhausted: no reply need be queued
+
+        entry = self._drift_then_fail(act)
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertTrue(entry["identity_changed"])
+        self.assertEqual(len(self.requests), 2)  # only the first (successful) run's GET+POST
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), CONTAINER)
+
+    def test_calls_is_recorded_as_unknown_not_zero_when_the_work_is_abandoned(self):
+        """R1-c09: `run["calls"]` is only assigned AFTER `upsert` returns --
+        a thread abandoned while still INSIDE it (the outer work budget, not
+        the client's own deadline refusal) never reaches that line, and the
+        ledger must not report a bare 0 there: that reads as "definitely no
+        requests were made", when in truth a real request may already be in
+        flight or even answered."""
+        self._write("2026-09-20-1000-x.md")
+        release = threading.Event()
+        self.addCleanup(release.set)  # let the abandoned worker finish and exit
+
+        def stall(*args, **kwargs):
+            release.wait(30)
+            return _ingest_client.Outcome()
+
+        with mock.patch.object(_ingest_client.IngestClient, "upsert", stall), \
+                mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.2):
+            self._run(session_id="sess-1")
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertIsNone(entry["calls"])
+
+    def test_source_name_is_the_backend_allowlisted_value(self):
+        """R1-c27: SOURCE_NAME is a literal string the backend attributes by
+        exact match (mcp_attribution._KNOWN_CLIENTS); a typo here sends
+        every write to source=unknown with nothing local to catch it."""
+        self.assertEqual(_MOD.SOURCE_NAME, "handoff-sync-hook")
+
+    def test_requests_carry_the_x_nexus_source_header(self):
+        """R1-c27: the wire header itself, not just the constant's value."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+        expected = f"{_MOD.SOURCE_NAME}/{_identity.plugin_version()}"
+        self.assertTrue(self.requests)
+        for req in self.requests:
+            self.assertEqual(req["headers"]["x-nexus-source"], expected)
+
+    def test_the_ingest_client_deadline_is_wired_from_the_work_budget(self):
+        """R1-c26: nothing previously pinned that `deadline=run["deadline"]`
+        (main's own absolute time.monotonic() budget) actually reaches
+        IngestClient -- passing `deadline=None` through left every other
+        test green."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        captured = {}
+        real_init = _ingest_client.IngestClient.__init__
+
+        def spy_init(self_, *args, **kwargs):
+            captured.update(kwargs)
+            real_init(self_, *args, **kwargs)
+
+        with mock.patch.object(_ingest_client.IngestClient, "__init__", spy_init), \
+                mock.patch.object(_MOD.time, "monotonic", return_value=1_000_000.0):
+            self._run(session_id="sess-1")
+        expected = 1_000_000.0 + _MOD._WORK_BUDGET_SECONDS - _MOD._DEADLINE_SLACK_SECONDS
+        self.assertEqual(captured.get("deadline"), expected)
+
+    def test_a_deadline_already_exhausted_refuses_without_a_request(self):
+        """The second half of R1-c26: with the deadline already in the past
+        by the time IngestClient makes its first call, the client refuses
+        instead of trying against the clock -- zero requests."""
+        self._write("2026-09-20-1000-x.md")
+        with mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 1_000_000.0):
+            self._run(session_id="sess-1")
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "timeout")
+
+    def test_the_ledger_records_which_document_a_write_was_about(self):
+        """R1-c30: pins external_id as its OWN ledger field (not only inside
+        the metadata the wire request happens to carry)."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+
+    def test_the_ledger_detail_is_truncated_to_200_chars(self):
+        """R1-c30: `_short`'s cap, pinned end to end through the ledger."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(422, {"detail": "x" * 1000})
+        self._run(session_id="sess-1")
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "rejected_422")
+        self.assertLessEqual(len(entry["detail"]), 200)
+
+    def test_locate_does_not_filter_candidates_by_owner(self):
+        """Ruling 1 (TASK-005 R1 fix round, R1-c07): `_locate` picks the
+        newest `updated-at` across ALL candidates in the directory, never
+        checking frontmatter `owner-container` -- the owner check only runs
+        AFTER a single document has already been chosen. A newer handoff
+        written by a DIFFERENT container therefore wins over an older one
+        THIS container actually owns, and the older one is never even
+        considered: this run ends in `not_owner`, not a successful
+        ingestion of the older document. Deliberate (see Amendment A9): a
+        change here must be a deliberate decision, not an incidental
+        refactor -- this test exists so that decision shows up as a test
+        change, not a silent behaviour change.
+        """
+        self._write("2026-09-19-old-mine.md", owner=f"owner/{LOCAL_UUID}", updated_at="2026-09-19T00:00:00Z")
+        self._write("2026-09-20-new-theirs.md", owner=f"owner/{OTHER_UUID}", updated_at="2026-09-20T00:00:00Z")
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "not_owner")
+
+    def test_session_attribution_is_the_ingesting_session_not_the_documents_own(self):
+        """Ruling 1 (TASK-005 R1 fix round, R1-c03): metadata.session_id is
+        always the CURRENT SessionEnd's session_id, never anything derived
+        from the handoff document itself -- there is nothing in a handoff
+        document that could tell us which session originally wrote it. This
+        is deliberate, not an oversight (see Amendment A9); a change here
+        must be deliberate, not incidental.
+        """
+        self._write("2026-09-20-1000-x.md", updated_at="2020-01-01T00:00:00Z")  # written long "ago"
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="this-very-session")
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "this-very-session")
+
+    def test_owner_container_frontmatter_value_is_recorded_on_identity_unresolved(self):
+        """R1-c10: the ledger `extra` used to stay `{}` on every reason that
+        returns before the write path -- a SessionStart failure report for
+        `identity_unresolved` could not even say which frontmatter value
+        was the problem."""
+        self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")  # hostname-shaped
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "identity_unresolved")
+        self.assertIn("simonfish/dev-claude2", entry["detail"])
+        self.assertEqual(entry["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+
+    def test_not_owner_and_opted_out_also_record_external_id(self):
+        """R1-c10, the other non-write branches: `not_owner` and `opted_out`
+        likewise say which document the run was about."""
+        self._write("2026-09-20-1000-x.md", owner=f"owner/{OTHER_UUID}")
+        self._run()
+        self.assertEqual(self._last_entry()["reason"], "not_owner")
+        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1000-x.md")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -807,13 +1288,36 @@ class TestRuns(unittest.TestCase):
         self.assertEqual(from_root, from_sub)
 
     def test_degraded_identity_refuses_to_write(self):
+        """R1-c33: `_identity._resolved_root` only ever sets `degraded=True`
+        alongside `toplevel=None` (never a real path) -- `(self.repo, True)`
+        is a shape the real code never produces. `(None, True)` is the real
+        one; `root = toplevel or cwd` still resolves to `self.repo` here
+        because this call runs from the repo root, so the rest of the test
+        is unchanged."""
         _write_handoff(self.handoff_dir, "2026-09-20-1000-x.md", owner=f"owner/{LOCAL_UUID}")
         _write_latest_pointer(self.handoff_dir, "2026-09-20-1000-x.md")
-        with mock.patch.object(_identity, "project_root", return_value=(self.repo, True)):
+        with mock.patch.object(_identity, "project_root", return_value=(None, True)):
             self._run(self.repo)
         self.assertEqual(self.backend.requests, [])
         entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.repo)
         self.assertEqual(entries[-1]["reason"], "identity_unresolved")
+
+    def test_outside_a_repository_locates_and_writes_under_cwd(self):
+        """R1-c33: the OTHER real shape `_resolved_root` returns -- not a
+        repository at all (`degraded=False`, `toplevel=None`) -- as opposed
+        to the degraded case above. This one is not refused: `root = cwd`
+        and the write proceeds normally."""
+        non_repo = os.path.join(self.tmp.name, "not-a-repo")
+        sub_handoff = os.path.join(non_repo, "docs", "handoff")
+        os.makedirs(sub_handoff)
+        _write_handoff(sub_handoff, "2026-09-20-1000-x.md", owner=f"owner/{LOCAL_UUID}")
+        _write_latest_pointer(sub_handoff, "2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        with mock.patch.object(_identity, "project_root", return_value=(None, False)):
+            self._run(non_repo)
+        self.assertEqual([r["method"] for r in self.backend.requests], ["GET", "POST"])
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, non_repo)
+        self.assertEqual(entries[-1]["reason"], "none")
 
     def test_not_configured_makes_no_request_when_no_api_url(self):
         _run_main(_MOD, {"cwd": self.repo, "session_id": "s"}, {"NEXUS_HOOK_STATE_DIR": self.state_dir})
@@ -822,10 +1326,67 @@ class TestRuns(unittest.TestCase):
         self.assertEqual(entries[-1]["reason"], "not_configured")
 
     def test_elapsed_ms_is_recorded(self):
-        _run_main(_MOD, {"cwd": self.repo, "session_id": "s"}, {"NEXUS_HOOK_STATE_DIR": self.state_dir})
+        """R1-c30: strengthened past "an int >= 0" (a frozen `elapsed_ms =
+        0` constant would also satisfy that) to a real, strictly positive
+        value, using a fake clock that advances on every call."""
+        counter = {"n": 0}
+
+        def fake_monotonic():
+            counter["n"] += 1
+            return counter["n"] * 0.001
+
+        with mock.patch.object(_MOD.time, "monotonic", side_effect=fake_monotonic):
+            _run_main(_MOD, {"cwd": self.repo, "session_id": "s"}, {"NEXUS_HOOK_STATE_DIR": self.state_dir})
         entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.repo)
         self.assertIs(type(entries[-1]["elapsed_ms"]), int)
-        self.assertGreaterEqual(entries[-1]["elapsed_ms"], 0)
+        self.assertGreater(entries[-1]["elapsed_ms"], 0)
+
+
+class TestImportGuards(unittest.TestCase):
+    """handoff_sync.py's own three import guards (R1-c31): none of them had
+    a test of its own, unlike session_capture.py's / session_inject.py's
+    equivalent `TestSharedModulesUnavailable` (which this mirrors). One
+    difference from those two (module docstring, A5-3): `_ingest_client`
+    is REQUIRED here, not peripheral bookkeeping."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _copy_hook_without(self, *missing):
+        target = os.path.join(self.tmp.name, "partial-install")
+        os.makedirs(target)
+        names = (
+            "handoff_sync.py", "_identity.py", "_hook_runner.py",
+            "_ingest_client.py", "_hook_state.py", "_redact.py",
+        )
+        for name in names:
+            if name not in missing:
+                shutil.copy(os.path.join(_HOOKS_DIR, name), target)
+        return os.path.join(target, "handoff_sync.py")
+
+    def test_without_identity_it_exits_zero_and_says_why(self):
+        script = self._copy_hook_without("_identity.py")
+        stdout, code, stderr = _run_hook("{}", script=script, want_stderr=True)
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertIn("_identity", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_without_hook_runner_it_exits_zero_and_says_why(self):
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code, stderr = _run_hook("{}", script=script, want_stderr=True)
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertIn("_hook_runner", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_without_ingest_client_it_exits_zero_and_says_why(self):
+        """The one guard that is unique to this hook (contrast the other two
+        SessionEnd hooks, which treat their ledger as optional)."""
+        script = self._copy_hook_without("_ingest_client.py")
+        stdout, code, stderr = _run_hook("{}", script=script, want_stderr=True)
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertIn("_ingest_client", stderr)
+        self.assertNotIn("Traceback", stderr)
 
 
 class TestSubprocess(unittest.TestCase):

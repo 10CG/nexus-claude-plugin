@@ -175,6 +175,15 @@ _USER_AGENT = "nexus-sessionstart-hook/0.3"
 # without anyone noticing. New SessionEnd hooks add themselves; a test walks
 # hooks.json to make sure they do.
 _EXPECTED_LEDGERS = ("session-capture", "handoff-sync")
+# State key (ruling 4, TASK-005 R1 fix round, R1-c21): which of
+# _EXPECTED_LEDGERS this project has already been told about. A plugin
+# upgrade that adds a new SessionEnd hook here (handoff-sync was the first)
+# must not report it "has never recorded a run" on the very next
+# SessionStart -- its first SessionEnd is still ahead of it, and that is not
+# the hook failing to fire. Legacy state written before this key existed (or
+# before handoff-sync was added) reads as the set that was expected then.
+_SEEN_EXPECTED_LEDGERS_KEY = "seen_expected_ledgers"
+_LEGACY_EXPECTED_LEDGERS = ("session-capture",)
 _LEDGER_SUFFIX = ".json"
 _STATE_SUFFIX = ".state.json"
 _TMP_PREFIX = ".tmp-"
@@ -354,6 +363,14 @@ def _failure_report(cwd):
     """
     state, _ = _hook_state.read_state(HOOK, cwd)
     already = state.get("reported") if isinstance(state.get("reported"), dict) else {}
+    seen_raw = state.get(_SEEN_EXPECTED_LEDGERS_KEY)
+    # ruling 4 (R1-c21): a hook newly present in _EXPECTED_LEDGERS but absent
+    # from what THIS project was already told about gets one silent grace
+    # SessionStart -- `main()` persists the current _EXPECTED_LEDGERS here
+    # unconditionally afterwards (see below), so it is only ever absent once
+    # per hook, on the first start after it was added (or, for legacy state
+    # written before this key existed, before the key's own introduction).
+    seen_expected = set(seen_raw) if isinstance(seen_raw, list) else set(_LEGACY_EXPECTED_LEDGERS)
     own_entries, _ = _hook_state.read_ledger(HOOK, cwd)
     first_start = not own_entries
     marks = {}
@@ -362,10 +379,10 @@ def _failure_report(cwd):
         entries, reasons = _hook_state.read_ledger(hook, cwd)
         exists = os.path.exists(_hook_state.ledger_path(hook, cwd))
         if not exists:
-            if hook in _EXPECTED_LEDGERS and not first_start:
+            if hook in _EXPECTED_LEDGERS and hook in seen_expected and not first_start:
                 key, text = "missing", f"{hook} has never recorded a run (is its hook firing?)"
             else:
-                continue  # a first start, or a hook that is simply not installed
+                continue  # a first start, a hook not installed, or one newly expected (grace period)
         elif not entries and "unknown" in reasons:
             key, text = "unreadable", f"{hook} ledger is unreadable"
         elif not entries:
@@ -515,10 +532,20 @@ def _record(reason, started, run):
             # container_id travels with every state write: identity_drift
             # (TASK-007) reads it back, and a state written without it makes
             # every later run report unknown.
+            # seen_expected_ledgers travels alongside `reported` (ruling 4,
+            # R1-c21): persisting the CURRENT _EXPECTED_LEDGERS every run
+            # this far means a hook newly added to it is "seen" starting
+            # with the very next start -- exactly one grace period, then
+            # ordinary "missing" reporting resumes.
             _hook_state.update_state(
                 HOOK,
                 cwd or os.getcwd(),
-                lambda s: {**s, "reported": marks, "container_id": _identity.container_id()},
+                lambda s: {
+                    **s,
+                    "reported": marks,
+                    "container_id": _identity.container_id(),
+                    _SEEN_EXPECTED_LEDGERS_KEY: list(_EXPECTED_LEDGERS),
+                },
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[{HOOK}] could not persist the report markers: {exc!r}", file=sys.stderr)

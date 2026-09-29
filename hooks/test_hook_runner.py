@@ -11,6 +11,7 @@ file needs no fake-HOME / NEXUS_HOOK_STATE_DIR module fixture: nothing here
 reaches a real hook's main(), and nothing here writes anywhere.
 """
 
+import io
 import os
 import sys
 import threading
@@ -87,6 +88,41 @@ class TestRunWithDeadline(unittest.TestCase):
         stalled = next(t for t in threading.enumerate() if t.name == "stall-work")
         self.assertTrue(stalled.daemon, "must not be able to keep the interpreter alive on its own")
 
+    def test_a_budget_that_stopped_working_fails_fast_not_slow(self):
+        """R1-c34 (non-mandatory): a target blocked on a threading.Event
+        that is NEVER set catches a `worker.join(budget) -> worker.join()`
+        regression in under a second. The existing budget-exceeded test
+        above (bounded by its own `release.wait(30)`) would also go red
+        under that mutant, but only after riding out the whole 30 s wait --
+        a slow red on a regression that should be instant. An
+        immediately-returning target (the other natural choice for a fast
+        test) would not catch this mutant at all: with or without a budget,
+        it returns before either `join()` call matters.
+
+        Runs `run_with_deadline` on a watchdog thread of THIS test's own so
+        it fails within its own bound even if the code under test regressed
+        to blocking forever, rather than hanging the whole suite.
+        """
+        never_set = threading.Event()
+        result = {}
+
+        def call_it():
+            result["value"] = _hook_runner.run_with_deadline(
+                lambda: never_set.wait(), 0.2, "never-set-work"
+            )
+
+        watchdog = threading.Thread(target=call_it, daemon=True)
+        began = time.monotonic()
+        watchdog.start()
+        watchdog.join(1.0)
+        elapsed = time.monotonic() - began
+        self.assertFalse(
+            watchdog.is_alive(), f"run_with_deadline did not return within 1s (took >{elapsed:.1f}s)"
+        )
+        outcome, left_behind = result["value"]
+        self.assertTrue(left_behind)
+        self.assertEqual(outcome, {})
+
     def test_target_is_called_with_no_arguments_on_its_own_thread(self):
         """Callers close over their own state (e.g. ``lambda: _collect(run)``);
         run_with_deadline itself must call target() with nothing, on a
@@ -123,8 +159,15 @@ class TestWriteWithBudget(unittest.TestCase):
         # ended (badly) well inside the budget -- this is the net under a
         # write() that does not already guard itself (every current caller's
         # write() does; see the module docstring).
-        left_behind = _hook_runner.write_with_budget(write, 5, "w")
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            left_behind = _hook_runner.write_with_budget(write, 5, "w")
         self.assertFalse(left_behind)
+        # R1-c14: the exception must not vanish with no trace either -- this
+        # function discards run_with_deadline's own outcome entirely, so
+        # without this print the only copy of `exc` anywhere is gone.
+        self.assertIn("w", stderr.getvalue())
+        self.assertIn("the caller forgot to catch this", stderr.getvalue())
 
     def test_budget_exceeded_reports_left_behind(self):
         release = threading.Event()

@@ -957,6 +957,17 @@ class TestSharedModulesUnavailable(_LedgerCase):
         self.assertIn("_identity", stderr)
         self.assertNotIn("Traceback", stderr)
 
+    def test_as_a_script_without_the_hook_runner_module_it_exits_zero_and_says_why(self):
+        """R1-c31 (TASK-005 R1 fix round): `_hook_runner` became a REQUIRED
+        import here (TASK-005's "third user" consolidation) but never had
+        its own missing-module case, unlike `_identity` and `_hook_state`
+        above -- `_copy_hook_without` always included it."""
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code, stderr = _run_hook(json.dumps({"cwd": self.cwd}), script=script, want_stderr=True)
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertIn("_hook_runner", stderr)
+        self.assertNotIn("Traceback", stderr)
+
 
 
 class TestLedgerStepIsBounded(_LedgerCase):
