@@ -101,9 +101,7 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
 
 import json
 import os
-import subprocess
 import sys
-import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -125,6 +123,20 @@ except Exception as exc:  # a broken or partial install
     if __name__ != "__main__":
         raise
     print(f"[session-inject] cannot import _identity: {exc!r}", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    import _hook_runner
+except Exception as exc:  # a broken or partial install
+    # Same contract as the _identity guard above: loud when imported by a
+    # test, quiet exit(0) when run as a hook (a traceback here is exit 1,
+    # which Claude Code reports as a hook error on every single session
+    # start). main() cannot run its deadline / ledger-budget races without
+    # this module, so it is treated as required, not as optional
+    # bookkeeping like _hook_state below.
+    if __name__ != "__main__":
+        raise
+    print(f"[session-inject] cannot import _hook_runner: {exc!r}", file=sys.stderr)
     sys.exit(0)
 
 try:
@@ -162,7 +174,16 @@ _USER_AGENT = "nexus-sessionstart-hook/0.3"
 # invisible in every other way, and a hook not named here could stop for good
 # without anyone noticing. New SessionEnd hooks add themselves; a test walks
 # hooks.json to make sure they do.
-_EXPECTED_LEDGERS = ("session-capture",)
+_EXPECTED_LEDGERS = ("session-capture", "handoff-sync")
+# State key (ruling 4, TASK-005 R1 fix round, R1-c21): which of
+# _EXPECTED_LEDGERS this project has already been told about. A plugin
+# upgrade that adds a new SessionEnd hook here (handoff-sync was the first)
+# must not report it "has never recorded a run" on the very next
+# SessionStart -- its first SessionEnd is still ahead of it, and that is not
+# the hook failing to fire. Legacy state written before this key existed (or
+# before handoff-sync was added) reads as the set that was expected then.
+_SEEN_EXPECTED_LEDGERS_KEY = "seen_expected_ledgers"
+_LEGACY_EXPECTED_LEDGERS = ("session-capture",)
 _LEDGER_SUFFIX = ".json"
 _STATE_SUFFIX = ".state.json"
 _TMP_PREFIX = ".tmp-"
@@ -189,21 +210,16 @@ _SETTLED_RANK = {layer: rank for rank, layer in enumerate(_SETTLED_LAYERS)}
 
 
 def _current_branch(cwd):
-    """Return the current git branch, or None if not a git repo / git failed."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return None
-        branch = result.stdout.decode().strip()
-        if not branch or branch == "HEAD":  # detached HEAD -> no branch scoping
-            return None
-        return branch
-    except Exception:
-        return None
+    """Return the current git branch, or None if not a git repo / git failed.
+
+    Delegates to _identity.current_branch (TASK-005): this hook and
+    session_capture.py each carried a byte-identical copy of the derivation
+    until now. Kept as a module-level name (not inlined as
+    ``_identity.current_branch`` at the one call site) because tests patch
+    ``mod._current_branch`` directly, and _collect must keep calling the
+    module-level name for that patch to take effect.
+    """
+    return _identity.current_branch(cwd)
 
 
 def _retrieve(base_url, token, user_id, metadata_filter, timeout):
@@ -347,6 +363,30 @@ def _failure_report(cwd):
     """
     state, _ = _hook_state.read_state(HOOK, cwd)
     already = state.get("reported") if isinstance(state.get("reported"), dict) else {}
+    seen_raw = state.get(_SEEN_EXPECTED_LEDGERS_KEY)
+    # ruling 4 (R1-c21): a hook newly present in _EXPECTED_LEDGERS but absent
+    # from what THIS project was already told about gets one silent grace
+    # SessionStart -- `main()` persists the current _EXPECTED_LEDGERS here
+    # unconditionally afterwards (see below), so it is only ever absent once
+    # per hook, on the first start after it was added (or, for legacy state
+    # written before this key existed, before the key's own introduction).
+    #
+    # Each ELEMENT is also type-checked, not just the list itself (R3-c08):
+    # `set(seen_raw)` alone raises `TypeError` on an unhashable element (a
+    # stray list/dict, however it got there), which escapes this function
+    # entirely -- `_collect`'s own `except Exception` catches it, but that
+    # leaves `run["marks"]` at its initial `None`, and `_record` reads
+    # `marks is None` as "the ledgers were never read this run; leave the
+    # markers alone" and skips the persist that would otherwise have
+    # overwritten the bad value. Every later SessionStart hits the exact
+    # same `TypeError` forever, with no self-healing write to break the
+    # loop -- unlike the sibling `reported` key three lines up, which
+    # already has this same `isinstance` guard.
+    seen_expected = (
+        {h for h in seen_raw if isinstance(h, str)}
+        if isinstance(seen_raw, list)
+        else set(_LEGACY_EXPECTED_LEDGERS)
+    )
     own_entries, _ = _hook_state.read_ledger(HOOK, cwd)
     first_start = not own_entries
     marks = {}
@@ -355,10 +395,10 @@ def _failure_report(cwd):
         entries, reasons = _hook_state.read_ledger(hook, cwd)
         exists = os.path.exists(_hook_state.ledger_path(hook, cwd))
         if not exists:
-            if hook in _EXPECTED_LEDGERS and not first_start:
+            if hook in _EXPECTED_LEDGERS and hook in seen_expected and not first_start:
                 key, text = "missing", f"{hook} has never recorded a run (is its hook firing?)"
             else:
-                continue  # a first start, or a hook that is simply not installed
+                continue  # a first start, a hook not installed, or one newly expected (grace period)
         elif not entries and "unknown" in reasons:
             key, text = "unreadable", f"{hook} ledger is unreadable"
         elif not entries:
@@ -470,13 +510,13 @@ def _record(reason, started, run):
     """Append this run to the ledger, within a budget. Never raises.
     Returns True when the write had to be left behind.
 
-    The write happens on a daemon thread that is abandoned after
-    ``_LEDGER_BUDGET_SECONDS``. Catching exceptions is not enough: the ledger
-    takes a blocking lock, and a write that STALLS keeps this process alive
-    until the host's timeout kills it -- and the host only uses the stdout of a
-    hook that exited 0, so the stall would cost the very output that was
-    written first to keep it safe. An abandoned daemon thread dies with the
-    interpreter.
+    The write happens on a daemon thread (``_hook_runner.write_with_budget``)
+    that is abandoned after ``_LEDGER_BUDGET_SECONDS``. Catching exceptions is
+    not enough: the ledger takes a blocking lock, and a write that STALLS
+    keeps this process alive until the host's timeout kills it -- and the
+    host only uses the stdout of a hook that exited 0, so the stall would
+    cost the very output that was written first to keep it safe. An
+    abandoned daemon thread dies with the interpreter.
     """
     if _hook_state is None:
         print(
@@ -508,25 +548,32 @@ def _record(reason, started, run):
             # container_id travels with every state write: identity_drift
             # (TASK-007) reads it back, and a state written without it makes
             # every later run report unknown.
+            # seen_expected_ledgers travels alongside `reported` (ruling 4,
+            # R1-c21): persisting the CURRENT _EXPECTED_LEDGERS every run
+            # this far means a hook newly added to it is "seen" starting
+            # with the very next start -- exactly one grace period, then
+            # ordinary "missing" reporting resumes.
             _hook_state.update_state(
                 HOOK,
                 cwd or os.getcwd(),
-                lambda s: {**s, "reported": marks, "container_id": _identity.container_id()},
+                lambda s: {
+                    **s,
+                    "reported": marks,
+                    "container_id": _identity.container_id(),
+                    _SEEN_EXPECTED_LEDGERS_KEY: list(_EXPECTED_LEDGERS),
+                },
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[{HOOK}] could not persist the report markers: {exc!r}", file=sys.stderr)
 
-    worker = threading.Thread(target=write, name=f"{HOOK}-ledger", daemon=True)
-    worker.start()
-    worker.join(_LEDGER_BUDGET_SECONDS)
-    if worker.is_alive():
+    left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
+    if left_behind:
         print(
             f"[{HOOK}] ledger write still running after {_LEDGER_BUDGET_SECONDS}s; "
             f"leaving it behind, this run ({reason}) may go unrecorded",
             file=sys.stderr,
         )
-        return True
-    return False
+    return left_behind
 
 
 def _silence_stdout():
@@ -548,22 +595,15 @@ def main():
     """Run the hook. Returns True when a worker thread had to be left behind."""
     started = time.monotonic()
     run = {"cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None}
-    outcome = {}
-
-    def work():  # never prints: a thread that may be abandoned must stay off stdio
-        try:
-            outcome["result"] = _collect(run)
-        except Exception as exc:
-            outcome["error"] = exc
 
     # The work runs against a deadline of its own. urllib's timeout is per
     # socket operation, not per request -- one "6 s" request was measured at
     # 24 s against a server that drips bytes -- and a hook the host has to kill
     # leaves no record and, for SessionStart, no brief. So leave first.
-    worker = threading.Thread(target=work, name=f"{HOOK}-work", daemon=True)
-    worker.start()
-    worker.join(_WORK_BUDGET_SECONDS)
-    left_behind = worker.is_alive()
+    # _collect never prints: a thread that may be abandoned must stay off stdio.
+    outcome, left_behind = _hook_runner.run_with_deadline(
+        lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
+    )
 
     reason, brief = "unknown", None
     if left_behind:
@@ -624,16 +664,4 @@ if __name__ == "__main__":
         # FAIL-OPEN: ANY failure (config, network, timeout, parse, git) -> exit 0
         # with no stdout. Never block session startup over memory retrieval.
         pass
-    if left_behind:
-        # A daemon thread is still running. Ordinary interpreter shutdown can
-        # die with "could not acquire lock for <stderr>" if that thread happens
-        # to be printing at that instant -- a non-zero exit, which for
-        # SessionStart costs the brief. Everything that matters has been
-        # flushed, so leave without the ceremony.
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        except Exception:
-            pass
-        os._exit(0)
-    sys.exit(0)
+    _hook_runner.finish(left_behind)

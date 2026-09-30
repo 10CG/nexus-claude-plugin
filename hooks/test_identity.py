@@ -319,6 +319,132 @@ class TestProjectSlugAndUserId(unittest.TestCase):
                 )
 
 
+class TestProjectRoot(unittest.TestCase):
+    """TASK-005 (change 2): handoff_sync.py needs an actual directory to
+    list `docs/handoff` under, not just project_identity's slug."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_returns_the_toplevel_from_a_subdirectory(self):
+        repo = os.path.join(self.tmp.name, "therepo")
+        sub = os.path.join(repo, "deep", "nested")
+        os.makedirs(sub)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        self.assertEqual(_identity.project_root(sub), (repo, False))
+        self.assertEqual(_identity.project_root(repo), (repo, False))
+
+    def test_not_a_repo_is_none_not_degraded(self):
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True):
+            self.assertEqual(_identity.project_root(plain), (None, False))
+
+    def test_git_failure_is_degraded_true(self):
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
+            self.assertEqual(_identity.project_root(plain), (None, True))
+
+    def test_a_refused_answer_is_degraded_true(self):
+        """`dubious ownership`: git is there, the directory IS a repository,
+        and it still refuses to answer -- this repo's own deployment shape
+        (a checkout mounted under another uid)."""
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        refused = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: detected dubious ownership in repository at '/x/therepo'\n",
+        )
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=refused):
+            self.assertEqual(_identity.project_root(plain), (None, True))
+
+    def test_shares_the_one_git_call_with_project_identity(self):
+        """Amendment A6-4: asking both for the same cwd must cost one
+        subprocess, not two -- the whole reason this shares a cache."""
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=done) as run:
+            self.assertEqual(_identity.project_identity("/x/therepo/a"), ("therepo", False))
+            self.assertEqual(_identity.project_root("/x/therepo/a"), ("/x/therepo", False))
+            self.assertEqual(run.call_count, 1)
+            # The other order must be equally cheap: whichever is called
+            # first populates the cache for the other.
+            _identity.project_root("/x/therepo/b")
+            self.assertEqual(run.call_count, 2)
+            _identity.project_identity("/x/therepo/b")
+            self.assertEqual(run.call_count, 2)
+
+    def test_project_identity_return_value_is_unchanged_by_the_refactor(self):
+        """The digest requires project_identity's own return value and
+        behaviour to survive sharing its git call with project_root."""
+        not_a_repo = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"",
+            stderr=b"fatal: not a git repository (or any of the parent directories): .git\n",
+        )
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=not_a_repo):
+            self.assertEqual(_identity.project_identity(plain), ("notarepo", False))
+
+
+class TestCurrentBranch(unittest.TestCase):
+    """TASK-005: session_capture.py and session_inject.py each carried a
+    byte-identical copy of this derivation until it moved here."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _repo_with_a_commit(self, branch="feat/current-branch-test"):
+        """A real repo, on a KNOWN branch name (not whatever `git init`'s
+        default happens to be locally) with one commit -- `rev-parse
+        --abbrev-ref HEAD` fails on a branch with no commits yet."""
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", repo, "checkout", "-q", "-b", branch], check=True, capture_output=True
+        )
+        with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        subprocess.run(["git", "-C", repo, "add", "README.md"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git", "-C", repo,
+                "-c", "user.name=test", "-c", "user.email=test@example.com",
+                "commit", "-q", "-m", "init",
+            ],
+            check=True, capture_output=True,
+        )
+        return repo, branch
+
+    def test_returns_the_branch_name(self):
+        repo, branch = self._repo_with_a_commit()
+        self.assertEqual(_identity.current_branch(repo), branch)
+
+    def test_detached_head_is_none(self):
+        repo, _branch = self._repo_with_a_commit()
+        commit = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True
+        ).stdout.decode().strip()
+        subprocess.run(["git", "-C", repo, "checkout", "-q", commit], check=True, capture_output=True)
+        self.assertIsNone(_identity.current_branch(repo))
+
+    def test_not_a_repo_is_none(self):
+        plain = os.path.join(self.tmp.name, "not-a-repo")
+        os.makedirs(plain)
+        self.assertIsNone(_identity.current_branch(plain))
+
+    def test_git_missing_is_none(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("no such file: git")):
+            self.assertIsNone(_identity.current_branch(self.tmp.name))
+
+
 class TestPluginVersion(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

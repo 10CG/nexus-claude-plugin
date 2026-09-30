@@ -37,6 +37,15 @@ Two different identities are in play and they are NOT interchangeable:
     from the toplevel — running a hook from a subdirectory would list zero
     local files against a full set of server rows and read that as "everything
     was deleted".
+
+``current_branch``
+    The provenance branch tag on every observation / episode row, and half of
+    D's per-container episode grouping key (``container_id``, ``branch``).
+    session_capture.py and session_inject.py each carried a byte-identical
+    copy until TASK-005 (the branch half of the TASK-002 project_slug
+    consolidation) — a divergence here would silently split one branch into
+    two groups the same way a diverging project_slug used to split one
+    project.
 """
 
 import json
@@ -88,23 +97,21 @@ def normalize_slug(text):
 # 25 s deadline. Caching also keeps one run internally consistent: two calls
 # that disagreed (git timing out once) used to overwrite the ledger history
 # (Amendment A5-5). Amendment A6-4.
-_SLUG_CACHE = {}  # cwd -> (slug, degraded)
+#
+# Holds the RAW answer -- (toplevel-or-None, degraded) -- not a derived slug:
+# project_identity's slug and project_root's path (TASK-005, change 2) are two
+# different projections of the same one git call, and caching the raw pair
+# lets both derive their answer from it without a second subprocess. A cwd
+# that resolves is never absent from the dict (the tuple itself, even
+# ``(None, False)``, is not None), so ``.get(cwd) is not None`` still tells
+# "already asked" from "never asked" apart.
+_SLUG_CACHE = {}  # cwd -> (toplevel_or_None, degraded)
 
 
-def project_identity(cwd):
-    """``(slug, degraded)``: the project slug and whether it is a guess.
-
-    The slug is the git toplevel basename; outside a repository it is the cwd
-    basename, and that fallback is fine. ``degraded`` is True when git could
-    not be *asked* -- it timed out, is not installed, or refused to answer for
-    a directory that is a repository (``dubious ownership``) -- so the
-    fallback may name a different project than the one the rows are keyed by. That is not
-    fine: ``user_id`` derives from the same call, and one git hiccup would
-    file a whole run of writes under a different user_id, invisible to the
-    next run and to the orphan reconciliation (which lists rows by the new
-    id). A writer must record ``identity_unresolved`` and skip, not guess
-    (TASK-010 pre-merge review A8-4). Memoised per process by ``cwd``: one
-    git call per run, and one answer per run (Amendment A6-4).
+def _resolved_root(cwd):
+    """The one ``git rev-parse --show-toplevel`` call this process makes for
+    ``cwd``. Shared by project_identity and project_root (TASK-005): a run
+    that asks both pays for a single subprocess, not two (Amendment A6-4).
     """
     cached = _SLUG_CACHE.get(cwd)
     if cached is not None:
@@ -128,10 +135,53 @@ def project_identity(cwd):
     except Exception:  # timeout, no git binary, a cwd that vanished
         toplevel = None
         degraded = True
+    resolved = (toplevel, degraded)
+    _SLUG_CACHE[cwd] = resolved
+    return resolved
+
+
+def project_identity(cwd):
+    """``(slug, degraded)``: the project slug and whether it is a guess.
+
+    The slug is the git toplevel basename; outside a repository it is the cwd
+    basename, and that fallback is fine. ``degraded`` is True when git could
+    not be *asked* -- it timed out, is not installed, or refused to answer for
+    a directory that is a repository (``dubious ownership``) -- so the
+    fallback may name a different project than the one the rows are keyed by. That is not
+    fine: ``user_id`` derives from the same call, and one git hiccup would
+    file a whole run of writes under a different user_id, invisible to the
+    next run and to the orphan reconciliation (which lists rows by the new
+    id). A writer must record ``identity_unresolved`` and skip, not guess
+    (TASK-010 pre-merge review A8-4). Memoised per process by ``cwd``: one
+    git call per run, and one answer per run (Amendment A6-4).
+    """
+    toplevel, degraded = _resolved_root(cwd)
     base = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
-    identity = (normalize_slug(base), degraded)
-    _SLUG_CACHE[cwd] = identity
-    return identity
+    return normalize_slug(base), degraded
+
+
+def project_root(cwd):
+    """``(toplevel, degraded)``: the git toplevel for ``cwd``, or ``None``.
+
+    TASK-005 (change 2, the handoff-sync hook needs an actual directory to
+    list, not just a slug to key rows by). Shares project_identity's single
+    memoised git call -- calling both for the same ``cwd`` costs one
+    subprocess, not two.
+
+    ``toplevel`` is ``None`` in exactly the two cases project_identity's own
+    internal toplevel is: outside a git repository (``degraded`` False, git
+    answered and the answer is "no") and git could not be asked at all --
+    missing, timed out, or refused (``dubious ownership``) -- (``degraded``
+    True). Unlike ``project_slug``, this function does not invent a
+    directory for the ``None`` case: the basename fallback belongs to
+    project_identity's slug, not to a path callers will pass to ``open()`` or
+    ``os.listdir()``. Each caller decides its own fallback (handoff_sync.py
+    falls back to ``cwd`` itself either way, so a project outside a
+    repository -- or one git could not be asked about -- still gets to look
+    for handoff files under its own cwd; only the WRITE is refused when
+    ``degraded``, via ``identity_degraded`` on ``IngestClient``).
+    """
+    return _resolved_root(cwd)
 
 
 def project_slug(cwd):
@@ -148,6 +198,34 @@ def project_slug(cwd):
 def user_id(cwd):
     """The Nexus user_id rows are keyed by — same source as project_slug."""
     return os.environ.get("NEXUS_DEFAULT_USER_ID") or project_slug(cwd)
+
+
+def current_branch(cwd):
+    """The current git branch for ``cwd``, or None.
+
+    None covers three cases callers must not distinguish: not a git
+    repository, a detached HEAD (nothing to scope by), and git failing or
+    timing out — a hung git (NFS, a stale index lock) must not cost a hook
+    more than this call's own 5 s budget. Not memoised like
+    ``project_identity``: every existing caller asks once per run already,
+    so there is no repeated-call cost here to amortise (contrast
+    ``_SLUG_CACHE``'s docstring, where a single ledger-reporting run was
+    measured asking 11 times).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        branch = result.stdout.decode().strip()
+        if not branch or branch == "HEAD":  # detached HEAD -> no branch
+            return None
+        return branch
+    except Exception:
+        return None
 
 
 def container_id():

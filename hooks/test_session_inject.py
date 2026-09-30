@@ -742,7 +742,7 @@ class TestSharedModulesUnavailable(_LedgerCase):
     def _copy_hook_without(self, *missing):
         target = os.path.join(self.tmp.name, "partial-install")
         os.makedirs(target)
-        for name in ("session_inject.py", "_identity.py", "_hook_state.py"):
+        for name in ("session_inject.py", "_identity.py", "_hook_runner.py", "_hook_state.py"):
             if name not in missing:
                 shutil.copy(os.path.join(_HOOKS_DIR, name), target)
         return os.path.join(target, "session_inject.py")
@@ -772,6 +772,17 @@ class TestSharedModulesUnavailable(_LedgerCase):
         stdout, code, stderr = _run_hook(json.dumps({"cwd": self.cwd}), script=script, want_stderr=True)
         self.assertEqual((stdout, code), (b"", 0))
         self.assertIn("_identity", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_as_a_script_without_the_hook_runner_module_it_exits_zero_and_says_why(self):
+        """R1-c31 (TASK-005 R1 fix round): `_hook_runner` became a REQUIRED
+        import here (TASK-005's "third user" consolidation) but never had
+        its own missing-module case, unlike `_identity` and `_hook_state`
+        above -- `_copy_hook_without` always included it."""
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code, stderr = _run_hook(json.dumps({"cwd": self.cwd}), script=script, want_stderr=True)
+        self.assertEqual((stdout, code), (b"", 0))
+        self.assertIn("_hook_runner", stderr)
         self.assertNotIn("Traceback", stderr)
 
 
@@ -1137,11 +1148,16 @@ def _entry(reason, ts, ok=None, hook="session-capture"):
 class _ReportCase(_LedgerCase):
     """A project whose session-inject ledger already holds one clean run, so
     this is not the very first session start (a missing capture ledger is only
-    news after a SessionEnd has had the chance to fire)."""
+    news after a SessionEnd has had the chance to fire). handoff-sync (change
+    2 TASK-005, the second _EXPECTED_LEDGERS member) is seeded clean too, so
+    existing tests that assert quiet stay quiet by default; a test that wants
+    to exercise handoff-sync's own reporting overwrites this with its own
+    _write_ledger("handoff-sync", ...) call."""
 
     def setUp(self):
         super().setUp()
         self._write_ledger("session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")])
+        self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
 
     def _write_ledger(self, hook, entries):
         path = _hook_state.ledger_path(hook, self.cwd)
@@ -1343,6 +1359,108 @@ class TestReportDelivery(_ReportCase):
         self.assertEqual(code, 0, stderr)
         parsed = json.loads(stdout)
         self.assertIn("http_error", parsed["systemMessage"])
+
+
+class TestUpgradeGracePeriod(_LedgerCase):
+    """Ruling 4 (TASK-005 R1 fix round, R1-c21): a hook newly present in
+    _EXPECTED_LEDGERS (handoff-sync was the first addition after
+    session-capture) must not be reported "has never recorded a run" on the
+    very first SessionStart after it appeared -- its own first SessionEnd
+    has not happened yet, which is not the hook failing to fire.
+
+    Unlike _ReportCase (which seeds a clean handoff-sync ledger specifically
+    to sidestep this false alarm, see its own docstring), these tests leave
+    handoff-sync's ledger absent on purpose -- that absence is the whole
+    point being tested.
+    """
+
+    def _write_ledger(self, hook, entries):
+        path = _hook_state.ledger_path(hook, self.cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(entries if isinstance(entries, str) else json.dumps(entries))
+
+    def _established_project(self):
+        """An existing project, past its very first SessionStart, whose
+        state predates handoff-sync's addition to _EXPECTED_LEDGERS: no
+        `seen_expected_ledgers` key in state at all, and no handoff-sync
+        ledger either."""
+        self._write_ledger(
+            "session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")]
+        )
+        self._write_ledger("session-capture", [_entry("none", "2026-09-20T10:00:00Z")])
+
+    def test_a_newly_expected_hook_is_not_reported_on_the_first_start_after_it_appears(self):
+        self._established_project()
+        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        parsed = json.loads(out) if out else None
+        self.assertIsNone(parsed, "handoff-sync must not be reported on its grace-period start")
+        state, reasons = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(reasons, [])
+        self.assertEqual(state.get(_MOD._SEEN_EXPECTED_LEDGERS_KEY), list(_MOD._EXPECTED_LEDGERS))
+
+    def test_the_hook_is_reported_missing_on_the_following_start(self):
+        self._established_project()
+        self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # the grace-period start
+
+        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # the NEXT one
+        parsed = json.loads(out)
+        self.assertIn("handoff-sync", parsed["systemMessage"])
+        self.assertIn("never", parsed["systemMessage"])
+
+    def test_a_fresh_install_stays_quiet_for_every_expected_hook(self):
+        """A6-2's rule, kept: session-inject's OWN ledger has no entries at
+        all -- the very first SessionStart, before either hook has had a
+        chance to run -- stays quiet regardless of `seen_expected_ledgers`."""
+        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        parsed = json.loads(out) if out else None
+        self.assertIsNone(parsed)
+
+    def test_a_hook_missing_before_the_key_existed_is_reported_immediately(self):
+        """Legacy state (written before `seen_expected_ledgers` existed) has
+        no such key at all, which reads as the OLD set, {"session-capture"}
+        -- so a MISSING session-capture ledger (already expected before this
+        fix shipped) is reported right away, not given a grace period it
+        does not need. handoff-sync stays quiet in the same run (its own
+        grace period, per the test above)."""
+        self._write_ledger(
+            "session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")]
+        )
+        # session-capture ledger absent; no seen_expected_ledgers state key.
+        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        parsed = json.loads(out)
+        self.assertIn("session-capture", parsed["systemMessage"])
+        self.assertIn("never", parsed["systemMessage"])
+        self.assertNotIn("handoff-sync", parsed["systemMessage"])
+
+    def test_an_unhashable_element_in_seen_expected_ledgers_does_not_wedge_the_report_forever(self):
+        """R3-c08: `set(seen_raw)` alone raises `TypeError` on an unhashable
+        element (a stray list/dict, however it got there) -- which used to
+        escape `_failure_report` entirely. `_collect`'s own `except
+        Exception` net catches it, but that leaves `run["marks"]` at its
+        initial `None`, and `_record` reads `marks is None` as "the
+        ledgers were never read this run" and skips the very persist that
+        would otherwise have repaired the bad value -- so every LATER
+        SessionStart hit the identical `TypeError` again, with no
+        self-healing write to ever break the loop, and every OTHER hook's
+        own failures (session-capture's included) went unreported right
+        alongside it."""
+        self._write_ledger(
+            "session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")]
+        )
+        self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-20T10:00:00Z")])
+        _hook_state.update_state(
+            "session-inject",
+            self.cwd,
+            lambda s: {**s, _MOD._SEEN_EXPECTED_LEDGERS_KEY: ["session-capture", ["nested", "list"]]},
+        )
+        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        parsed = json.loads(out)
+        self.assertIn("session-capture", parsed["systemMessage"])  # the report still works
+        state, reasons = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(reasons, [])
+        self.assertEqual(state.get(_MOD._SEEN_EXPECTED_LEDGERS_KEY), list(_MOD._EXPECTED_LEDGERS))  # repaired
 
 
 class TestExpectedLedgersMatchTheManifest(unittest.TestCase):
