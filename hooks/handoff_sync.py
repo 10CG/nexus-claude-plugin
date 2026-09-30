@@ -356,12 +356,21 @@ def _candidates(handoff_dir):
                 # itself -- as opposed to FileNotFoundError -- is NOT "gone
                 # by the time we looked": something is still there and this
                 # run simply cannot resolve it (a directory that lost its
-                # execute/search bit is the common real-world shape, see
-                # the test with the same name below). The old code read
-                # ANY OSError here the same as FileNotFoundError, quietly
-                # dropping the candidate and, if it was the only one,
-                # landing on `no_handoff` -- exactly the silent stop ruling
-                # 5 / ruling 13 rule out. Falls through to the same
+                # execute/search bit is the common real-world shape --
+                # R5-c10: this used to say "see the test with the same
+                # name below", which cannot be right in a SOURCE file with
+                # no tests in it at all; the tests actually live in
+                # test_handoff_sync.py's TestLocate:
+                # test_an_unstattable_candidate_entry_is_pointer_
+                # unresolved_not_quiet (mocked) and its real_chmod sibling
+                # pin THIS branch alone; test_an_unstattable_candidates_
+                # own_lstat_failure_does_not_sabotage_a_healthy_sibling
+                # (R5-c06) additionally pins that ONE such entry does not
+                # take a healthy sibling candidate down with it). The old
+                # code read ANY OSError here the same as FileNotFoundError,
+                # quietly dropping the candidate and, if it was the only
+                # one, landing on `no_handoff` -- exactly the silent stop
+                # ruling 5 / ruling 13 rule out. Falls through to the same
                 # `undecidable.append` below as a successful lstat does.
                 pass
             undecidable.append(name)
@@ -372,32 +381,87 @@ def _candidates(handoff_dir):
 
 
 def _pointer_target(handoff_dir):
-    """The basename ``latest.md`` points to, or ``None`` -- covers a missing
+    """``(target, unresolved)``: ``target`` is the basename ``latest.md``
+    points to, or ``None`` when there is no pointer to follow -- a missing
     ``latest.md``, a multi-track deprecation banner (no ``**Latest**:``
-    line), and the deprecated arrow-style pointer alike: none of those match
-    the collector pattern, so the caller falls back to the newest
-    ``updated-at`` among the candidates.
+    line), or the deprecated arrow-style pointer: none of those match the
+    collector pattern, and none of them is "wrong", so the caller falls
+    back to the newest ``updated-at`` among the candidates QUIETLY. Exactly
+    one of ``target`` / ``unresolved`` can be meaningful at a time, but both
+    can be ``None`` together (no pointer line found in an otherwise
+    perfectly readable ``latest.md``).
 
-    ``os.path.isfile`` is checked before ``open`` (R1-c13): without it, a
-    FIFO or a device node named ``latest.md`` can block the read for as long
-    as the hook's own work budget allows, rather than reading as "no
-    pointer" the way any other unreadable file here does. The read itself is
-    capped (``_MAX_DOCUMENT_CHARS``) for the same reason a regular file that
-    is merely huge must not be read in full just to find one pointer line.
+    ``unresolved``, when not ``None``, is a short description of why
+    ``latest.md`` itself could not be resolved at all -- a dangling or
+    self-referential (``ELOOP``) symlink, a directory, a permission error, a
+    stale handle (R5-c01). This is a DIFFERENT shape from "no pointer": a
+    project that genuinely keeps no ``latest.md`` must stay quiet, but one
+    whose ``latest.md`` exists in SOME form and cannot be resolved must not
+    have that read failure silently reinterpreted as "no pointer" -- the
+    old ``os.path.isfile`` check folded both into the exact same ``False``,
+    so the newest-``updated-at`` fallback below ran anyway and could
+    silently pick a DIFFERENT document than the one the (unreadable)
+    pointer might actually have named -- exactly the silent which-document
+    swap ruling 13 forbids, and the same shape R4-c03 already closes one
+    level down (an EXPLICIT pointer TARGET landing in ``undecidable``) --
+    this is the pointer FILE itself being unresolvable. The caller
+    (``_locate``) decides what an ``unresolved`` result means: with two or
+    more candidates to choose between it reports ``pointer_unresolved``
+    (guessing could ingest the wrong one); with only ONE candidate there is
+    nothing else ``latest.md`` could have named, so that leg falls through
+    unchanged and quiet (R2-c13's FIFO fixture stays green).
+
+    ``os.lstat`` -- not ``os.path.isfile``, which this replaces -- is
+    checked FIRST specifically so a genuinely ABSENT ``latest.md``
+    (``FileNotFoundError``, the overwhelmingly common case: every project
+    without a hand-maintained pointer) is told apart from one that exists
+    in SOME form but cannot be resolved. ``os.path.isfile`` silently folded
+    a dangling symlink, ``ELOOP``, and a directory into the exact same
+    ``False`` a missing file produces; R1-c13 added it only to keep a FIFO
+    or device node from being opened, a guard that still holds below.
+
+    Once something is confirmed to exist, ``os.stat`` (which DOES follow
+    symlinks, unlike the ``lstat`` just used to confirm presence) resolves
+    what is actually at the far end of the path -- WITHOUT opening it, so a
+    FIFO or a device node cannot block this call the way ``open()`` would
+    (R1-c13: ``stat()`` reads metadata only, it does not wait for a writer
+    the way opening a FIFO does -- confirmed empirically against R2-c13's
+    own FIFO fixture). Anything other than a regular file at that point (a
+    directory, FIFO, device, or a dangling/looping symlink ``stat`` itself
+    cannot resolve) is ``unresolved`` and is never opened.
+
+    The read itself is capped (``_MAX_DOCUMENT_CHARS``) for the same reason
+    a regular file that is merely huge must not be read in full just to
+    find one pointer line.
     """
     path = os.path.join(handoff_dir, _LATEST_MD)
-    if not os.path.isfile(path):
-        return None
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None, None  # the ordinary case: no latest.md at all
+    except OSError as exc:
+        # Something (usually the ENCLOSING directory) makes even the
+        # existence check itself fail -- same "cannot tell" shape as the
+        # two legs below, just caught one step earlier.
+        return None, f"{exc!r}"
+    try:
+        resolved = os.stat(path)
+    except OSError as exc:  # a dangling or self-referential (ELOOP) symlink
+        return None, f"{exc!r}"
+    if not stat.S_ISREG(resolved.st_mode):
+        # A directory, FIFO, device node, socket: something IS configured
+        # at this path, but it is not a file this hook may open (R1-c13).
+        return None, "not a regular file"
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read(_MAX_DOCUMENT_CHARS)
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"{exc!r}"
     match = _LATEST_POINTER_RE.search(text)
     if not match:
-        return None
+        return None, None  # no pointer line: multi-track banner / arrow style / mismatch
     target = match.group(1).strip()
-    return os.path.basename(target) if target else None
+    return (os.path.basename(target) if target else None), None
 
 
 def _probe_frontmatter(path):
@@ -460,25 +524,30 @@ def _locate(handoff_dir, extra=None):
     ``extra``, given (R2-c04), is a ledger ``extra`` dict updated in place
     with a ``detail`` key on every ``pointer_unresolved`` exit: the
     several origins -- unlistable directory, every candidate undecidable,
-    a pointer naming an undecidable entry, candidates that exist but none
-    resolved a timestamp, a candidate that could not even be READ to
-    compare -- read identically on the ledger otherwise, and stderr from a
-    SessionEnd hook is not a channel anyone reads. ``None`` (the default)
-    skips this -- callers that only care about the reason, like most of
-    this file's own tests, need not provide one. Every such exit EXCEPT
-    the last (R4-c16: this used to claim ALL of them, which stopped being
-    true the moment a second exit existed) also calls ``_warn``
-    (R3-c03/c04): a bare ``print`` here, on a closed stderr pipe, would
-    raise BrokenPipeError OUT of this function (a ``ConnectionError``
-    subclass, which ``_hook_state.reason_for_exception`` reads as
-    ``http_error`` one layer up) before ``extra["detail"]`` was ever set
-    -- turning "docs/handoff could not be listed" into a misleading
-    network-failure report with no detail at all. The "no candidate
-    resolved a parseable updated-at" exit only sets ``detail``, with no
-    matching ``_warn`` call -- an existing asymmetry, not something this
-    revision changes; a future author adding one should keep it or, if
-    intentionally leaving it out, drop this parenthetical instead of
-    re-widening the claim back to "every exit".
+    latest.md itself unresolved with more than one candidate to choose
+    between (R5-c01), a pointer naming an undecidable entry, a candidate
+    that could not even be READ to compare, candidates that exist but none
+    resolved a timestamp -- read identically on the ledger otherwise, and
+    stderr from a SessionEnd hook is not a channel anyone reads. ``None``
+    (the default) skips this -- callers that only care about the reason,
+    like most of this file's own tests, need not provide one. Every such
+    exit calls ``_warn`` (R3-c03/c04) EXCEPT ONE -- "no candidate resolved
+    a parseable updated-at", the LAST `return` in this function's own
+    source order -- which only sets ``detail`` (R4-c16: an earlier
+    revision of this paragraph claimed ALL exits called `_warn`, which
+    stopped being true the moment a second exit existed; R5-c10 then found
+    the revision that was meant to correct that instead pointed at the
+    wrong item in THIS paragraph's own listing -- "the last" refers to
+    the last `return` in the function body, not whichever origin happens
+    to be listed last in this prose). A bare ``print`` here, on a closed
+    stderr pipe, would raise BrokenPipeError OUT of this function (a
+    ``ConnectionError`` subclass, which ``_hook_state.reason_for_exception``
+    reads as ``http_error`` one layer up) before ``extra["detail"]`` was
+    ever set -- turning "docs/handoff could not be listed" into a
+    misleading network-failure report with no detail at all. A future
+    author adding a `_warn` call to that one remaining silent exit should
+    update this paragraph rather than re-widening the claim back to
+    "every exit calls _warn, full stop".
     """
     try:
         candidates, undecidable = _candidates(handoff_dir)
@@ -514,7 +583,28 @@ def _locate(handoff_dir, extra=None):
             extra["detail"] = _short(detail)
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
-    target = _pointer_target(handoff_dir)
+    target, pointer_unresolved = _pointer_target(handoff_dir)
+    if pointer_unresolved is not None and len(candidates) > 1:
+        # R5-c01 / ruling 13: latest.md exists in SOME form but could not
+        # be resolved (a dangling or self-referential symlink, a
+        # directory, a permission error, a stale handle) -- a DIFFERENT
+        # shape from simply being absent. With two or more candidates to
+        # choose between, silently falling through to the newest-
+        # `updated-at` scan below risks ingesting a DIFFERENT document
+        # than whatever the unreadable pointer might actually have named
+        # -- the same silent which-document swap R4-c03 already closes one
+        # level down (an EXPLICIT pointer TARGET landing in
+        # `undecidable`), just caught here for the pointer FILE itself.
+        # With only ONE candidate there is nothing else it could have
+        # named, so that leg falls through unchanged below (`target` is
+        # `None` here, which never matches a real filename, so the
+        # fallback scan runs exactly as it would for a genuinely absent
+        # pointer) -- R2-c13's FIFO fixture stays quiet, not a failure.
+        detail = f"latest.md: {pointer_unresolved}"
+        if extra is not None:
+            extra["detail"] = _short(detail)
+        _warn(f"[{HOOK}] {detail}")
+        return None, "pointer_unresolved"
     if target in candidates:  # None never matches a real filename
         return target, None
     if target is not None and target in undecidable:
@@ -1245,25 +1335,54 @@ class _StderrGuard:
     time, so replacing the attribute here protects writes from ANY module,
     not just this file's own.
 
-    A write failing here is swallowed and, on the FIRST such failure, the
-    underlying file descriptor is redirected to ``os.devnull`` via
-    ``_silence_stderr`` -- the same dance ``_warn`` already does for its
-    own writes (R3-c03) -- so CPython's own unconditional reflush at
-    shutdown lands on a descriptor that accepts anything, instead of
-    retrying the exact same failed bytes against the exact same closed
-    pipe a second time with no Python-level ``except`` anywhere near it
-    (exit 120, R4-c04).
+    A write failing here is swallowed by the ``except OSError`` below, and
+    NOT only on the first such failure (R5-c10): that clause protects
+    EVERY call through this object, including the ``.flush()`` CPython's
+    own unconditional reflush at shutdown makes against this SAME guard
+    again -- the identical except catches that retry too, whichever
+    attempt it is. Redirecting the underlying file descriptor to
+    ``os.devnull`` via ``_silence_stderr``, on the FIRST such failure --
+    the same dance ``_warn`` already does for its own writes (R3-c03) --
+    stops a LATER write through this object from failing at all, which is
+    worth doing, but is not what keeps exit at 0 for anything that reaches
+    this class specifically: an EARLIER revision of this paragraph
+    conflated the two (confirmed empirically: a ``_silence_stderr``
+    mutated to a true no-op still leaves every closed-pipe subprocess test
+    that reaches ``main()`` -- and therefore this wrapper -- exiting 0).
+    Contrast ``_warn``'s own bare top-level guard, protecting the three
+    import-guard ``print`` calls above (R4-c04): those run BEFORE this
+    class is ever installed, against the raw, unwrapped stream, with no
+    per-call ``except`` of its own -- there, ``_silence_stderr`` really is
+    the only thing standing between the first failure and CPython's later,
+    uncaught retry (exit 120; the same mutation applied there instead
+    makes exactly those tests start failing).
 
     ``real`` may itself be ``None`` (R4-c07): ``sys.stderr`` -- what this
     wraps -- is ``None``, never a stream, when fd 2 was already closed
     BEFORE the interpreter even started. Calling ``.write``/``.flush`` on
     ``None`` would raise ``AttributeError``, which the ``except OSError``
-    below does NOT catch -- that exception would escape this wrapper (and,
-    at interpreter shutdown, is exactly as fatal as the closed-pipe
-    ``OSError`` this class otherwise protects against). There is no real
-    file descriptor behind a ``None`` stream to redirect either, so both
-    methods simply no-op in that case, same as after ``_silence_stderr``
-    has already run once.
+    above does NOT catch -- that exception escapes this wrapper, with a
+    DIFFERENT consequence depending on which thread hits it (R5-c02: an
+    earlier revision of this paragraph claimed one "exactly as fatal (exit
+    120)" outcome for both, confirmed wrong for the second). On the MAIN
+    thread -- ``_warn``'s own final diagnostic call in ``main()``, after
+    the work thread has already finished -- nothing between it and
+    ``__main__``'s own blanket ``except Exception`` catches anything
+    narrower, so CPython's later shutdown reflush hits the same unguarded
+    ``None`` a second time with no Python-level ``except`` left at all:
+    exit 120, confirmed empirically. On the WORK thread -- ``_ingest_
+    client``'s own prints, this class's PRIMARY motivation (see above) --
+    ``_hook_runner.run_with_deadline`` catches ``AttributeError`` the same
+    as any other ``Exception`` its target raises, turns it into
+    ``outcome["error"]``, and ``_hook_state.reason_for_exception`` (which
+    recognises no ``AttributeError`` shape) resolves that to the generic
+    ``unknown`` -- the run ends there, with whatever dedup/write call it
+    was mid-loop on silently abandoned: quieter than exit 120, but the
+    same "silently skips dedup/write" failure this class exists to prevent
+    in the first place (see above), just triggered by ``None`` instead of
+    a closed pipe. There is no real file descriptor behind a ``None``
+    stream to redirect either, so both methods simply no-op in that case,
+    same as after ``_silence_stderr`` has already run once.
     """
 
     def __init__(self, real):
