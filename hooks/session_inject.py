@@ -370,7 +370,23 @@ def _failure_report(cwd):
     # unconditionally afterwards (see below), so it is only ever absent once
     # per hook, on the first start after it was added (or, for legacy state
     # written before this key existed, before the key's own introduction).
-    seen_expected = set(seen_raw) if isinstance(seen_raw, list) else set(_LEGACY_EXPECTED_LEDGERS)
+    #
+    # Each ELEMENT is also type-checked, not just the list itself (R3-c08):
+    # `set(seen_raw)` alone raises `TypeError` on an unhashable element (a
+    # stray list/dict, however it got there), which escapes this function
+    # entirely -- `_collect`'s own `except Exception` catches it, but that
+    # leaves `run["marks"]` at its initial `None`, and `_record` reads
+    # `marks is None` as "the ledgers were never read this run; leave the
+    # markers alone" and skips the persist that would otherwise have
+    # overwritten the bad value. Every later SessionStart hits the exact
+    # same `TypeError` forever, with no self-healing write to break the
+    # loop -- unlike the sibling `reported` key three lines up, which
+    # already has this same `isinstance` guard.
+    seen_expected = (
+        {h for h in seen_raw if isinstance(h, str)}
+        if isinstance(seen_raw, list)
+        else set(_LEGACY_EXPECTED_LEDGERS)
+    )
     own_entries, _ = _hook_state.read_ledger(HOOK, cwd)
     first_start = not own_entries
     marks = {}

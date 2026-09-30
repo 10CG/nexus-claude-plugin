@@ -1433,6 +1433,35 @@ class TestUpgradeGracePeriod(_LedgerCase):
         self.assertIn("never", parsed["systemMessage"])
         self.assertNotIn("handoff-sync", parsed["systemMessage"])
 
+    def test_an_unhashable_element_in_seen_expected_ledgers_does_not_wedge_the_report_forever(self):
+        """R3-c08: `set(seen_raw)` alone raises `TypeError` on an unhashable
+        element (a stray list/dict, however it got there) -- which used to
+        escape `_failure_report` entirely. `_collect`'s own `except
+        Exception` net catches it, but that leaves `run["marks"]` at its
+        initial `None`, and `_record` reads `marks is None` as "the
+        ledgers were never read this run" and skips the very persist that
+        would otherwise have repaired the bad value -- so every LATER
+        SessionStart hit the identical `TypeError` again, with no
+        self-healing write to ever break the loop, and every OTHER hook's
+        own failures (session-capture's included) went unreported right
+        alongside it."""
+        self._write_ledger(
+            "session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")]
+        )
+        self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
+        self._write_ledger("session-capture", [_entry("http_error", "2026-09-20T10:00:00Z")])
+        _hook_state.update_state(
+            "session-inject",
+            self.cwd,
+            lambda s: {**s, _MOD._SEEN_EXPECTED_LEDGERS_KEY: ["session-capture", ["nested", "list"]]},
+        )
+        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        parsed = json.loads(out)
+        self.assertIn("session-capture", parsed["systemMessage"])  # the report still works
+        state, reasons = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(reasons, [])
+        self.assertEqual(state.get(_MOD._SEEN_EXPECTED_LEDGERS_KEY), list(_MOD._EXPECTED_LEDGERS))  # repaired
+
 
 class TestExpectedLedgersMatchTheManifest(unittest.TestCase):
     def test_every_registered_session_end_hook_is_expected_to_leave_a_ledger(self):

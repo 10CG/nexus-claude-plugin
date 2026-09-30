@@ -192,56 +192,75 @@ _H2_RE = re.compile(r"^## ")
 # ── locate ───────────────────────────────────────────────────────────────
 
 def _candidates(handoff_dir):
-    """Regular ``*.md`` files directly in ``handoff_dir`` (non-recursive),
-    excluding ``latest.md`` and ``README.md`` (case-insensitively -- ruling
-    6). ``[]`` when the directory itself does not exist -- the common case,
-    most projects keep no handoffs, and must stay quiet (``no_handoff``).
+    """``(names, undecidable)``: ``names`` -- the resolvable regular ``*.md``
+    files directly in ``handoff_dir`` (non-recursive, sorted), excluding
+    ``latest.md`` and ``README.md`` (case-insensitively -- ruling 6). Both
+    come back ``[]`` when the directory itself does not exist -- the common
+    case, most projects keep no handoffs, and must stay quiet (``no_handoff``).
 
-    Any OTHER ``OSError`` (permission denied, ``ELOOP``, a stale NFS handle)
-    is RE-RAISED rather than folded into that same ``[]``: ruling 5 (R1-c06)
-    -- "cannot tell" is not "no handoff", and reading the two alike is how a
-    broken/unreadable directory goes quiet forever. ``_locate`` below turns
-    the re-raised error into ``pointer_unresolved`` with a stderr line
-    naming it, instead of the silent skip this used to be.
+    Any OTHER ``OSError`` from the top-level ``listdir`` (permission denied,
+    a stale NFS handle) is RE-RAISED rather than folded into that same
+    ``[]``: ruling 5 (R1-c06) -- "cannot tell" is not "no handoff", and
+    reading the two alike is how a broken/unreadable directory goes quiet
+    forever. ``_locate`` below turns the re-raised error into
+    ``pointer_unresolved`` with a stderr line naming it, instead of the
+    silent skip this used to be.
 
     A ``FileNotFoundError`` from ``listdir`` covers two different shapes
     (R2-c03): the ordinary "does not exist at all", and ``handoff_dir``
     itself being a DANGLING symlink (a broken mount, an unlinked shared
     volume) -- something WAS configured here, so that one is re-raised too,
-    same as any other "cannot tell".
+    same as any other "cannot tell". R3-c05 adds a third: the PARENT
+    (``docs/``) being the dangling symlink -- ``os.listdir(handoff_dir)``
+    fails the exact same way (``handoff_dir`` cannot be reached at all), but
+    ``os.path.islink(handoff_dir)`` alone never catches it, since the
+    dangling link sits one level up.
 
-    Each listed entry is STATTED explicitly (following symlinks, same as
-    ``os.path.isfile`` would) rather than filtered with ``os.path.isfile``
-    directly: that function catches ``OSError`` internally and returns
-    ``False``, so an entry that could not be statted at all -- typically
-    ``handoff_dir`` itself lacking the traverse (execute) bit needed to
-    reach entries inside it, the usual result of a recursive ``chmod 644``
-    over a whole ``docs/`` tree -- used to read exactly like "not a regular
-    file", silently dropping every candidate and landing on the quiet
-    ``no_handoff`` instead of the loud "cannot tell" ruling 5 requires. A
-    ``FileNotFoundError`` here, in contrast, is an ordinary race (listed a
-    moment ago, gone by the time this loop reaches it) and stays quiet.
+    ``undecidable`` (R3-c05) names entries that were listed but whose OWN
+    stat could not be resolved -- a dangling ``*.md`` symlink, ``ELOOP`` (a
+    self-referential symlink), a per-entry permission problem -- as opposed
+    to one that is simply GONE by the time this loop reaches it (listed a
+    moment ago, unlinked since: an ordinary race, R2-c03's own reading,
+    kept for that case alone). The two used to be indistinguishable by
+    exception type: ``os.stat`` follows symlinks, so both a vanished entry
+    and a dangling one raise the identical ``FileNotFoundError``. Filtering
+    with ``os.path.isfile`` directly (rather than ``os.stat`` + `S_ISREG``
+    explicitly) would make the same mistake a second way -- that function
+    catches ``OSError`` internally and returns ``False``, so ANY per-entry
+    stat failure reads as "not a regular file" and silently drops the
+    candidate, landing on the quiet ``no_handoff``/a wrong pick instead of
+    the loud "cannot tell" ruling 5 requires. ``os.lstat`` (which does NOT
+    follow the link) is the tell: if IT still finds the entry, something is
+    really there and unresolved (``undecidable``); if it ALSO raises
+    ``FileNotFoundError``, the entry is genuinely gone (a race, dropped
+    quietly, matching R2-c03).
     """
     try:
         names = os.listdir(handoff_dir)
     except FileNotFoundError:
-        if os.path.islink(handoff_dir):
+        if os.path.islink(handoff_dir) or os.path.islink(os.path.dirname(handoff_dir)):
             raise
-        return []
+        return [], []
     except NotADirectoryError:
-        return []
+        return [], []
     out = []
+    undecidable = []
     for name in names:
         if name.upper() in _HANDOFF_EXCLUDED_NAMES_UPPER or not name.endswith(".md"):
             continue
         path = os.path.join(handoff_dir, name)
         try:
             is_file = stat.S_ISREG(os.stat(path).st_mode)
-        except FileNotFoundError:
+        except OSError:
+            try:
+                os.lstat(path)
+            except OSError:
+                continue  # gone even at the symlink-entry level: a real race
+            undecidable.append(name)
             continue
         if is_file:
             out.append(name)
-    return sorted(out)
+    return sorted(out), undecidable
 
 
 def _pointer_target(handoff_dir):
@@ -275,11 +294,22 @@ def _pointer_target(handoff_dir):
 
 def _probe_frontmatter(path):
     """Just enough of a candidate's head to read its frontmatter, for the
-    fallback scan below (which reads every candidate)."""
+    fallback scan below (which reads every candidate).
+
+    Only ``FileNotFoundError`` (the file listed a moment ago is gone by the
+    time this reads it -- an ordinary race) is swallowed to ``{}``. Any
+    OTHER ``OSError`` -- permission denied, a stale NFS handle -- is
+    RE-RAISED (R3-c06): the caller (``_locate``'s fallback scan) must not
+    read "could not open this candidate" the same as "this candidate has
+    no parseable updated-at". The two used to look identical to the
+    fallback scan -- both simply fail to contribute a timestamp -- which
+    let a newer document nobody can currently read lose, silently, to an
+    older one that just happens to still be readable.
+    """
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read(_FRONTMATTER_PROBE_BYTES)
-    except OSError:
+    except FileNotFoundError:
         return {}
     frontmatter, _body = _split_frontmatter(text)
     return frontmatter
@@ -301,32 +331,76 @@ def _locate(handoff_dir, extra=None):
     is the same failure, not the quiet ``no_handoff`` leg: ``_candidates``
     re-raises anything other than "the directory does not exist" for this
     to catch, name on stderr, and fold into the existing failure-class
-    reason rather than inventing a new one.
+    reason rather than inventing a new one. R3-c05 adds a second failure
+    shape at the SAME level: every listed ``*.md`` entry existing only in
+    ``_candidates``'s ``undecidable`` list (a dangling symlink, ``ELOOP``)
+    is "something was configured here, none of it could be resolved" --
+    the same ``pointer_unresolved`` leg, not the quiet one, even though
+    ``listdir`` itself succeeded. A directory with SOME resolvable
+    candidates alongside an undecidable one is not held back by the
+    latter: it is simply left out of the newest-``updated-at`` comparison
+    below, the same as any other document this run cannot see.
 
     ``extra``, given (R2-c04), is a ledger ``extra`` dict updated in place
-    with a ``detail`` key on either ``pointer_unresolved`` exit: the two
-    origins -- unlistable directory vs. candidates that exist but none
-    resolved -- read identically on the ledger otherwise, and stderr from a
-    SessionEnd hook is not a channel anyone reads. ``None`` (the default)
-    skips this -- callers that only care about the reason, like most of
-    this file's own tests, need not provide one.
+    with a ``detail`` key on every ``pointer_unresolved`` exit: the
+    several origins -- unlistable directory, every candidate undecidable,
+    candidates that exist but none resolved a timestamp, a candidate that
+    could not even be READ to compare -- read identically on the ledger
+    otherwise, and stderr from a SessionEnd hook is not a channel anyone
+    reads. ``None`` (the default) skips this -- callers that only care
+    about the reason, like most of this file's own tests, need not provide
+    one. Every such exit also calls ``_warn`` (R3-c03/c04): a bare
+    ``print`` here, on a closed stderr pipe, would raise BrokenPipeError
+    OUT of this function (a ``ConnectionError`` subclass, which
+    ``_hook_state.reason_for_exception`` reads as ``http_error`` one layer
+    up) before ``extra["detail"]`` was ever set -- turning "docs/handoff
+    could not be listed" into a misleading network-failure report with no
+    detail at all.
     """
     try:
-        candidates = _candidates(handoff_dir)
+        candidates, undecidable = _candidates(handoff_dir)
     except OSError as exc:
         detail = f"docs/handoff exists but could not be listed: {exc!r}"
-        print(f"[{HOOK}] {detail}", file=sys.stderr)
+        if extra is not None:
+            extra["detail"] = _short(detail)  # set BEFORE warning (R3-c04)
+        _warn(f"[{HOOK}] {detail}")
+        return None, "pointer_unresolved"
+    if not candidates and not undecidable:
+        return None, "no_handoff"
+    if not candidates:
+        # Every listed *.md entry was undecidable (R3-c05): something WAS
+        # kept here, so this is the loud "cannot tell" leg, not "nothing
+        # here" -- the same distinction ruling 5 draws for an unlistable
+        # directory, one level down.
+        detail = (
+            f"{len(undecidable)} candidate(s) in docs/handoff could not be resolved: "
+            f"{', '.join(undecidable)}"
+        )
         if extra is not None:
             extra["detail"] = _short(detail)
+        _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
-    if not candidates:
-        return None, "no_handoff"
     target = _pointer_target(handoff_dir)
     if target in candidates:  # None never matches a real filename
         return target, None
     newest_name, newest_ts = None, None
     for name in candidates:
-        ts = _parse_instant(_probe_frontmatter(os.path.join(handoff_dir, name)).get("updated-at"))
+        try:
+            frontmatter = _probe_frontmatter(os.path.join(handoff_dir, name))
+        except OSError as exc:
+            # R3-c06: a candidate that IS resolvable as a file but cannot
+            # be READ must not silently lose the newest-updated-at
+            # comparison to an older, readable sibling -- that would ingest
+            # the wrong document and report nothing wrong. Whichever
+            # document turns out to be truly newest is unknowable here, so
+            # this fails loud rather than guessing from what happens to be
+            # readable.
+            detail = f"{name}: frontmatter could not be read to compare updated-at: {exc!r}"
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "pointer_unresolved"
+        ts = _parse_instant(frontmatter.get("updated-at"))
         if ts is not None and (newest_ts is None or ts > newest_ts):
             newest_name, newest_ts = name, ts
     if newest_name:
@@ -438,14 +512,35 @@ def _extract_h1(lines):
     return ""
 
 
+def _is_divider_line(line):
+    """True for a bare Markdown thematic-break line (``---`` / ``***`` /
+    ``___``, three or more, optional surrounding whitespace) -- R3-c07.
+
+    The real Aria template (``aria/templates/session-handoff.md``) puts one
+    of these immediately before EVERY ``## §N`` heading, itself included:
+    a handoff whose author deleted §6/§2's body but left the heading and
+    that trailing divider in place -- exactly ruling 3 / R1-c01's "template
+    skeleton not filled in" -- reads as heading, blank line, ``---``. The
+    ``---`` line IS technically non-whitespace, so the plain
+    ``line.strip()`` truthiness check ``_extract_section`` used to rely on
+    read it as content and shipped "## §2 ...\\n\\n---" as a real episode.
+    """
+    stripped = line.strip()
+    return len(stripped) >= 3 and stripped in (
+        "-" * len(stripped), "*" * len(stripped), "_" * len(stripped)
+    )
+
+
 def _extract_section(lines, start_re):
     """The heading line matching ``start_re`` through the line before the
     next ``## `` heading (subsections included), or ``""`` when the section
     is not present at all -- OR present only as a bare heading with nothing
-    but blank lines under it (ruling 3, TASK-005 R1 fix round, R1-c01): a
-    freshly created handoff whose §6/§2 still just carry the template
-    heading is not "content", and must not be read as one. Subsection
-    headings and any other non-blank line under the heading still count.
+    but blank lines (or a bare divider line, R3-c07) under it (ruling 3,
+    TASK-005 R1 fix round, R1-c01): a freshly created handoff whose §6/§2
+    still just carry the template heading -- and, in the real template,
+    the ``---`` divider that trails every section -- is not "content", and
+    must not be read as one. Subsection headings and any other non-blank,
+    non-divider line under the heading still count.
     """
     start = None
     for i, line in enumerate(lines):
@@ -459,7 +554,9 @@ def _extract_section(lines, start_re):
         if _H2_RE.match(lines[j]):
             end = j
             break
-    if not any(line.strip() for line in lines[start + 1 : end]):
+    if not any(
+        line.strip() and not _is_divider_line(line) for line in lines[start + 1 : end]
+    ):
         return ""
     return "\n".join(lines[start:end]).strip()
 
@@ -589,15 +686,28 @@ def _cap_for_wire(content):
     or two passes for any realistic document; the loop is additionally
     capped at ``_CONTENT_CAP`` iterations as a hard ceiling against a
     pathological future redaction rule that never converges.
+
+    ``limit`` is derived from ``content``'s OWN current length, not from
+    ``_CONTENT_CAP`` (R3-c02: the previous ``limit -= overflow``, starting
+    from ``_CONTENT_CAP`` itself, computed a limit LARGER than
+    ``len(content)`` whenever ``content`` sat in the band
+    ``(_CONTENT_CAP - G, _CONTENT_CAP - G/2]`` -- ``G`` the net character
+    growth one redaction hit adds (23 for the shortest URL-userinfo match
+    against its 4-character minimum: net +19). The old
+    ``len(content) <= limit`` escape hatch then read as "already short
+    enough", returning ``content`` UNCHANGED even though its REDACTED
+    form -- what ``_ingest_client`` actually puts on the wire -- exceeded
+    the cap by as much as ``G/2``. Computing ``limit`` from ``len(content)``
+    itself means that check can only ever be true when there is genuinely
+    nothing left to cut.
     """
-    limit = _CONTENT_CAP
     for _ in range(_CONTENT_CAP):
         redacted, _hits = _redact.redact_text(content)
         overflow = len(redacted) - _CONTENT_CAP
         if overflow <= 0:
             return content
-        limit -= overflow
-        if limit <= 0 or len(content) <= limit:
+        limit = len(content) - overflow
+        if limit <= 0:
             # Nothing left to safely cut (e.g. the whole thing is one
             # matched secret) -- leave it to _ingest_client / the backend
             # rather than mangle it further.
@@ -853,7 +963,19 @@ def _record(reason, started, run, work_left_behind):
     primitive this fix does not add; a second, independent
     ``state_write_failed`` row is what stays inside the existing public
     surface (Amendment A9 -- the exact shape of "must not vanish" is an
-    owner question, not decided here).
+    owner question, not decided here) -- but ONLY when the persist
+    genuinely failed (R3-c01, see ``write`` below): ``update_state``'s own
+    ``reasons`` list is not a pass/fail flag by itself. A degraded lock
+    (``lock_unavailable``) or a corrupt state file it just repaired
+    (``unknown``) both still finish the write -- ``_hook_state._locked``
+    degrades to writing UNLOCKED rather than dropping the write, and a
+    corrupt ``read_state`` rebuilds from empty rather than aborting -- so
+    treating ANY non-empty ``reasons`` as failure appended a SPURIOUS
+    ``state_write_failed`` row even when the write landed, and since
+    ``session_inject._failure_report`` only reads the ledger's LAST row,
+    that spurious row buried whatever this run's real, correctly-recorded
+    reason was (``identity_changed``, ``dedup_merged``) behind a failure
+    that never happened.
     """
     elapsed_ms = int((time.monotonic() - started) * 1000)
     # R1-c09: a work thread abandoned mid-`upsert` never reaches the line
@@ -876,7 +998,7 @@ def _record(reason, started, run, work_left_behind):
                 extra=extra or None,
             )
         except Exception as exc:  # record_run does not raise by contract; the net under it
-            print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+            _warn(f"[{HOOK}] could not record this run ({reason}): {exc!r}")
         if not persist:
             return
         try:
@@ -886,9 +1008,19 @@ def _record(reason, started, run, work_left_behind):
                 lambda s: {**s, "container_id": _identity.container_id()},
             )
         except Exception as exc:  # noqa: BLE001 - update_state does not raise by contract; the net under it
-            print(f"[{HOOK}] could not persist container_id: {exc!r}", file=sys.stderr)
-            persist_reasons = ["state_write_failed"]
-        if not persist_reasons:
+            _warn(f"[{HOOK}] could not persist container_id: {exc!r}")
+            _new_state, persist_reasons = {}, ["state_write_failed"]
+        if _new_state.get("container_id") == _identity.container_id():
+            # The write landed on disk with the identity this mutate always
+            # sets, whatever `persist_reasons` says about HOW (R3-c01) --
+            # see the docstring above. Trust disk state over the reasons
+            # list.
+            return
+        if "state_write_failed" not in persist_reasons:
+            # A degraded lock or a repaired-corrupt-state whose OWN write
+            # this call cannot otherwise confirm is not this caller's
+            # failure to report (R3-c01): only a genuine
+            # `state_write_failed` means persisting itself is what broke.
             return
         # The row above already recorded this run's true reason; a persist
         # failure found only now is a second, independent fact, not a
@@ -904,7 +1036,7 @@ def _record(reason, started, run, work_left_behind):
                 extra={"detail": _short(f"container_id persist failed after this run ({reason})")},
             )
         except Exception as exc:  # record_run does not raise by contract; the net under it
-            print(f"[{HOOK}] could not record state_write_failed: {exc!r}", file=sys.stderr)
+            _warn(f"[{HOOK}] could not record state_write_failed: {exc!r}")
 
     left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
     if left_behind:
@@ -919,16 +1051,45 @@ def _warn(message):
     """Print one diagnostic line to stderr, never raising (R2-c05).
 
     A closed stderr pipe (the host is already exiting) makes ``print``
-    raise ``BrokenPipeError``; every stderr write ``main()`` itself makes
-    (the ones on the MAIN thread, not already behind one of
-    ``_hook_runner``'s own thread-boundary nets) goes through this instead
-    of a bare ``print`` -- see ``main()`` below for why that ordering, not
-    just this swallow, is what actually protects the ledger row.
+    raise ``BrokenPipeError``; every stderr write this file makes -- on the
+    main thread AND inside ``_record``'s own ledger-write closure, which
+    used to print directly -- goes through this instead of a bare ``print``
+    -- see ``main()`` below for why that ordering, not just this swallow,
+    is what actually protects the ledger row.
+
+    Swallowing the ``OSError`` from THIS call alone is not sufficient on
+    its own (R3-c03): CPython's own interpreter shutdown
+    (``flush_std_files``, behind every plain ``sys.exit()``, not just the
+    ``os._exit`` path ``_hook_runner.finish`` takes when a thread was left
+    behind) unconditionally flushes stdout AND stderr again once this
+    process is on its way out, regardless of what any Python-level
+    ``except`` already caught -- and a buffered writer whose own
+    ``write()`` raised does not discard the bytes it failed to write, so
+    that flush retries the SAME bytes against the SAME closed pipe, with
+    no ``except`` anywhere near it this time (confirmed empirically: a
+    real closed-pipe subprocess with every ``print(..., file=sys.stderr)``
+    already wrapped in a swallowing ``except OSError`` still exits 120).
+    Rerouting the FILE DESCRIPTOR itself to ``os.devnull``, the same way
+    ``session_inject._silence_stdout`` already does for stdout, is what
+    stops the retry from failing too -- it protects every later write to
+    fd 2 from this point on, not just this one call's own.
     """
     try:
         print(message, file=sys.stderr)
     except OSError:
-        pass
+        _silence_stderr()
+
+
+def _silence_stderr():
+    """After a failed stderr write, stop the interpreter retrying it on the
+    way out (R3-c03). See ``_warn`` above for why swallowing the write
+    itself is not enough."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stderr.fileno())
+        os.close(devnull)
+    except Exception:
+        pass  # not a real file descriptor (tests), or nothing left to protect
 
 
 def main():

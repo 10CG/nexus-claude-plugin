@@ -8,9 +8,10 @@ Pure stdlib, and imports nothing from this plugin: unlike ``_hook_state`` (which
 hard-imports ``fcntl`` for its file locks) this module must stay importable on
 any platform a hook itself would otherwise run on, because unlike the ledger
 -- which every hook already treats as optional bookkeeping -- the deadline
-mechanics here wrap the hook's actual job. unittest's `threading.excepthook`
-and `os._exit` are the only "spooky" stdlib surfaces touched, and both are
-documented at the call site below.
+mechanics here wrap the hook's actual job. ``os._exit`` is the only "spooky"
+stdlib surface touched, documented at the call site below (an earlier
+revision of this paragraph also named ``threading.excepthook`` as touched
+here; this module neither sets nor reads it -- R3-c15).
 
 Hook-specific policy stays OUT of this file on purpose: what "the work" is,
 what a reason string means, what gets printed to stderr and why, the ledger's
@@ -165,10 +166,26 @@ def finish(left_behind):
     anyway, because running the normal shutdown sequence matters for
     anything elsewhere in the interpreter that relies on it (buffered file
     writes, atexit handlers), and because there is no daemon thread for
-    this path to protect the process FROM -- a caller that wants the
-    closed-pipe case covered unconditionally, thread or not, has to do
-    what handoff_sync.py's own stderr writes now do: swallow the write
-    failure before it ever reaches this function.
+    this path to protect the process FROM.
+
+    A caller cannot cover the closed-pipe case merely by swallowing a
+    write's own ``OSError`` (R3-c03, correcting an earlier revision of
+    this paragraph that claimed handoff_sync.py's stderr writes already
+    did, by doing exactly that): CPython's shutdown sequence
+    (``flush_std_files``, behind every plain ``sys.exit()``) flushes
+    stdout AND stderr again UNCONDITIONALLY once this function returns
+    control to it, and a buffered writer whose earlier ``write()`` raised
+    does not discard what it failed to write -- the retry targets the
+    SAME closed pipe and fails again, this time with no Python-level
+    ``except`` anywhere near it (confirmed empirically against a real
+    closed pipe, not a mock stand-in: swallowing every explicit
+    ``print(..., file=sys.stderr)`` in a hook still exits 120). The only
+    thing that actually stops the retry from failing too is rerouting the
+    file descriptor itself to ``os.devnull`` on the first failure --
+    ``session_inject._silence_stdout`` for stdout, ``handoff_sync._silence_
+    stderr`` for stderr -- so that BOTH this function's own flush above
+    and the interpreter's later one land on a descriptor that accepts
+    anything.
     """
     if left_behind:
         try:
