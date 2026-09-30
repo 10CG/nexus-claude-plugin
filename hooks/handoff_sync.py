@@ -69,6 +69,83 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+
+def _warn(message):
+    """Print one diagnostic line to stderr, never raising (R2-c05).
+
+    A closed stderr pipe (the host is already exiting) makes ``print``
+    raise ``BrokenPipeError``; every stderr write this file makes -- the
+    three import guards immediately below (R4-c04), the main thread, AND
+    inside ``_record``'s own ledger-write closure, all of which used to
+    print directly -- goes through this instead of a bare ``print`` -- see
+    ``main()`` below for why that ordering, not just this swallow, is what
+    actually protects the ledger row.
+
+    Defined here, before the import guards, and NOT in ``_hook_runner``
+    (R4-c04): this function must keep working when ``_identity`` or
+    ``_hook_runner`` themselves are the missing piece, which is exactly
+    the condition the two guards below exist for -- so it cannot depend on
+    either, or on anything else this file imports from a sibling module.
+
+    Swallowing the ``OSError`` from THIS call alone is not sufficient on
+    its own (R3-c03): CPython's own interpreter shutdown
+    (``flush_std_files``, behind every plain ``sys.exit()``, not just the
+    ``os._exit`` path ``_hook_runner.finish`` takes when a thread was left
+    behind) unconditionally flushes stdout AND stderr again once this
+    process is on its way out, regardless of what any Python-level
+    ``except`` already caught -- and a buffered writer whose own
+    ``write()`` raised does not discard the bytes it failed to write, so
+    that flush retries the SAME bytes against the SAME closed pipe, with
+    no ``except`` anywhere near it this time (confirmed empirically: a
+    real closed-pipe subprocess with every ``print(..., file=sys.stderr)``
+    already wrapped in a swallowing ``except OSError`` still exits 120).
+    Rerouting the FILE DESCRIPTOR itself to ``os.devnull``, the same way
+    ``session_inject._silence_stdout`` already does for stdout, is what
+    stops the retry from failing too -- it protects every later write to
+    fd 2 from this point on, not just this one call's own.
+
+    ``sys.stderr is None`` (R4-c07) is a DIFFERENT shape from a closed
+    PIPE, and is checked first: CPython sets ``sys.stderr`` to ``None``
+    (never a stream object) when fd 2 is already closed BEFORE the
+    interpreter even starts, rather than a pipe that closes mid-run --
+    confirmed empirically. ``print(message, file=None)`` does not raise;
+    it silently FALLS BACK to ``sys.stdout`` (also confirmed empirically),
+    which would put this diagnostic on the one channel a SessionEnd hook's
+    contract requires to stay empty. There is no real file descriptor to
+    redirect in this shape (fd 2 was never opened at all), so this simply
+    skips the write rather than risking stdout.
+    """
+    if sys.stderr is None:
+        return
+    try:
+        print(message, file=sys.stderr)
+    except OSError:
+        _silence_stderr()
+
+
+def _silence_stderr():
+    """After a failed stderr write, stop the interpreter retrying it on the
+    way out (R3-c03). See ``_warn`` above for why swallowing the write
+    itself is not enough.
+
+    ``sys.stderr.fileno()`` is resolved BEFORE ``os.open`` (R4-c08): the
+    reverse order opened the devnull fd first, and if ``fileno()`` then
+    raised (a test double, or any future stderr replacement without a
+    real one) the blanket ``except Exception: pass`` below swallowed that
+    too, but the devnull fd already opened on the line before was never
+    closed -- a leak on every such call.
+    """
+    try:
+        target_fd = sys.stderr.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, target_fd)
+        finally:
+            os.close(devnull)
+    except Exception:
+        pass  # not a real file descriptor (tests), or nothing left to protect
+
+
 try:
     import _identity
 except Exception as exc:  # a broken or partial install
@@ -76,7 +153,7 @@ except Exception as exc:  # a broken or partial install
     # a traceback is exit 1, reported as a hook error on every session end.
     if __name__ != "__main__":
         raise
-    print(f"[handoff-sync] cannot import _identity: {exc!r}", file=sys.stderr)
+    _warn(f"[handoff-sync] cannot import _identity: {exc!r}")
     sys.exit(0)
 
 try:
@@ -84,7 +161,7 @@ try:
 except Exception as exc:  # a broken or partial install
     if __name__ != "__main__":
         raise
-    print(f"[handoff-sync] cannot import _hook_runner: {exc!r}", file=sys.stderr)
+    _warn(f"[handoff-sync] cannot import _hook_runner: {exc!r}")
     sys.exit(0)
 
 try:
@@ -96,7 +173,7 @@ except Exception as exc:
     # itself -- so a platform without it can do nothing useful here either.
     if __name__ != "__main__":
         raise
-    print(f"[handoff-sync] cannot import _ingest_client: {exc!r}", file=sys.stderr)
+    _warn(f"[handoff-sync] cannot import _ingest_client: {exc!r}")
     sys.exit(0)
 
 import _hook_state  # noqa: E402 - guaranteed importable: _ingest_client already imports it
@@ -155,12 +232,22 @@ _LATEST_MD = "latest.md"
 # Frontmatter is always a handful of short lines (session-handoff.md §2.3.1);
 # the fallback-locate scan reads every candidate's, so a bounded probe beats
 # loading each whole document just to compare one timestamp.
-_FRONTMATTER_PROBE_BYTES = 4096
+#
+# Named _CHARS, not _BYTES (R4-c17): every read these two feed is opened
+# text-mode (``encoding="utf-8", errors="replace"``), and ``fh.read(n)`` on
+# a text-mode file reads ``n`` CHARACTERS, not ``n`` bytes -- confirmed
+# empirically (``fh.read(5)`` against 10 repeated 3-byte CJK characters
+# returns exactly 5 of them, not 5 bytes' worth). A CJK-heavy handoff can
+# therefore run to roughly 3x this many bytes on disk (up to 4x for a
+# character requiring 4 UTF-8 bytes) before the cap engages -- the cap
+# still does its job (bounding a FIFO/pathological read), the numbers
+# below just were not what their old _BYTES name implied.
+_FRONTMATTER_PROBE_CHARS = 4096
 # Read caps (R1-c13): a regular file this small is already generous for any
 # real handoff (docs/handoff/*.md run a few KB); the cap exists so a FIFO or
 # a device node masquerading as a *.md file cannot block a read indefinitely
 # or exhaust memory, not because any real document is expected to hit it.
-_MAX_DOCUMENT_BYTES = 1_048_576
+_MAX_DOCUMENT_CHARS = 1_048_576
 
 # The Aria collector's own pointer pattern (standards/conventions/session-
 # handoff.md §3.2 "H5 fix"; also state-scanner's `_LATEST_POINTER_RE`). The
@@ -238,7 +325,15 @@ def _candidates(handoff_dir):
     try:
         names = os.listdir(handoff_dir)
     except FileNotFoundError:
-        if os.path.islink(handoff_dir) or os.path.islink(os.path.dirname(handoff_dir)):
+        docs = os.path.dirname(handoff_dir)
+        # R4-c02: the ancestor leg must fire only for a DANGLING `docs`
+        # symlink -- `os.path.islink(docs)` alone is true for ANY symlink,
+        # whether or not its target exists, so a project whose `docs` is a
+        # perfectly valid symlink (a monorepo's `docs -> website/docs`)
+        # and simply keeps no `handoff/` subdirectory used to be re-raised
+        # here too, turning the ordinary, quiet `no_handoff` case into a
+        # `pointer_unresolved` failure reported every single session.
+        if os.path.islink(handoff_dir) or (os.path.islink(docs) and not os.path.exists(docs)):
             raise
         return [], []
     except NotADirectoryError:
@@ -254,8 +349,21 @@ def _candidates(handoff_dir):
         except OSError:
             try:
                 os.lstat(path)
-            except OSError:
+            except FileNotFoundError:
                 continue  # gone even at the symlink-entry level: a real race
+            except OSError:
+                # R4-c01: EACCES / EIO / ESTALE etc. on the lstat call
+                # itself -- as opposed to FileNotFoundError -- is NOT "gone
+                # by the time we looked": something is still there and this
+                # run simply cannot resolve it (a directory that lost its
+                # execute/search bit is the common real-world shape, see
+                # the test with the same name below). The old code read
+                # ANY OSError here the same as FileNotFoundError, quietly
+                # dropping the candidate and, if it was the only one,
+                # landing on `no_handoff` -- exactly the silent stop ruling
+                # 5 / ruling 13 rule out. Falls through to the same
+                # `undecidable.append` below as a successful lstat does.
+                pass
             undecidable.append(name)
             continue
         if is_file:
@@ -274,7 +382,7 @@ def _pointer_target(handoff_dir):
     FIFO or a device node named ``latest.md`` can block the read for as long
     as the hook's own work budget allows, rather than reading as "no
     pointer" the way any other unreadable file here does. The read itself is
-    capped (``_MAX_DOCUMENT_BYTES``) for the same reason a regular file that
+    capped (``_MAX_DOCUMENT_CHARS``) for the same reason a regular file that
     is merely huge must not be read in full just to find one pointer line.
     """
     path = os.path.join(handoff_dir, _LATEST_MD)
@@ -282,7 +390,7 @@ def _pointer_target(handoff_dir):
         return None
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read(_MAX_DOCUMENT_BYTES)
+            text = fh.read(_MAX_DOCUMENT_CHARS)
     except OSError:
         return None
     match = _LATEST_POINTER_RE.search(text)
@@ -308,7 +416,7 @@ def _probe_frontmatter(path):
     """
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read(_FRONTMATTER_PROBE_BYTES)
+            text = fh.read(_FRONTMATTER_PROBE_CHARS)
     except FileNotFoundError:
         return {}
     frontmatter, _body = _split_frontmatter(text)
@@ -336,33 +444,59 @@ def _locate(handoff_dir, extra=None):
     ``_candidates``'s ``undecidable`` list (a dangling symlink, ``ELOOP``)
     is "something was configured here, none of it could be resolved" --
     the same ``pointer_unresolved`` leg, not the quiet one, even though
-    ``listdir`` itself succeeded. A directory with SOME resolvable
-    candidates alongside an undecidable one is not held back by the
-    latter: it is simply left out of the newest-``updated-at`` comparison
-    below, the same as any other document this run cannot see.
+    ``listdir`` itself succeeded. When there is no pointer naming one of
+    them specifically, a directory with SOME resolvable candidates
+    alongside an undecidable one is not held back by the latter for the
+    FALLBACK scan below: it is simply left out of the newest-``updated-at``
+    comparison, the same as any other document this run cannot see (owner
+    question A9 row c18 -- R4 post_implementation audit -- covers whether
+    that silent exclusion is the right call; unchanged here). A pointer
+    that names one of them EXPLICITLY is a different case, handled before
+    the fallback scan even starts (R4-c03): silently substituting an
+    older, merely-readable sibling for the specific document latest.md
+    points at is exactly the silent which-document swap ruling 13 forbids,
+    so that path reports ``pointer_unresolved`` instead.
 
     ``extra``, given (R2-c04), is a ledger ``extra`` dict updated in place
     with a ``detail`` key on every ``pointer_unresolved`` exit: the
     several origins -- unlistable directory, every candidate undecidable,
-    candidates that exist but none resolved a timestamp, a candidate that
-    could not even be READ to compare -- read identically on the ledger
-    otherwise, and stderr from a SessionEnd hook is not a channel anyone
-    reads. ``None`` (the default) skips this -- callers that only care
-    about the reason, like most of this file's own tests, need not provide
-    one. Every such exit also calls ``_warn`` (R3-c03/c04): a bare
-    ``print`` here, on a closed stderr pipe, would raise BrokenPipeError
-    OUT of this function (a ``ConnectionError`` subclass, which
-    ``_hook_state.reason_for_exception`` reads as ``http_error`` one layer
-    up) before ``extra["detail"]`` was ever set -- turning "docs/handoff
-    could not be listed" into a misleading network-failure report with no
-    detail at all.
+    a pointer naming an undecidable entry, candidates that exist but none
+    resolved a timestamp, a candidate that could not even be READ to
+    compare -- read identically on the ledger otherwise, and stderr from a
+    SessionEnd hook is not a channel anyone reads. ``None`` (the default)
+    skips this -- callers that only care about the reason, like most of
+    this file's own tests, need not provide one. Every such exit EXCEPT
+    the last (R4-c16: this used to claim ALL of them, which stopped being
+    true the moment a second exit existed) also calls ``_warn``
+    (R3-c03/c04): a bare ``print`` here, on a closed stderr pipe, would
+    raise BrokenPipeError OUT of this function (a ``ConnectionError``
+    subclass, which ``_hook_state.reason_for_exception`` reads as
+    ``http_error`` one layer up) before ``extra["detail"]`` was ever set
+    -- turning "docs/handoff could not be listed" into a misleading
+    network-failure report with no detail at all. The "no candidate
+    resolved a parseable updated-at" exit only sets ``detail``, with no
+    matching ``_warn`` call -- an existing asymmetry, not something this
+    revision changes; a future author adding one should keep it or, if
+    intentionally leaving it out, drop this parenthetical instead of
+    re-widening the claim back to "every exit".
     """
     try:
         candidates, undecidable = _candidates(handoff_dir)
     except OSError as exc:
         detail = f"docs/handoff exists but could not be listed: {exc!r}"
         if extra is not None:
-            extra["detail"] = _short(detail)  # set BEFORE warning (R3-c04)
+            extra["detail"] = _short(detail)
+        # This order (detail set, THEN _warn) is no longer load-bearing on
+        # its own (R4-c16): the ORIGINAL reason for it, back when `_warn`
+        # was a bare `print`, was that a BrokenPipeError from that print
+        # would escape this function before `extra["detail"]` was ever
+        # reached. R3-c03 made `_warn` itself never raise, for exactly
+        # this reason among others -- so swapping this order today changes
+        # nothing a test can observe (confirmed: an equivalent-mutant
+        # check, not a gap). Kept in THIS order anyway, matching every
+        # other exit below, because "the ledger detail is always set
+        # before any stderr write is even attempted" is simpler to reason
+        # about than "it happens to not matter here".
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
     if not candidates and not undecidable:
@@ -383,6 +517,23 @@ def _locate(handoff_dir, extra=None):
     target = _pointer_target(handoff_dir)
     if target in candidates:  # None never matches a real filename
         return target, None
+    if target is not None and target in undecidable:
+        # R4-c03 / ruling 13: latest.md explicitly names this entry, and it
+        # IS listed -- just unresolved (a dangling symlink, ELOOP, a
+        # per-entry permission problem). Falling through to the
+        # newest-updated-at scan below would silently ingest a DIFFERENT,
+        # older document instead of the one the pointer actually names,
+        # with a clean-looking ledger row: exactly the silent
+        # which-document swap ruling 13 forbids. This is deliberately
+        # narrower than the fallback scan a few lines down (owner question
+        # A9 row c18): only an EXPLICIT pointer resolving to an
+        # undecidable entry fails loud here; the no-pointer fallback still
+        # simply leaves an undecidable sibling out of the comparison.
+        detail = f"{target}: pointer target could not be resolved"
+        if extra is not None:
+            extra["detail"] = _short(detail)
+        _warn(f"[{HOOK}] {detail}")
+        return None, "pointer_unresolved"
     newest_name, newest_ts = None, None
     for name in candidates:
         try:
@@ -452,21 +603,21 @@ def _split_frontmatter(text):
     return frontmatter, body
 
 
-def _parse_instant(value):
-    """An aware ``datetime`` from an ISO-8601 string, else ``None``. Accepts
-    the trailing ``Z`` frontmatter uses and a naive value (taken as UTC)."""
-    if not isinstance(value, str) or not value:
-        return None
-    text = value.strip()
-    if text.endswith(("Z", "z")):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
+# R4-c14: this used to be a second, byte-identical copy of
+# _ingest_client._parse_instant (only the docstring wording differed).
+# Locating (this file, picking the newest-`updated-at` candidate) and
+# stale-checking (_ingest_client, comparing local_updated_at against the
+# server's own stored value) parse the SAME frontmatter value with what
+# were two independent implementations that happened to agree today --
+# changing either one's parsing rule alone (accepting/rejecting some
+# input shape) would silently split what "the newest document" means from
+# what "is this local copy stale" means, with no test able to catch the
+# divergence (confirmed: a temp copy with only THIS file's copy changed
+# passed the whole suite). Reusing the object directly, rather than
+# keeping a second copy in sync by hand, is what actually rules that out
+# -- and changes only this file (ruling 15: _ingest_client.py itself is
+# untouched).
+_parse_instant = _ingest_client._parse_instant
 
 
 def _opted_out(frontmatter):
@@ -818,7 +969,7 @@ def _collect(run):
     run["extra"]["external_id"] = external_id
     try:
         with open(doc_path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read(_MAX_DOCUMENT_BYTES)
+            text = fh.read(_MAX_DOCUMENT_CHARS)
     except OSError as exc:
         # Listed a moment ago by _locate, gone (or unreadable) now: a race
         # or a permissions change, not one of the digest's named reasons.
@@ -1002,19 +1153,45 @@ def _record(reason, started, run, work_left_behind):
         if not persist:
             return
         try:
-            _new_state, persist_reasons = _hook_state.update_state(
-                HOOK,
-                cwd or os.getcwd(),
-                lambda s: {**s, "container_id": _identity.container_id()},
-            )
-        except Exception as exc:  # noqa: BLE001 - update_state does not raise by contract; the net under it
-            _warn(f"[{HOOK}] could not persist container_id: {exc!r}")
+            # R4-c05: computed ONCE, here, rather than calling
+            # _identity.container_id() again below purely to VERIFY what
+            # this same value already told the mutate lambda to write.
+            # container_id() only reads an env var or falls back to
+            # socket.gethostname(), so a failure here is rare -- but the
+            # old code's SECOND, unprotected call sat right after
+            # update_state's own try/except, with nothing to catch it: a
+            # transient failure there escaped write() entirely, taking the
+            # whole "did the persist really land" check -- and the
+            # state_write_failed row a genuine persist failure is supposed
+            # to guarantee -- down with it. Treated exactly like
+            # update_state's own failure below: nothing could be persisted,
+            # full stop.
+            new_container_id = _identity.container_id()
+        except Exception as exc:  # noqa: BLE001 - the net under it; see above
+            _warn(f"[{HOOK}] could not determine container_id to persist: {exc!r}")
+            new_container_id = None
             _new_state, persist_reasons = {}, ["state_write_failed"]
-        if _new_state.get("container_id") == _identity.container_id():
+        else:
+            try:
+                _new_state, persist_reasons = _hook_state.update_state(
+                    HOOK,
+                    cwd or os.getcwd(),
+                    lambda s: {**s, "container_id": new_container_id},
+                )
+            except Exception as exc:  # noqa: BLE001 - update_state does not raise by contract; the net under it
+                _warn(f"[{HOOK}] could not persist container_id: {exc!r}")
+                _new_state, persist_reasons = {}, ["state_write_failed"]
+        if new_container_id is not None and _new_state.get("container_id") == new_container_id:
             # The write landed on disk with the identity this mutate always
             # sets, whatever `persist_reasons` says about HOW (R3-c01) --
             # see the docstring above. Trust disk state over the reasons
-            # list.
+            # list. The `is not None` guard matters only for the branch
+            # right above, where there is nothing trustworthy to compare
+            # against at all: without it, an empty `_new_state` reading
+            # back `None` for a MISSING key would false-positive against a
+            # `new_container_id` that is ALSO `None`, and this would
+            # wrongly return early instead of falling through to append
+            # the failure row below.
             return
         if "state_write_failed" not in persist_reasons:
             # A degraded lock or a repaired-corrupt-state whose OWN write
@@ -1047,54 +1224,86 @@ def _record(reason, started, run, work_left_behind):
     return left_behind
 
 
-def _warn(message):
-    """Print one diagnostic line to stderr, never raising (R2-c05).
+class _StderrGuard:
+    """Wraps ``sys.stderr`` so that ANY later write to it cannot raise out
+    into its caller (R4-c06).
 
-    A closed stderr pipe (the host is already exiting) makes ``print``
-    raise ``BrokenPipeError``; every stderr write this file makes -- on the
-    main thread AND inside ``_record``'s own ledger-write closure, which
-    used to print directly -- goes through this instead of a bare ``print``
-    -- see ``main()`` below for why that ordering, not just this swallow,
-    is what actually protects the ledger row.
+    ``_warn`` above already protects every stderr write THIS file makes.
+    But the work thread ``main()`` starts below calls into
+    ``_ingest_client``, which has SEVERAL of its own unguarded
+    ``print(..., file=sys.stderr)`` calls (a full lookup page, an
+    empty-content caller bug, a missing ``session_id``) -- a closed pipe
+    there raises ``BrokenPipeError`` straight out of ``_lookup``/``upsert``,
+    which ``_hook_state.reason_for_exception`` reads as ``http_error`` one
+    layer up (``BrokenPipeError`` is a ``ConnectionError`` subclass) --
+    misreporting a purely LOCAL "could not write a diagnostic" condition
+    as a network failure, and silently skipping whatever dedup/write that
+    perfectly good response called for. Ruling 15 forbids fixing this
+    inside ``_ingest_client.py`` itself, so this wraps the GLOBAL
+    ``sys.stderr`` object instead: every module that does
+    ``print(..., file=sys.stderr)`` looks up ``sys.stderr`` fresh at call
+    time, so replacing the attribute here protects writes from ANY module,
+    not just this file's own.
 
-    Swallowing the ``OSError`` from THIS call alone is not sufficient on
-    its own (R3-c03): CPython's own interpreter shutdown
-    (``flush_std_files``, behind every plain ``sys.exit()``, not just the
-    ``os._exit`` path ``_hook_runner.finish`` takes when a thread was left
-    behind) unconditionally flushes stdout AND stderr again once this
-    process is on its way out, regardless of what any Python-level
-    ``except`` already caught -- and a buffered writer whose own
-    ``write()`` raised does not discard the bytes it failed to write, so
-    that flush retries the SAME bytes against the SAME closed pipe, with
-    no ``except`` anywhere near it this time (confirmed empirically: a
-    real closed-pipe subprocess with every ``print(..., file=sys.stderr)``
-    already wrapped in a swallowing ``except OSError`` still exits 120).
-    Rerouting the FILE DESCRIPTOR itself to ``os.devnull``, the same way
-    ``session_inject._silence_stdout`` already does for stdout, is what
-    stops the retry from failing too -- it protects every later write to
-    fd 2 from this point on, not just this one call's own.
+    A write failing here is swallowed and, on the FIRST such failure, the
+    underlying file descriptor is redirected to ``os.devnull`` via
+    ``_silence_stderr`` -- the same dance ``_warn`` already does for its
+    own writes (R3-c03) -- so CPython's own unconditional reflush at
+    shutdown lands on a descriptor that accepts anything, instead of
+    retrying the exact same failed bytes against the exact same closed
+    pipe a second time with no Python-level ``except`` anywhere near it
+    (exit 120, R4-c04).
+
+    ``real`` may itself be ``None`` (R4-c07): ``sys.stderr`` -- what this
+    wraps -- is ``None``, never a stream, when fd 2 was already closed
+    BEFORE the interpreter even started. Calling ``.write``/``.flush`` on
+    ``None`` would raise ``AttributeError``, which the ``except OSError``
+    below does NOT catch -- that exception would escape this wrapper (and,
+    at interpreter shutdown, is exactly as fatal as the closed-pipe
+    ``OSError`` this class otherwise protects against). There is no real
+    file descriptor behind a ``None`` stream to redirect either, so both
+    methods simply no-op in that case, same as after ``_silence_stderr``
+    has already run once.
     """
-    try:
-        print(message, file=sys.stderr)
-    except OSError:
-        _silence_stderr()
 
+    def __init__(self, real):
+        self._real = real
 
-def _silence_stderr():
-    """After a failed stderr write, stop the interpreter retrying it on the
-    way out (R3-c03). See ``_warn`` above for why swallowing the write
-    itself is not enough."""
-    try:
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stderr.fileno())
-        os.close(devnull)
-    except Exception:
-        pass  # not a real file descriptor (tests), or nothing left to protect
+    def write(self, s):
+        if self._real is None:
+            return len(s)
+        try:
+            return self._real.write(s)
+        except OSError:
+            _silence_stderr()
+            return len(s)
+
+    def flush(self):
+        if self._real is None:
+            return
+        try:
+            self._real.flush()
+        except OSError:
+            _silence_stderr()
+
+    def fileno(self):
+        return self._real.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 def main():
     """Run the hook. Returns True when a worker thread had to be left behind."""
     started = time.monotonic()
+    if not isinstance(sys.stderr, _StderrGuard):
+        # Installed before the work thread starts (R4-c06): _collect, on
+        # that thread, calls into _ingest_client, whose own stderr writes
+        # this file does not own (ruling 15) but must still not let crash
+        # the run. Guarded against double-wrapping across repeated
+        # in-process main() calls within the same test process (production
+        # runs this once per process, so it never matters there).
+        sys.stderr = _StderrGuard(sys.stderr)
     run = {
         "cwd": None,
         "calls": 0,
@@ -1111,13 +1320,15 @@ def main():
     # stdio so an abandoned thread cannot interleave with anything main()
     # writes after giving up on it. Not quite absolute in practice, though
     # (R1-c35 said so of _ingest_client alone, and named two of its paths;
-    # R2-c21 found that undercount, so this revision names none, rather
-    # than restate a list that can go stale again the same way): _locate,
-    # which _collect calls directly, prints its own diagnostic line (an
-    # unlistable docs/handoff), and _ingest_client has SEVERAL of its own
-    # -- the same "spooky abandoned thread" risk _hook_runner's own
-    # docstring already names for stderr, not something this hook adds
-    # beyond it.
+    # R2-c21 found that undercount, and R4-c16 found the FIX for that had
+    # quietly drifted back into naming one -- "_locate ... prints its own
+    # diagnostic line (an unlistable docs/handoff)" -- even though _locate
+    # gained THREE MORE _warn call sites since: this revision goes back to
+    # naming none, on purpose, rather than restate a list that can go
+    # stale the same way a third time): both _locate, which _collect calls
+    # directly, and _ingest_client write to stderr from SEVERAL places
+    # each -- the same "spooky abandoned thread" risk _hook_runner's own
+    # docstring already names, not something this hook adds beyond it.
     outcome, left_behind = _hook_runner.run_with_deadline(
         lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
     )

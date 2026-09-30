@@ -24,6 +24,7 @@ cross-border proxy, and the module asserts the fake HOME is still empty on
 the way out.
 """
 
+import builtins
 import glob
 import http.server
 import importlib.util
@@ -131,6 +132,39 @@ class _BrokenStderr:
         raise BrokenPipeError("stderr closed")
 
 
+_PYTHON_PATH_VARS = ("PYTHONPATH", "PYTHONHOME")
+
+
+def _scrub_subprocess_env(extra=None):
+    """The environment a real hook subprocess runs under: every ``NEXUS_*``
+    var dropped (callers set exactly the ones a fixture needs), plus
+    ``PYTHONPATH`` / ``PYTHONHOME`` (R4-c15).
+
+    The latter two matter specifically for ``TestImportGuards``' partial-
+    install copies: those directories deliberately OMIT one sibling module
+    to make ``import`` fail. If the developer machine (or a future CI
+    image) happens to have ``PYTHONPATH`` set to this real ``hooks/``
+    directory, the "missing" module imports anyway via that fallback --
+    the guard never fires, `stderr` comes back empty, and an assertion
+    checking for the guard's own text goes RED for a reason that has
+    nothing to do with a regression in the guard itself (confirmed
+    empirically: with ``PYTHONPATH`` pointed at the real ``hooks/``, all
+    three ``TestImportGuards`` text assertions failed with an empty
+    `stderr`, and the run ALSO tripped this module's own home-hygiene
+    check, because the hook then actually ran for real instead of exiting
+    immediately on the intended import failure). A test that depends on a
+    module genuinely being absent must not inherit a search path that
+    puts it back.
+    """
+    run_env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("NEXUS_") and k not in _PYTHON_PATH_VARS
+    }
+    if extra:
+        run_env.update(extra)
+    return run_env
+
+
 def _run_hook(stdin_text, env=None, want_stderr=False, script=None):
     """Drive the real script as a subprocess; return (stdout_bytes, exit_code).
 
@@ -138,9 +172,7 @@ def _run_hook(stdin_text, env=None, want_stderr=False, script=None):
     copy in a temp dir, for the import-guard tests, instead of the real
     ``_HOOK_SCRIPT``.
     """
-    run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
-    if env:
-        run_env.update(env)
+    run_env = _scrub_subprocess_env(env)
     result = subprocess.run(
         [sys.executable, script or _HOOK_SCRIPT],
         input=stdin_text.encode(),
@@ -151,6 +183,33 @@ def _run_hook(stdin_text, env=None, want_stderr=False, script=None):
     if want_stderr:
         return result.stdout, result.returncode, result.stderr.decode()
     return result.stdout, result.returncode
+
+
+def _communicate_kill_on_timeout(proc, payload, timeout):
+    """``proc.communicate(payload, timeout=timeout)``, but a regression
+    that makes the hook hang fails FAST and leaves no orphan (R4-c13).
+
+    The three real-closed-pipe subprocess tests below cannot use
+    ``subprocess.run``'s own ``timeout=`` (its cleanup already kills the
+    child) -- they need the Popen object alive afterward to read
+    ``returncode``. A bare ``try: communicate(timeout=) finally: proc.wait
+    (timeout=)`` looks safe but is not: on a genuine timeout,
+    ``communicate`` raises ``TimeoutExpired`` with the child STILL
+    running, and the ``finally``'s own ``proc.wait(timeout=)`` then raises
+    a SECOND ``TimeoutExpired`` (which, being raised inside ``finally``,
+    REPLACES the first one -- confirmed empirically: this shape takes 2x
+    the timeout to fail and leaves the child alive afterward). Killing the
+    child explicitly on timeout, then re-raising, is what actually reports
+    the hang quickly and does not leak a process.
+    """
+    try:
+        return proc.communicate(payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
+        raise
+    finally:
+        proc.wait(timeout=timeout)
 
 
 # ── scripted loopback backend (mirrors test_ingest_client.py's _Backend) ──
@@ -462,15 +521,77 @@ class TestLocate(_HandoffDirCase):
         rather than the loud "cannot tell" ruling 5 requires. `os.stat`
         (not `isfile`) is mocked here so the injection is independent of
         which underlying primitive the fix ends up calling being isfile-
-        shaped or stat-shaped, as long as SOME per-entry OSError surfaces."""
+        shaped or stat-shaped, as long as SOME per-entry OSError surfaces.
+
+        R4-c01: `os.lstat` is mocked with the SAME error here, not left
+        real -- the original fixture only mocked `os.stat`, so the
+        fallback `os.lstat` call underneath ran unmocked against a
+        perfectly ordinary, readable file and always succeeded, landing
+        the entry in `undecidable` regardless of whether the code's OWN
+        `except` on the lstat call was narrow (`FileNotFoundError`) or
+        broad (any `OSError`) -- the two only disagree when lstat ITSELF
+        also fails, which this fixture never exercised. Parametrized over
+        three non-FileNotFoundError errnos (EACCES / EIO / ESTALE): the
+        365fc39 regression made the broad `except OSError: continue`
+        swallow all three as a silent "gone" race, when something is in
+        fact still there and unresolved."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md")
+        for exc in (
+            PermissionError(13, "Permission denied"),
+            OSError(5, "Input/output error"),
+            OSError(116, "Stale file handle"),
+        ):
+            with self.subTest(exc=exc):
+                stderr = io.StringIO()
+                with mock.patch.object(_MOD.os, "stat", side_effect=exc), \
+                        mock.patch.object(_MOD.os, "lstat", side_effect=exc), \
+                        mock.patch.object(sys, "stderr", stderr):
+                    result = _MOD._locate(self.handoff_dir)
+                self.assertEqual(result, (None, "pointer_unresolved"))
+                self.assertIn("docs/handoff", stderr.getvalue())
+
+    def test_an_unstattable_candidate_entry_real_chmod_is_pointer_unresolved(self):
+        """R4-c01, real-filesystem sibling of the mocked test above:
+        `docs/handoff` itself loses its execute (search) bit while
+        remaining readable, so `os.listdir` still succeeds (it only needs
+        read) but `os.stat` AND `os.lstat` on any entry inside it both
+        fail with EACCES (both need to traverse INTO the directory to
+        reach the entry). This is the actual regression shape (a bare
+        `chmod -R 644 docs/` instead breaks the PARENT's own execute bit
+        first, which fails `os.listdir` one level up and never reaches
+        this per-entry branch at all -- confirmed empirically during
+        verification of this finding)."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md")
+        os.chmod(self.handoff_dir, 0o644)  # rw-r--r--: read but no execute/search
+        self.addCleanup(os.chmod, self.handoff_dir, 0o755)  # so TemporaryDirectory cleanup can remove it
+        try:
+            os.stat(os.path.join(self.handoff_dir, "a.md"))
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("running as a user unaffected by chmod (e.g. root)")
         stderr = io.StringIO()
-        with mock.patch.object(_MOD.os, "stat", side_effect=PermissionError(13, "denied")), \
-                mock.patch.object(sys, "stderr", stderr):
+        with mock.patch.object(sys, "stderr", stderr):
             result = _MOD._locate(self.handoff_dir)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
+
+    def test_a_candidate_that_vanishes_at_both_stat_and_lstat_is_dropped_quietly(self):
+        """R4-c01 pinning test, the OTHER side of the same branch: when
+        `os.lstat` ALSO raises `FileNotFoundError` (not merely some other
+        OSError), the entry really is gone -- a listdir-then-stat race,
+        R2-c03's own original case -- and must stay a silent drop, not
+        `undecidable`. Directly exercises `_candidates` (not `_locate`)
+        since this shape, alone in an otherwise-empty directory, is
+        indistinguishable from "no handoff kept here" one level up."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md")
+        with mock.patch.object(_MOD.os, "stat", side_effect=FileNotFoundError(2, "gone")), \
+                mock.patch.object(_MOD.os, "lstat", side_effect=FileNotFoundError(2, "gone")):
+            candidates, undecidable = _MOD._candidates(self.handoff_dir)
+        self.assertEqual((candidates, undecidable), ([], []))
 
     def test_a_dangling_symlink_handoff_dir_is_pointer_unresolved_not_quiet(self):
         """R2-c03, second leg: `docs/handoff` ITSELF being a dangling
@@ -519,6 +640,26 @@ class TestLocate(_HandoffDirCase):
         result = _MOD._locate(self.handoff_dir)
         self.assertEqual(result, (None, "pointer_unresolved"))
 
+    def test_a_valid_docs_symlink_without_a_handoff_dir_stays_quiet(self):
+        """R4-c02: the ancestor check above must fire only for a DANGLING
+        `docs` symlink, not for a valid one. A monorepo that links
+        `docs -> website/docs` (or any project whose `docs` happens to be
+        a symlink to a real, existing directory that simply keeps no
+        `handoff/` subdirectory) makes `os.listdir(handoff_dir)` raise
+        `FileNotFoundError` the ordinary way -- nothing is missing except
+        the handoff directory itself, the common `no_handoff` case every
+        other project without handoffs also hits. The 365fc39 ancestor
+        check tested `os.path.islink(docs)` alone, true for ANY symlink
+        whether or not its target exists, so this healthy shape was
+        wrongly re-raised as `pointer_unresolved` -- a project that will
+        never write a handoff got a failure-class report every single
+        session, with a `detail` naming a directory that does not exist."""
+        docs = os.path.dirname(self.handoff_dir)
+        real_target = os.path.join(self.tmp.name, "real-docs-target")
+        os.makedirs(real_target)
+        os.symlink(real_target, docs)
+        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+
     def test_a_single_eloop_entry_does_not_sabotage_other_candidates(self):
         """R3-c05, third leg: a self-referential symlink (`ELOOP` on
         `os.stat`) is neither `FileNotFoundError` (so the old per-entry
@@ -560,6 +701,64 @@ class TestLocate(_HandoffDirCase):
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("2026-09-20-new.md", stderr.getvalue())
         self.assertNotEqual(result, (os.path.basename(older), None))  # never silently the older one
+
+    def test_an_unreadable_newer_candidate_is_pointer_unresolved_even_as_root(self):
+        """R4-c11: the chmod-000 test above SKIPS when the suite runs as
+        root (root ignores the permission bits, so `open()` succeeds
+        anyway) -- and this plugin's CI image (`node:20-bookworm`, no
+        `user:` declared) runs as root, so that test never actually RUNS
+        there. This is the exact same gap R2-c09 already found and fixed
+        for the OTHER chmod-000 test in this class (the unreadable
+        DIRECTORY, not a candidate FILE); this one never got a mock
+        twin. Injecting the error via mock exercises the identical
+        `_probe_frontmatter`/`_locate` branch regardless of who runs the
+        suite."""
+        self._mkdir()
+        older = _write_handoff(self.handoff_dir, "2026-09-10-old.md", updated_at="2026-09-10T00:00:00Z")
+        newer = _write_handoff(self.handoff_dir, "2026-09-20-new.md", updated_at="2026-09-20T00:00:00Z")
+
+        def failing_open(target, *a, **kw):
+            if os.path.abspath(target) == os.path.abspath(newer):
+                raise PermissionError(13, "denied")
+            return builtins.open(target, *a, **kw)
+
+        stderr = io.StringIO()
+        with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open), \
+                mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("2026-09-20-new.md", stderr.getvalue())
+        self.assertNotEqual(result, (os.path.basename(older), None))  # never silently the older one
+
+    def test_a_pointer_to_a_dangling_target_does_not_silently_fall_back_to_an_older_candidate(self):
+        """R4-c03: `latest.md` names an entry that IS listed but lands in
+        `undecidable` (here, a dangling symlink; ELOOP is the same shape)
+        alongside an older, perfectly healthy sibling. Before this fix,
+        `target in candidates` was simply False (the dangling entry is not
+        in `candidates`, only in `undecidable`), so the fallback newest-
+        updated-at scan ran over `candidates` alone and silently returned
+        the OLDER document -- even though `latest.md` explicitly named a
+        DIFFERENT, presumably newer one. Ruling 13: a dangling POINTER
+        TARGET must never silently change which document is ingested --
+        either the pointer's own document is ingested, or the run reports
+        `pointer_unresolved` naming what could not be read. This is
+        distinct from Amendment A9 row c18 (the FALLBACK scan, with no
+        explicit pointer, quietly leaving an undecidable sibling out of
+        the comparison) -- that shape is untouched by this fix, only an
+        explicit pointer resolving to an undecidable entry is."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "2026-09-10-old.md", updated_at="2026-09-10T00:00:00Z")
+        dangling = os.path.join(self.handoff_dir, "2026-09-29-new.md")
+        os.symlink(os.path.join(self.tmp.name, "does-not-exist-target.md"), dangling)
+        with open(os.path.join(self.handoff_dir, "latest.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Latest\n\n**Latest**: [2026-09-29-new.md](./2026-09-29-new.md)\n")
+        stderr = io.StringIO()
+        extra = {}
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("2026-09-29-new.md", extra["detail"])
+        self.assertIn("2026-09-29-new.md", stderr.getvalue())
 
     def test_a_closed_stderr_does_not_turn_an_unlistable_directory_into_http_error(self):
         """R3-c04: the old code printed `[{HOOK}] {detail}` with a bare
@@ -880,6 +1079,23 @@ class TestContent(unittest.TestCase):
         )
         self.assertEqual(_MOD._build_content(body), (None, "empty_sections"))
 
+    def test_a_bare_divider_line_of_any_recognised_character_is_still_empty(self):
+        """R4-c12: the two ORIGINAL R3-c07 fixtures (this class) only ever
+        used `---`, even though `_is_divider_line` also recognises `***`
+        and `___` (A9-8 already names all three as the intended set) --
+        a mutant narrowing it to just `-` passed the whole suite before
+        this test existed (confirmed against a temp copy). Parametrized
+        over all three characters, plus a longer run of each (still a
+        thematic break per the same rule)."""
+        for marker in ("---", "***", "___", "-----", "*****", "_____"):
+            with self.subTest(marker=marker):
+                body = (
+                    "# T\n\n"
+                    f"## §6 Next session 入口 + 优先级建议\n\n{marker}\n\n"
+                    f"## §2 未完成 / Carry-forward 清单\n\n{marker}\n"
+                )
+                self.assertEqual(_MOD._build_content(body), (None, "empty_sections"))
+
     def test_a_divider_line_does_not_hide_real_content_before_it(self):
         """The other direction of R3-c07's fix: a section with GENUINE
         content followed by the SAME trailing `---` divider (the common,
@@ -983,6 +1199,22 @@ class TestMetadata(unittest.TestCase):
         self.assertEqual(meta["aria.phase"], "B")
         self.assertEqual(meta["aria.status"], "active")
         self.assertEqual(meta["aria.updated_at"], "2026-09-20T10:00:00Z")
+
+
+class TestParseInstantIsShared(unittest.TestCase):
+    """R4-c14: handoff_sync.py used to carry a second, byte-identical copy
+    of `_ingest_client._parse_instant` -- locating (this file, picking the
+    candidate with the newest `updated-at`) and stale-checking
+    (`_ingest_client`, comparing `local_updated_at` against the server's
+    own value) parsed the same frontmatter value through what were two
+    independently-editable implementations. Asserting the SAME object
+    (not merely equal behaviour on today's fixtures) is what actually
+    rules out a future edit to one copy silently not reaching the other;
+    a temp copy with only handoff_sync.py's OWN (then-separate) copy
+    changed passed the whole suite before this consolidation."""
+
+    def test_handoff_sync_reuses_the_ingest_client_object(self):
+        self.assertIs(_MOD._parse_instant, _ingest_client._parse_instant)
 
 
 class TestPointerTargetReadSafety(_HandoffDirCase):
@@ -1161,10 +1393,10 @@ class TestOwnerAndOptOut(_WriteCase):
 
 
 class TestChosenDocumentReadCap(_WriteCase):
-    """R2-c18: R1-c13 added ``_MAX_DOCUMENT_BYTES`` for TWO reads -- the
+    """R2-c18: R1-c13 added ``_MAX_DOCUMENT_CHARS`` for TWO reads -- the
     ``latest.md`` pointer probe (``_pointer_target``, fixture in
     ``TestPointerTargetReadSafety``) and the CHOSEN document's own read
-    inside ``_collect`` (``fh.read(_MAX_DOCUMENT_BYTES)``) -- but only the
+    inside ``_collect`` (``fh.read(_MAX_DOCUMENT_CHARS)``) -- but only the
     first of the two had a fixture. An abnormally huge candidate would
     otherwise be read into memory in full before anything here gets a
     chance to cap it."""
@@ -1177,7 +1409,7 @@ class TestChosenDocumentReadCap(_WriteCase):
         # missing, nothing downstream would ALSO have trimmed it away.
         marker = "MARKERBEYONDCAP"
         section6 = "## §6 Next session 入口 + 优先级建议\n\n" + ("A" * 300) + marker
-        with mock.patch.object(_MOD, "_MAX_DOCUMENT_BYTES", 200):
+        with mock.patch.object(_MOD, "_MAX_DOCUMENT_CHARS", 200):
             self._write("2026-09-20-1000-x.md", section6=section6)
             self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
             self._run()
@@ -1401,6 +1633,46 @@ class TestWritePath(_WriteCase):
         self.assertEqual(entry["dedup_merged"], 1)
         findings, _marks = _INJECT_MOD._failure_report(self.cwd)
         self.assertTrue(any("handoff-sync" in f and "dedup_merged" in f for f in findings), findings)
+
+    def test_a_closed_stderr_during_a_full_lookup_page_does_not_turn_into_http_error(self):
+        """R4-c06: `_ingest_client._lookup`'s OWN "dedup page full"
+        diagnostic (`LOOKUP_LIMIT=5`) is a bare, unguarded
+        `print(..., file=sys.stderr)` -- unlike every stderr write THIS
+        file makes, which all go through `_warn` (R3-c03). Ruling 15
+        forbids fixing this inside `_ingest_client.py` itself, so `main()`
+        must protect it from here instead: without that, a closed stderr
+        pipe turns this bare print's own `BrokenPipeError` into an
+        uncaught exception that escapes `_lookup`/`upsert` entirely,
+        misreported one layer up as `http_error` (`reason_for_exception`
+        reads `BrokenPipeError`, a `ConnectionError` subclass, that way)
+        even though the GET this run made got a perfectly good response,
+        and the dedup/write that response called for never happens."""
+        path = self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
+        with open(path, encoding="utf-8") as fh:
+            _fm, body = _MOD._split_frontmatter(fh.read())
+        content, _reason = _MOD._build_content(body)
+        digest = _ingest_client.content_hash(content)
+        stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
+        rows = [
+            _row(
+                "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+                created_at=f"2026-09-19T0{i}:00:00.000001Z",
+                row_id=f"{i:08x}-1111-4111-8111-111111111111",
+            )
+            for i in range(5)  # == LOOKUP_LIMIT: a full page
+        ]
+        self.backend.reply(200, _page(*rows))
+        for _ in range(4):  # the 4 non-canonical rows, each dedup-deleted
+            self.backend.reply(204, None)
+        with mock.patch.object(sys, "stderr", _BrokenStderr()):
+            self._run(session_id="sess-1")
+        self.assertEqual(
+            [r["method"] for r in self.requests], ["GET", "DELETE", "DELETE", "DELETE", "DELETE"]
+        )
+        entry = self._last_entry()
+        self.assertNotEqual(entry["reason"], "http_error")
+        self.assertEqual(entry["reason"], "dedup_merged")
+        self.assertEqual(entry["dedup_merged"], 4)
 
     def test_403_structured_ingest_disabled(self):
         self._write("2026-09-20-1000-x.md")
@@ -1725,6 +1997,115 @@ class TestWritePath(_WriteCase):
             self._run(session_id="sess-1")
         self.assertEqual(self._last_entry()["reason"], "identity_changed")  # still unresolved
 
+    def test_a_transient_container_id_failure_during_the_persist_check_does_not_swallow_state_write_failed(self):
+        """R4-c05: the comparison `_new_state.get("container_id") ==
+        _identity.container_id()` (right after the ``update_state`` call
+        above) invokes `_identity.container_id()` a SECOND time, OUTSIDE
+        that call's own try/except. `container_id()` itself only reads an
+        env var or falls back to `socket.gethostname()`, so this is a rare,
+        transient fault -- but if it happens to raise on exactly this
+        call, the exception escapes `write()` entirely (nothing after this
+        line catches it), and the supplementary `state_write_failed` row
+        the test right above this one exists to guarantee is never
+        appended, even though the persist genuinely failed THIS run (not
+        merely a degraded lock or a repaired-corrupt-state, the two
+        already-legitimate non-failure shapes `update_state` can return
+        alongside a non-empty `reasons`)."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+
+        def failing_update_state(name, cwd, mutate):
+            return {}, ["state_write_failed"]
+
+        with mock.patch.object(
+            _identity, "container_id",
+            # Exactly the two real calls `_collect` makes (identity_drift's
+            # `current=`, then the IngestClient constructor) return the new
+            # id normally; `update_state` is itself replaced below, so its
+            # mutate lambda's OWN call never happens -- the THIRD call is
+            # the unprotected comparison this finding is about.
+            side_effect=["dev-box-b", "dev-box-b", RuntimeError("transient container_id failure")],
+        ), mock.patch.object(_hook_state, "update_state", side_effect=failing_update_state):
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
+            with mock.patch("sys.stderr"):
+                self._run(session_id="sess-1")
+
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        reasons = [e["reason"] for e in entries]
+        # The run's own row must exist and say identity_changed regardless
+        # (record_run happens before any of this: R2-c01's ordering) --
+        # this much already holds even on the unfixed code.
+        self.assertIn("identity_changed", reasons)
+        # The point of this test: the supplementary state_write_failed row
+        # must ALSO exist -- a genuine persist failure this run must not be
+        # swallowed just because the verification step's own second
+        # container_id() call happened to raise.
+        self.assertIn("state_write_failed", reasons)
+        persist_row = entries[-1]
+        self.assertEqual(persist_row["reason"], "state_write_failed")
+        self.assertFalse(persist_row["ok"])
+
+    def test_a_transient_persist_failure_in_steady_state_does_not_append_a_spurious_failure_row(self):
+        """R4-c09, mutant M01: deleting the `new_container_id is not None
+        and _new_state.get("container_id") == new_container_id` check
+        entirely (relying solely on the `"state_write_failed" not in
+        persist_reasons` membership check below it) passes every OTHER
+        existing test, because in every other fixture the two checks
+        return early for the same reason. The one shape that tells them
+        apart: STEADY STATE (this container's id is already the value on
+        disk -- no drift at all this run) plus update_state's OWN write
+        genuinely failing THIS run -- it returns the state as it stood
+        BEFORE the mutate, which, in steady state, already equals the
+        current id. Without the disk-trust check, this reads as a genuine
+        persist failure and appends a spurious row even though nothing on
+        disk is actually wrong."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")  # persists CONTAINER; steady state from here on
+
+        def failing_update_state(name, cwd, mutate):
+            # The write itself raised; update_state returns the PRE-mutate
+            # state (see its own docstring) -- which, in steady state,
+            # already carries today's container_id.
+            return {"container_id": CONTAINER}, ["state_write_failed"]
+
+        with mock.patch.object(_hook_state, "update_state", side_effect=failing_update_state):
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
+            with mock.patch("sys.stderr"):
+                self._run(session_id="sess-1")
+
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        self.assertNotIn("state_write_failed", [e["reason"] for e in entries])
+        self.assertEqual(entries[-1]["reason"], "none")
+
+    def test_an_update_state_mutate_crash_is_not_reported_as_a_persist_failure(self):
+        """R4-c09, mutant M02: reverting `"state_write_failed" not in
+        persist_reasons` back to the literal `not persist_reasons` passes
+        every OTHER existing test too, because the one shape where this
+        matters -- ``update_state``'s own mutate callback raising
+        (``reasons=["unknown"]``, state left exactly as it was before the
+        mutate, per its own docstring) -- is not otherwise exercised.
+        Pins the current, intended behaviour: an unrelated mutate crash is
+        not reported as a persist failure."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+
+        def crashing_update_state(name, cwd, mutate):
+            current, _reasons = _hook_state.read_state(name, cwd)
+            return current, ["unknown"]
+
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
+                mock.patch.object(_hook_state, "update_state", side_effect=crashing_update_state):
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
+            with mock.patch("sys.stderr"):
+                self._run(session_id="sess-1")
+
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        self.assertNotIn("state_write_failed", [e["reason"] for e in entries])
+        self.assertEqual(entries[-1]["reason"], "identity_changed")
+
     def test_identity_drift_persists_despite_a_degraded_lock_without_a_spurious_failure_row(self):
         """R3-c01 (a regression in the R2-c11 fix above): `_hook_state.
         update_state` can return a NON-EMPTY `reasons` list even when the
@@ -1910,6 +2291,63 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="sess-1")
         self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+
+    def test_a_document_that_vanishes_between_locate_and_open_is_unknown_not_quiet(self):
+        """R4-c10: after `_locate` has already picked a document, the
+        `open()` inside `_collect` can still fail (a race, a permissions
+        change) -- `except OSError` there returns the failure-class
+        `unknown`, reported at the next SessionStart (ruling 13: never
+        silently change WHICH document was ingested, and that includes
+        never silently treating a disappearance as "nothing to ingest").
+        Mutating this branch's `return "unknown"` to `return "no_handoff"`
+        (a permanent, silent skip) passed the whole suite before this test
+        existed (confirmed against a temp copy)."""
+        path = self._write("2026-09-20-1000-x.md")
+        # A pointer naming it directly (rather than the no-pointer
+        # fallback scan) so `_locate` never itself calls `open()` on this
+        # path to probe frontmatter -- isolating the ONE open() this test
+        # means to fail to `_collect`'s own read of the chosen document.
+        _write_latest_pointer(self.handoff_dir, "2026-09-20-1000-x.md")
+
+        def failing_open(target, *a, **kw):
+            if os.path.abspath(target) == os.path.abspath(path):
+                raise FileNotFoundError(2, "gone")
+            return builtins.open(target, *a, **kw)
+
+        with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open):
+            self._run(session_id="sess-1")
+        self.assertEqual(self.requests, [])
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertIn("cannot read", entry["detail"])
+        findings, _marks = _INJECT_MOD._failure_report(self.cwd)
+        self.assertTrue(any("handoff-sync" in f for f in findings), findings)
+
+    def test_a_pointer_target_that_loses_its_read_permission_is_unknown_not_quiet(self):
+        """R4-c10, real-filesystem sibling of the mocked test above: a
+        pointer resolving DIRECTLY to a candidate (``target in
+        candidates``) never opens it to compare timestamps -- `_locate`
+        only ``os.stat``s it (permission bits on the FILE itself do not
+        block that, only the ENCLOSING directory's execute bit would) --
+        so a chmod(000) document that `latest.md` names is still the
+        chosen document, and only `_collect`'s own `open()` discovers it
+        cannot actually be read."""
+        path = self._write("2026-09-20-1000-x.md")
+        _write_latest_pointer(self.handoff_dir, "2026-09-20-1000-x.md")
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o644)
+        try:
+            with open(path):
+                pass
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("running as a user unaffected by chmod 000 (e.g. root)")
+        self._run(session_id="sess-1")
+        self.assertEqual(self.requests, [])
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertIn("cannot read", entry["detail"])
 
     def test_the_ledger_detail_is_truncated_to_200_chars(self):
         """R1-c30: `_short`'s cap, pinned end to end through the ledger."""
@@ -2156,6 +2594,55 @@ class TestCurrentBranchForwarding(unittest.TestCase):
         self.assertEqual(_MOD._current_branch(self.repo), "a-real-branch")
 
 
+class TestSilenceStderrFdHygiene(unittest.TestCase):
+    """R4-c08: `_silence_stderr` opens a devnull fd BEFORE calling
+    `sys.stderr.fileno()` -- if THAT raises (a test double, or any future
+    stderr replacement without a real `fileno`), the blanket `except
+    Exception: pass` swallows it, but the devnull fd already opened on the
+    line before is never closed."""
+
+    def test_does_not_leak_a_devnull_fd_when_fileno_is_unavailable(self):
+        opened = []
+        real_open = os.open
+
+        def tracking_open(path, flags):
+            fd = real_open(path, flags)
+            opened.append(fd)
+            return fd
+
+        with mock.patch.object(_MOD.os, "open", side_effect=tracking_open), \
+                mock.patch.object(sys, "stderr", _BrokenStderr()):  # no .fileno() at all
+            _MOD._silence_stderr()  # must not raise
+        # Resolving fileno() first (the fix) means a target-less devnull is
+        # never opened in the first place; opening it before checking
+        # fileno() (the bug) opened exactly one and left it dangling.
+        for fd in opened:
+            with self.assertRaises(OSError):
+                os.fstat(fd)  # fstat on a closed fd raises EBADF; a leaked one would not
+
+
+class TestStderrGuardProtectsWriteWithBudget(unittest.TestCase):
+    """R4-c04, the OTHER half (the import guards are covered end to end by
+    ``TestImportGuards``' closed-pipe tests): ``_hook_runner.write_with_
+    budget``'s own fallback ``print(..., file=sys.stderr)`` is a bare,
+    unguarded write too (a "net under a net" for a ``write()`` that does
+    not already protect itself, per that module's own docstring). Once
+    ``_StderrGuard`` is installed (``main()``, before the work thread
+    starts), it protects THIS print as well, since ``write_with_budget``
+    looks up ``sys.stderr`` fresh at call time same as everything else --
+    proving the fix in ``main()`` is not scoped to only this file's own
+    ``_warn`` call sites."""
+
+    def test_a_write_that_raises_does_not_escape_through_a_broken_real_stream(self):
+        guarded_stderr = _MOD._StderrGuard(_BrokenStderr())  # no real fd behind it either
+        with mock.patch.object(sys, "stderr", guarded_stderr):
+            def failing_write():
+                raise RuntimeError("boom, escapes write()'s own protections")
+
+            left_behind = _MOD._hook_runner.write_with_budget(failing_write, 2.0, "probe")
+        self.assertFalse(left_behind)  # the thread completed; nothing hung or crashed the test
+
+
 class TestImportGuards(unittest.TestCase):
     """handoff_sync.py's own three import guards (R1-c31): none of them had
     a test of its own, unlike session_capture.py's / session_inject.py's
@@ -2201,6 +2688,47 @@ class TestImportGuards(unittest.TestCase):
         self.assertEqual((stdout, code), (b"", 0))
         self.assertIn("_ingest_client", stderr)
         self.assertNotIn("Traceback", stderr)
+
+    def _run_with_closed_stderr(self, script):
+        """Like TestSubprocess's own closed-pipe helper, reused here: a
+        closed read end BEFORE the child ever writes means every write to
+        the write end is EPIPE -- the only way to observe the interpreter's
+        own unconditional reflush-at-shutdown failing a SECOND time with no
+        Python-level except anywhere near it (R3-c03's own docstring)."""
+        r, w = os.pipe()
+        os.close(r)
+        run_env = _scrub_subprocess_env()
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=w, env=run_env,
+        )
+        os.close(w)
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{}", 20)
+        return stdout, proc.returncode
+
+    def test_without_identity_and_a_closed_stderr_pipe_still_exits_zero(self):
+        """R4-c04: unlike every OTHER stderr write in this file (which all
+        go through `_warn`, R3-c03), the three import guards used a bare
+        `print(..., file=sys.stderr)`. On a closed pipe that raises
+        BrokenPipeError with no `_silence_stderr`-style protection, and
+        CPython's own unconditional reflush at shutdown (behind the
+        guard's `sys.exit(0)`) then retries the same failed write with no
+        Python-level except anywhere near it -- exit code 120, not 0.
+        Confirmed empirically (a real closed pipe, not a mock) against the
+        unfixed guard before this fix."""
+        script = self._copy_hook_without("_identity.py")
+        stdout, code = self._run_with_closed_stderr(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_hook_runner_and_a_closed_stderr_pipe_still_exits_zero(self):
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code = self._run_with_closed_stderr(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_ingest_client_and_a_closed_stderr_pipe_still_exits_zero(self):
+        script = self._copy_hook_without("_ingest_client.py")
+        stdout, code = self._run_with_closed_stderr(script)
+        self.assertEqual((stdout, code), (b"", 0))
 
 
 class TestSubprocess(unittest.TestCase):
@@ -2251,17 +2779,36 @@ class TestSubprocess(unittest.TestCase):
         write always succeeds from the child's point of view."""
         r, w = os.pipe()
         os.close(r)  # closed BEFORE the child ever writes: every write to `w` is EPIPE
-        run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
+        run_env = _scrub_subprocess_env()
         run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
         proc = subprocess.Popen(
             [sys.executable, _HOOK_SCRIPT],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=w, env=run_env,
         )
         os.close(w)  # only the child holds the write end now
-        try:
-            stdout, _stderr = proc.communicate(b"{not json", timeout=20)
-        finally:
-            proc.wait(timeout=20)
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
+        self.assertEqual((stdout, proc.returncode), (b"", 0))
+
+    def test_fd_2_closed_before_the_interpreter_starts_still_exits_zero_with_no_stdout(self):
+        """R4-c07: when fd 2 is closed BEFORE the interpreter even starts
+        (as opposed to a pipe that closes mid-run, the shape every other
+        closed-pipe test above covers), CPython sets `sys.stderr` to
+        `None` rather than a stream object -- confirmed empirically
+        (`python3 -c "import sys; print(repr(sys.stderr))"` under the same
+        `preexec_fn` reports `None`). `print(msg, file=None)` FALLS BACK to
+        `sys.stdout` (also confirmed empirically), which would put
+        `_warn`'s diagnostic on the one channel a SessionEnd hook's
+        contract requires to stay empty. Garbage stdin drives `_collect` to
+        raise, so `main()` calls `_warn(diagnostic)` on the main thread --
+        exactly the call this finding is about."""
+        run_env = _scrub_subprocess_env()
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        proc = subprocess.Popen(
+            [sys.executable, _HOOK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, env=run_env,
+            preexec_fn=lambda: os.close(2),
+        )
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
         self.assertEqual((stdout, proc.returncode), (b"", 0))
 
 
