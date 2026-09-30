@@ -1115,9 +1115,11 @@ class TestLocate(_HandoffDirCase):
     def test_a_healthy_symlinked_latest_md_resolves_its_target(self):
         """R6-c06: `_pointer_target` deliberately uses `os.stat` (which
         FOLLOWS symlinks), not `os.lstat`, to resolve what a symlinked
-        `latest.md` actually points at -- Aether's own `docs/handoff/
-        latest.md` is exactly this shape, a `git`-tracked symlink
-        (`standards/conventions/session-handoff.md`). Nothing pinned the
+        `latest.md` actually points at. (Not Aether's shape: Aether's
+        `docs/handoff/latest.md` is a symlink straight to a handoff
+        DOCUMENT, which has no `**Latest**:` line and therefore reads as
+        "no pointer" -> the quiet updated-at fallback; a symlinked POINTER
+        file, as here, is the case this test pins.) Nothing pinned the
         HEALTHY case before this test; only dangling and self-referential
         symlinks were covered, and both stay `unresolved` no matter which
         stat call is used to tell them apart, so neither would catch a

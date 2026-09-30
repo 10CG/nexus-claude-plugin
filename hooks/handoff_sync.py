@@ -59,7 +59,6 @@ import re
 import stat
 import sys
 import time
-from datetime import datetime, timezone
 
 # Siblings are imported by name, which only works while this file's directory
 # is on sys.path. PYTHONSAFEPATH=1 / `python -P` (3.11+) takes it off, and
@@ -406,10 +405,12 @@ def _pointer_target(handoff_dir):
     level down (an EXPLICIT pointer TARGET landing in ``undecidable``) --
     this is the pointer FILE itself being unresolvable. The caller
     (``_locate``) decides what an ``unresolved`` result means: with two or
-    more candidates to choose between it reports ``pointer_unresolved``
-    (guessing could ingest the wrong one); with only ONE candidate there is
-    nothing else ``latest.md`` could have named, so that leg falls through
-    unchanged and quiet (R2-c13's FIFO fixture stays green).
+    more ``*.md`` entries it could have named -- resolvable candidates and
+    undecidable ones counted together (R6-c01) -- it reports
+    ``pointer_unresolved`` (guessing could ingest the wrong one); only with
+    exactly ONE such entry in total is there nothing else ``latest.md``
+    could have named, so that leg falls through unchanged and quiet
+    (R2-c13's FIFO fixture stays green).
 
     ``os.lstat`` -- not ``os.path.isfile``, which this replaces -- is
     checked FIRST specifically so a genuinely ABSENT ``latest.md``
@@ -524,8 +525,9 @@ def _locate(handoff_dir, extra=None):
     ``extra``, given (R2-c04), is a ledger ``extra`` dict updated in place
     with a ``detail`` key on every ``pointer_unresolved`` exit: the
     several origins -- unlistable directory, every candidate undecidable,
-    latest.md itself unresolved with more than one candidate to choose
-    between (R5-c01), a pointer naming an undecidable entry, a candidate
+    latest.md itself unresolved with more than one entry it could have
+    named, undecidable ones included (R5-c01 / R6-c01), a pointer naming
+    an undecidable entry, a candidate
     that could not even be READ to compare, candidates that exist but none
     resolved a timestamp -- read identically on the ledger otherwise, and
     stderr from a SessionEnd hook is not a channel anyone reads. ``None``
