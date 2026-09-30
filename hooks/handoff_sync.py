@@ -56,6 +56,7 @@ handoff.md`` §2.2 / §2.3):
 import json
 import os
 import re
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -99,6 +100,7 @@ except Exception as exc:
     sys.exit(0)
 
 import _hook_state  # noqa: E402 - guaranteed importable: _ingest_client already imports it
+import _redact  # noqa: E402 - guaranteed importable: _ingest_client already imports it (R2-c08)
 
 HOOK = "handoff-sync"  # names the ledger file; must stay in session_inject._EXPECTED_LEDGERS
 
@@ -113,15 +115,21 @@ _HTTP_TIMEOUT_SECONDS = 8
 _LEDGER_BUDGET_SECONDS = 2.0
 # The hook's own deadline for everything before the ledger (see main).
 # NOT a sum that covers the nominal worst case (R1-c35: an earlier version
-# of this comment claimed it was): two 5 s git calls (project_root's
-# memoised one, and _current_branch's own, separate, un-memoised one) plus
-# up to three 8 s HTTP calls (lookup + POST/PATCH + dedup DELETE) add up to
-# ~29 s on paper, more than this budget. What actually keeps a slow run
-# inside it is IngestClient's own ``deadline`` (derived from this same
-# budget, see main): it refuses a call it could not finish rather than let
-# the wall clock run out from under it. This number only has to clear
-# ordinary latency plus that refusal path, and, with the ledger budget,
-# stay under the host's timeout.
+# of this comment tried to state that sum and got the total wrong; R2-c21
+# found the SAME comment's restated total also wrong, and its HTTP call
+# count too low -- a dedup page can delete several rows, not just one --
+# so this revision deliberately does not restate a call count or a total
+# at all, to stop that number drifting out of sync a third time): two git
+# calls (project_root's memoised one, and _current_branch's own, separate,
+# un-memoised one) plus a handful of HTTP calls (a lookup, zero or more
+# dedup deletes, and a final create/update) could, if every one of them
+# ran its full nominal timeout back to back, add up to well more than this
+# budget. What actually keeps a slow run inside it is IngestClient's own
+# ``deadline`` (derived from this same budget, see main): it refuses a
+# call it could not finish rather than let the wall clock run out from
+# under it. This number only has to clear ordinary latency plus that
+# refusal path, and, with the ledger budget, stay under the host's
+# timeout.
 _WORK_BUDGET_SECONDS = 20.0
 # IngestClient's own `deadline` sits this far inside the work budget, so the
 # client can refuse a request it would not finish in time rather than the
@@ -195,16 +203,43 @@ def _candidates(handoff_dir):
     broken/unreadable directory goes quiet forever. ``_locate`` below turns
     the re-raised error into ``pointer_unresolved`` with a stderr line
     naming it, instead of the silent skip this used to be.
+
+    A ``FileNotFoundError`` from ``listdir`` covers two different shapes
+    (R2-c03): the ordinary "does not exist at all", and ``handoff_dir``
+    itself being a DANGLING symlink (a broken mount, an unlinked shared
+    volume) -- something WAS configured here, so that one is re-raised too,
+    same as any other "cannot tell".
+
+    Each listed entry is STATTED explicitly (following symlinks, same as
+    ``os.path.isfile`` would) rather than filtered with ``os.path.isfile``
+    directly: that function catches ``OSError`` internally and returns
+    ``False``, so an entry that could not be statted at all -- typically
+    ``handoff_dir`` itself lacking the traverse (execute) bit needed to
+    reach entries inside it, the usual result of a recursive ``chmod 644``
+    over a whole ``docs/`` tree -- used to read exactly like "not a regular
+    file", silently dropping every candidate and landing on the quiet
+    ``no_handoff`` instead of the loud "cannot tell" ruling 5 requires. A
+    ``FileNotFoundError`` here, in contrast, is an ordinary race (listed a
+    moment ago, gone by the time this loop reaches it) and stays quiet.
     """
     try:
         names = os.listdir(handoff_dir)
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
+        if os.path.islink(handoff_dir):
+            raise
+        return []
+    except NotADirectoryError:
         return []
     out = []
     for name in names:
         if name.upper() in _HANDOFF_EXCLUDED_NAMES_UPPER or not name.endswith(".md"):
             continue
-        if os.path.isfile(os.path.join(handoff_dir, name)):
+        path = os.path.join(handoff_dir, name)
+        try:
+            is_file = stat.S_ISREG(os.stat(path).st_mode)
+        except FileNotFoundError:
+            continue
+        if is_file:
             out.append(name)
     return sorted(out)
 
@@ -250,7 +285,7 @@ def _probe_frontmatter(path):
     return frontmatter
 
 
-def _locate(handoff_dir):
+def _locate(handoff_dir, extra=None):
     """``(name, reason)``: the candidate filename (inside ``handoff_dir``) to
     ingest, or a reason when none could be located. Exactly one of the two
     is non-``None``.
@@ -267,11 +302,22 @@ def _locate(handoff_dir):
     re-raises anything other than "the directory does not exist" for this
     to catch, name on stderr, and fold into the existing failure-class
     reason rather than inventing a new one.
+
+    ``extra``, given (R2-c04), is a ledger ``extra`` dict updated in place
+    with a ``detail`` key on either ``pointer_unresolved`` exit: the two
+    origins -- unlistable directory vs. candidates that exist but none
+    resolved -- read identically on the ledger otherwise, and stderr from a
+    SessionEnd hook is not a channel anyone reads. ``None`` (the default)
+    skips this -- callers that only care about the reason, like most of
+    this file's own tests, need not provide one.
     """
     try:
         candidates = _candidates(handoff_dir)
     except OSError as exc:
-        print(f"[{HOOK}] docs/handoff exists but could not be listed: {exc!r}", file=sys.stderr)
+        detail = f"docs/handoff exists but could not be listed: {exc!r}"
+        print(f"[{HOOK}] {detail}", file=sys.stderr)
+        if extra is not None:
+            extra["detail"] = _short(detail)
         return None, "pointer_unresolved"
     if not candidates:
         return None, "no_handoff"
@@ -285,6 +331,11 @@ def _locate(handoff_dir):
             newest_name, newest_ts = name, ts
     if newest_name:
         return newest_name, None
+    if extra is not None:
+        extra["detail"] = _short(
+            f"{len(candidates)} candidate(s) in docs/handoff, none with a parseable "
+            f"updated-at and no pointer resolved to one"
+        )
     return None, "pointer_unresolved"
 
 
@@ -346,22 +397,36 @@ def _parse_instant(value):
 
 def _opted_out(frontmatter):
     """True when ``nexus-ingest`` selects the opt-out (R1-c05, TASK-005 R1
-    fix round). Normalises case and strips a trailing inline ``# reason``
-    comment before comparing -- this frontmatter dialect is flat
-    ``key: string`` only (session-handoff.md §2.3.8.3; Aria's own simple
-    parser keeps an inline comment verbatim on the value exactly like
-    ``_split_frontmatter`` above does), so ``Skip`` / ``SKIP`` / ``skip  #
-    has a secret in §6`` were all being read as "not skip" and ingested
-    instead of honouring the recovery path (``docs/architecture/memory-
-    layers.md`` §3.2) it exists for. Only the literal ``skip`` is
-    recognised once normalised: ``false`` / ``no`` / ``off`` are left
-    ingesting, an open question for Amendment A9, not a guess made here.
+    fix round; quoted values R2-c02). Strips a trailing inline ``# reason``
+    comment, then -- same as ``_split_frontmatter`` -- one level of matching
+    quotes, before normalising case and comparing -- this frontmatter
+    dialect is flat ``key: string`` only (session-handoff.md §2.3.8.3;
+    Aria's own simple parser keeps an inline comment verbatim on the value
+    exactly like ``_split_frontmatter`` above does), so ``Skip`` / ``SKIP``
+    / ``skip  # has a secret in §6`` were all being read as "not skip" and
+    ingested instead of honouring the recovery path (``docs/architecture/
+    memory-layers.md`` §3.2) it exists for.
+
+    The quote-stripping repeats ``_split_frontmatter``'s own step rather
+    than relying on it: that function only strips a pair of quotes sitting
+    at the very START and END of the WHOLE value, and a trailing comment
+    means the closing quote is no longer the last character -- so a
+    document written as ``nexus-ingest: "skip"  # reason`` (the quoted form
+    a human editing frontmatter by hand is likely to use) reaches here
+    still wearing its quotes, comment removed but quotes intact, and used
+    to compare unequal to the bare word ``skip``.
+
+    Only the literal ``skip`` is recognised once normalised: ``false`` /
+    ``no`` / ``off`` are left ingesting, an open question for Amendment A9,
+    not a guess made here.
     """
     value = frontmatter.get("nexus-ingest")
     if not isinstance(value, str):
         return False
-    value = re.split(r"\s+#", value, maxsplit=1)[0].strip().lower()
-    return value == "skip"
+    value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value.strip().lower() == "skip"
 
 
 # ── content: H1 -> §6 -> §2, capped ─────────────────────────────────────
@@ -416,11 +481,22 @@ def _cap(text, limit):
     not fit is the price: only when NOT EVEN ONE line fits inside ``limit``
     (no newline at all within the budget) does this fall back to the old
     mid-line hard cut, because there is nothing else left to do with it.
+
+    A ``limit`` too small for even the COMPLETE marker (R2-c07) comes back
+    ``""``, not a slice of the marker itself: the old ``_TRUNCATION_MARKER[
+    :limit]`` produced a partial marker like ``"\\n\\n…[t"`` for a budget of
+    5 -- unreadable, and indistinguishable from real content that happened
+    to get cut mid-marker, rather than a deliberate truncation notice.
+    Nothing useful fits in that band; the caller (``_assemble_content``)
+    already treats an empty result as "drop this section entirely" for
+    exactly this reason. ``limit`` exactly equal to the marker's own length
+    is the one point in this band worth keeping: the complete, un-truncated
+    marker, with zero characters of real content ahead of it.
     """
     if len(text) <= limit:
         return text
-    if limit <= len(_TRUNCATION_MARKER):
-        return _TRUNCATION_MARKER[: max(limit, 0)]
+    if limit < len(_TRUNCATION_MARKER):
+        return ""
     budget = limit - len(_TRUNCATION_MARKER)
     cut = text[:budget]
     newline = cut.rfind("\n")
@@ -482,6 +558,52 @@ def _build_content(body):
             return None, "sections_unparsed"
         return None, "empty_sections"
     return _assemble_content(h1, section6, section2), None
+
+
+def _cap_for_wire(content):
+    """Re-cut ``content`` (already at most ``_CONTENT_CAP`` chars, per
+    ``_build_content`` above) so the REDACTED text -- what ``_ingest_client``
+    actually puts on the wire -- also fits the cap (R2-c08).
+
+    ``_build_content`` / ``_assemble_content`` / ``_cap`` are deliberately
+    redaction-OBLIVIOUS: they only know about characters, and a value-level
+    redaction rule needs to see a secret's whole shape (see ``_cap``'s own
+    docstring), which is exactly why the cut there retreats to a line
+    boundary rather than the redactor's own match boundaries. But a
+    redaction MARKER is longer than a short secret it replaces
+    (``[redacted:url-userinfo]`` is 23 characters; a URL password can be as
+    short as 4), so content this hook built at EXACTLY the cap -- honouring
+    its own invariant -- can still leave the process longer than the cap by
+    the time ``_ingest_client`` redacts it.
+
+    This file owns the 4000-character business rule (``_CONTENT_CAP``);
+    ``_ingest_client`` is generic and shared with memory_sync, so guessing a
+    per-caller limit there is the wrong layer. Re-running the SAME redaction
+    pass here (rather than trying to predict its growth analytically) is
+    the simplest thing that is still correct; ``_ingest_client`` redacts
+    this same text again on the way out, which is idempotent (the marker
+    text itself matches no rule).
+
+    Bounded: each iteration's cut is by at least the previous iteration's
+    overflow (>= 1 whenever the loop runs again), so this converges in one
+    or two passes for any realistic document; the loop is additionally
+    capped at ``_CONTENT_CAP`` iterations as a hard ceiling against a
+    pathological future redaction rule that never converges.
+    """
+    limit = _CONTENT_CAP
+    for _ in range(_CONTENT_CAP):
+        redacted, _hits = _redact.redact_text(content)
+        overflow = len(redacted) - _CONTENT_CAP
+        if overflow <= 0:
+            return content
+        limit -= overflow
+        if limit <= 0 or len(content) <= limit:
+            # Nothing left to safely cut (e.g. the whole thing is one
+            # matched secret) -- leave it to _ingest_client / the backend
+            # rather than mangle it further.
+            return content
+        content = _cap(content, limit)
+    return content
 
 
 # ── metadata / external_id ──────────────────────────────────────────────
@@ -574,7 +696,7 @@ def _collect(run):
     root = toplevel or cwd
     handoff_dir = os.path.join(root, "docs", "handoff")
 
-    name, locate_reason = _locate(handoff_dir)
+    name, locate_reason = _locate(handoff_dir, run["extra"])
     if locate_reason:
         return locate_reason
     doc_path = os.path.join(handoff_dir, name)
@@ -616,6 +738,7 @@ def _collect(run):
     content, content_reason = _build_content(body)
     if content_reason:
         return content_reason
+    content = _cap_for_wire(content)  # R2-c08: the cap must hold post-redaction too
 
     # ---- write path: owner + content both passed ----
     metadata = _build_metadata(session_id, _current_branch(cwd), frontmatter, doc_uuid)
@@ -626,12 +749,22 @@ def _collect(run):
         current=_identity.container_id(),
         state_existed=_hook_state.state_exists(HOOK, cwd),
     )
-    if drift_reasons:
+    if "identity_changed" in drift_reasons:
         # Recorded independently of the scalar `reason` this run ends on
         # (ruling 2, R1-c04): worst_reason can have a higher-priority
         # failure such as http_error outrank identity_changed there, and
         # without this separate flag the drift signal simply disappears
         # from the ledger for that run -- exactly the finding's complaint.
+        #
+        # Checked by MEMBERSHIP, not `if drift_reasons:` (R2-c06): a
+        # corrupted or pre-migration state file (one that exists but
+        # carries no `container_id`) makes `identity_drift` return
+        # `["unknown"]` -- the previous identity is UNKNOWABLE, a
+        # genuinely different condition from "the identity changed", and
+        # the old truthiness check stamped `identity_changed: True` on
+        # that ledger row too, sending a reader chasing a container swap
+        # that never happened. `worst_reason` below still surfaces
+        # `unknown` as the scalar `reason` either way.
         run["extra"]["identity_changed"] = True
 
     client = _ingest_client.IngestClient(
@@ -695,12 +828,32 @@ def _record(reason, started, run, work_left_behind):
     on ``run["persist_container_id"]`` -- a thread abandoned mid-``upsert``
     must not have its guess about the outcome trusted.
 
-    The persist attempt runs BEFORE ``record_run``, and its own failure
-    reason (``state_write_failed``) is folded into what gets recorded
-    (ruling 2): the two are separate files, but the ledger is the only
-    channel a user ever sees, so a failure to persist container_id must
-    show up on the very row that would otherwise misreport this run as the
-    clean one that resolved the drift.
+    ``record_run`` happens FIRST, the persist attempt only AFTER (R2-c01,
+    reversing an earlier revision that had it the other way around): both
+    steps share this one budgeted ``write()``, and ``write_with_budget``
+    abandons whichever step is still running at ``_LEDGER_BUDGET_SECONDS``
+    -- the thread is simply left behind, not killed, but the process this
+    runs in DOES get killed shortly after, via ``_hook_runner.finish``'s
+    ``os._exit(0)`` when a thread was left behind (see ``__main__`` below).
+    Persisting first meant a persist slow or contended enough to eat the
+    whole budget could commit the new container_id to disk and STILL run
+    out of time before record_run ever ran -- os._exit then erasing the row
+    for good, not just the persist half of it, because the next run's drift
+    check reads the already-updated state and finds nothing changed. With
+    record_run first, the row that says what THIS run did is what has to
+    survive a slow persist, not the other way around; a persist abandoned
+    after it merely means the NEXT run's drift check still sees the old id
+    and reports the (by then already known) drift again -- a duplicate,
+    not a silent loss.
+
+    A persist failure discovered this way -- after the run's own row is
+    already on disk -- can no longer be folded into that row's `reason`
+    (ruling 2's literal "must not vanish" used to mean exactly that merge).
+    Rewriting the row already appended would need a new ``_hook_state``
+    primitive this fix does not add; a second, independent
+    ``state_write_failed`` row is what stays inside the existing public
+    surface (Amendment A9 -- the exact shape of "must not vanish" is an
+    owner question, not decided here).
     """
     elapsed_ms = int((time.monotonic() - started) * 1000)
     # R1-c09: a work thread abandoned mid-`upsert` never reaches the line
@@ -712,40 +865,70 @@ def _record(reason, started, run, work_left_behind):
     extra, persist = dict(run["extra"]), run["persist_container_id"] and not work_left_behind
 
     def write():
-        final_reason = reason
-        if persist:
-            try:
-                _new_state, persist_reasons = _hook_state.update_state(
-                    HOOK,
-                    cwd or os.getcwd(),
-                    lambda s: {**s, "container_id": _identity.container_id()},
-                )
-            except Exception as exc:  # noqa: BLE001 - update_state does not raise by contract; the net under it
-                print(f"[{HOOK}] could not persist container_id: {exc!r}", file=sys.stderr)
-                persist_reasons = ["state_write_failed"]
-            if persist_reasons:
-                final_reason = _hook_state.worst_reason([final_reason, *persist_reasons])
         try:
             _hook_state.record_run(
                 HOOK,
-                ok=not _hook_state.is_failure_reason(final_reason),
-                reason=final_reason,
+                ok=not _hook_state.is_failure_reason(reason),
+                reason=reason,
                 elapsed_ms=elapsed_ms,
                 calls=calls,
                 cwd=cwd,
                 extra=extra or None,
             )
         except Exception as exc:  # record_run does not raise by contract; the net under it
-            print(f"[{HOOK}] could not record this run ({final_reason}): {exc!r}", file=sys.stderr)
+            print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+        if not persist:
+            return
+        try:
+            _new_state, persist_reasons = _hook_state.update_state(
+                HOOK,
+                cwd or os.getcwd(),
+                lambda s: {**s, "container_id": _identity.container_id()},
+            )
+        except Exception as exc:  # noqa: BLE001 - update_state does not raise by contract; the net under it
+            print(f"[{HOOK}] could not persist container_id: {exc!r}", file=sys.stderr)
+            persist_reasons = ["state_write_failed"]
+        if not persist_reasons:
+            return
+        # The row above already recorded this run's true reason; a persist
+        # failure found only now is a second, independent fact, not a
+        # correction of it -- see the "state_write_failed" paragraph above.
+        try:
+            _hook_state.record_run(
+                HOOK,
+                ok=False,
+                reason="state_write_failed",
+                elapsed_ms=0,
+                calls=None,
+                cwd=cwd,
+                extra={"detail": _short(f"container_id persist failed after this run ({reason})")},
+            )
+        except Exception as exc:  # record_run does not raise by contract; the net under it
+            print(f"[{HOOK}] could not record state_write_failed: {exc!r}", file=sys.stderr)
 
     left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
     if left_behind:
-        print(
+        _warn(
             f"[{HOOK}] ledger write still running after {_LEDGER_BUDGET_SECONDS}s; "
-            f"leaving it behind, this run ({reason}) may go unrecorded",
-            file=sys.stderr,
+            f"leaving it behind, this run ({reason}) may go unrecorded"
         )
     return left_behind
+
+
+def _warn(message):
+    """Print one diagnostic line to stderr, never raising (R2-c05).
+
+    A closed stderr pipe (the host is already exiting) makes ``print``
+    raise ``BrokenPipeError``; every stderr write ``main()`` itself makes
+    (the ones on the MAIN thread, not already behind one of
+    ``_hook_runner``'s own thread-boundary nets) goes through this instead
+    of a bare ``print`` -- see ``main()`` below for why that ordering, not
+    just this swallow, is what actually protects the ledger row.
+    """
+    try:
+        print(message, file=sys.stderr)
+    except OSError:
+        pass
 
 
 def main():
@@ -763,32 +946,45 @@ def main():
         "deadline": started + _WORK_BUDGET_SECONDS - _DEADLINE_SLACK_SECONDS,
     }
 
-    # _collect itself never calls print(): the WORK stays off stdio so an
-    # abandoned thread cannot interleave with anything main() writes after
-    # giving up on it. Not quite absolute, though (R1-c35): the client it
-    # calls into (_ingest_client) still writes a diagnostic line to stderr
-    # on a couple of its own paths (a dedup page that filled up, a body
-    # that could not be serialised) -- the same "spooky abandoned thread"
-    # risk _hook_runner's own docstring already names for stderr, not
-    # something this hook adds beyond it.
+    # _collect itself never calls print() DIRECTLY: the WORK stays off
+    # stdio so an abandoned thread cannot interleave with anything main()
+    # writes after giving up on it. Not quite absolute in practice, though
+    # (R1-c35 said so of _ingest_client alone, and named two of its paths;
+    # R2-c21 found that undercount, so this revision names none, rather
+    # than restate a list that can go stale again the same way): _locate,
+    # which _collect calls directly, prints its own diagnostic line (an
+    # unlistable docs/handoff), and _ingest_client has SEVERAL of its own
+    # -- the same "spooky abandoned thread" risk _hook_runner's own
+    # docstring already names for stderr, not something this hook adds
+    # beyond it.
     outcome, left_behind = _hook_runner.run_with_deadline(
         lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
     )
 
     reason = "unknown"
+    diagnostic = None
     if left_behind:
         reason = "timeout"
-        print(
-            f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind",
-            file=sys.stderr,
-        )
+        diagnostic = f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind"
     elif "result" not in outcome:
         exc = outcome.get("error", RuntimeError("the worker ended without a result"))
         reason = _hook_state.reason_for_exception(exc)
-        print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+        diagnostic = f"[{HOOK}] {reason}: {exc!r}"
     else:
         reason = outcome["result"]
-    return _record(reason, started, run, left_behind) or left_behind
+
+    # _record (the ledger row for THIS run) runs BEFORE the diagnostic
+    # print, not after (R2-c05): the old order printed first, and a stderr
+    # write that fails -- a closed pipe, the host already exiting -- used
+    # to raise straight out of main() before _record ever ran, silently
+    # losing the row for a run that had a genuine, useful reason to report
+    # (timeout / a real exception). _warn's own swallow is a second,
+    # independent net: even the reordering does not help if a LATER stderr
+    # write in _record's own ledger-write path were to fail the same way.
+    record_left_behind = _record(reason, started, run, left_behind)
+    if diagnostic is not None:
+        _warn(diagnostic)
+    return record_left_behind or left_behind
 
 
 if __name__ == "__main__":

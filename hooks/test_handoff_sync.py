@@ -110,6 +110,19 @@ def _run_main(mod, event, extra_env):
         sys.stdin = old_stdin
 
 
+class _BrokenStderr:
+    """A stand-in for ``sys.stderr`` whose ``write`` always raises
+    ``BrokenPipeError`` -- what a real closed pipe (the host process has
+    already exited) looks like to a ``print(..., file=sys.stderr)`` call
+    (R2-c05)."""
+
+    def write(self, *args, **kwargs):
+        raise BrokenPipeError("stderr closed")
+
+    def flush(self):
+        raise BrokenPipeError("stderr closed")
+
+
 def _run_hook(stdin_text, env=None, want_stderr=False, script=None):
     """Drive the real script as a subprocess; return (stdout_bytes, exit_code).
 
@@ -335,11 +348,19 @@ class TestLocate(_HandoffDirCase):
         latest.md / README.md must not be a literal-case match -- a project
         that only keeps a lowercase readme.md is the same "no handoff kept
         here" shape as one with README.md, not a broken one reported every
-        session."""
+        session.
+
+        The latest.md leg uses ``LATEST.md`` (uppercase NAME, lowercase
+        extension) rather than ``Latest.MD`` (R2-c14): the candidate filter
+        first requires ``name.endswith(".md")``, which is itself a literal,
+        case-SENSITIVE match -- ``Latest.MD`` fails that check before the
+        name-exclusion comparison this test means to exercise is ever
+        reached, so it would report ``no_handoff`` even if the exclusion's
+        own case-insensitivity regressed to a literal match."""
         self._mkdir()
         with open(os.path.join(self.handoff_dir, "readme.md"), "w", encoding="utf-8") as fh:
             fh.write("# About this directory\n")
-        with open(os.path.join(self.handoff_dir, "Latest.MD"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(self.handoff_dir, "LATEST.md"), "w", encoding="utf-8") as fh:
             fh.write("nothing useful\n")
         self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
 
@@ -383,6 +404,82 @@ class TestLocate(_HandoffDirCase):
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
+    def test_an_unreadable_directory_is_pointer_unresolved_even_as_root(self):
+        """R2-c09: the chmod-000 test above SKIPS when the suite runs as
+        root (root ignores the permission bits, so `os.listdir` succeeds
+        anyway) -- and this plugin's CI image declares no non-root `user:`,
+        so that test never actually RUNS there. Injecting the error via
+        mock exercises the exact same `_locate` branch regardless of who
+        is running the suite; the chmod version is kept alongside it as a
+        real-shape control for when the suite does run unprivileged."""
+        self._mkdir()
+        stderr = io.StringIO()
+        with mock.patch.object(_MOD.os, "listdir", side_effect=PermissionError(13, "denied")), \
+                mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("docs/handoff", stderr.getvalue())
+
+    def test_an_unstattable_candidate_entry_is_pointer_unresolved_not_quiet(self):
+        """R2-c03: the per-entry filter used to call `os.path.isfile()`,
+        which CATCHES OSError internally and returns False -- so a listed
+        name that could not be STATTED (typically the directory itself
+        lacking the execute bit needed to traverse into it, the usual
+        result of a recursive `chmod 644` over a whole `docs/` tree) read
+        exactly like "not a regular file", silently dropping every
+        candidate and landing on the quiet no_handoff most projects hit,
+        rather than the loud "cannot tell" ruling 5 requires. `os.stat`
+        (not `isfile`) is mocked here so the injection is independent of
+        which underlying primitive the fix ends up calling being isfile-
+        shaped or stat-shaped, as long as SOME per-entry OSError surfaces."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md")
+        stderr = io.StringIO()
+        with mock.patch.object(_MOD.os, "stat", side_effect=PermissionError(13, "denied")), \
+                mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("docs/handoff", stderr.getvalue())
+
+    def test_a_dangling_symlink_handoff_dir_is_pointer_unresolved_not_quiet(self):
+        """R2-c03, second leg: `docs/handoff` ITSELF being a dangling
+        symlink (a broken mount, an unlinked shared volume) makes
+        `os.listdir` raise `FileNotFoundError` -- indistinguishable, by
+        exception type alone, from "the directory does not exist" at all.
+        But something WAS configured here; that is "cannot tell", not the
+        ordinary quiet case."""
+        os.makedirs(os.path.dirname(self.handoff_dir), exist_ok=True)  # docs/, NOT docs/handoff itself
+        os.symlink(os.path.join(self.tmp.name, "does-not-exist"), self.handoff_dir)
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+
+    def test_pointer_unresolved_records_a_detail_for_an_unlistable_directory(self):
+        """R2-c04: the two `pointer_unresolved` origins (a directory that
+        could not be listed at all, vs. one whose candidates all failed to
+        resolve) used to be indistinguishable on the ledger -- the only
+        channel a user can actually inspect; stderr from a SessionEnd hook
+        is not read by anyone. `extra`, when given, must end up with a
+        `detail` naming which origin this was."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md")
+        extra = {}
+        with mock.patch.object(_MOD, "_candidates", side_effect=OSError("denied")), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("could not be listed", extra["detail"])
+
+    def test_pointer_unresolved_records_a_detail_when_no_candidate_resolves(self):
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "not: a-known-key", "---"])
+        _write_latest_pointer(self.handoff_dir, "does-not-exist.md")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("candidate", extra["detail"])
+
     # -- Amendment A4-5 pair: the SAME directory shape, contents-only diff --
 
     def test_a4_5_leg_empty_dir_is_no_handoff(self):
@@ -419,6 +516,13 @@ class TestContent(unittest.TestCase):
         self.assertIn("still six", content)  # a subsection is swept up
         self.assertNotIn("已完成", content)   # §1 excluded
         self.assertNotIn("提交清单", content)  # §7 excluded
+        # R2-c12: every other assertion here is an ordering/substring check
+        # that would still pass if `_join` separated parts with a single
+        # newline instead of a blank line -- pin the exact separator too, so
+        # adjacent sections do not visually run together in the rendered
+        # Markdown.
+        self.assertIn("# My Title\n\n## §6 Next session 入口", content)
+        self.assertIn("still six\n\n## §2 未完成", content)
 
     def test_section_sixty_is_not_mistaken_for_section_six(self):
         body = "# T\n\n## §60 Something Else\n\nnope\n\n## §6 Next session\n\nreal six\n"
@@ -478,6 +582,34 @@ class TestContent(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertLessEqual(len(content), _MOD._CONTENT_CAP)
         self.assertIn("truncated", content)
+
+    def test_cap_never_returns_a_partial_truncation_marker(self):
+        """R2-c07: a remaining budget of 1..13 chars (less than the marker's
+        OWN length) used to return a slice of the marker itself, e.g.
+        "\\n\\n…[t" -- an unreadable fragment that looks like real content
+        got cut mid-marker, not a deliberate truncation notice. Too little
+        room for even the complete marker must come back empty; exactly
+        enough room (14, the marker's own length) must come back as the
+        whole marker, uncut."""
+        long_text = "x" * 100
+        for limit in range(1, len(_MOD._TRUNCATION_MARKER)):
+            with self.subTest(limit=limit):
+                result = _MOD._cap(long_text, limit)
+                self.assertEqual(result, "", f"limit={limit} produced a fragment: {result!r}")
+        self.assertEqual(_MOD._cap(long_text, len(_MOD._TRUNCATION_MARKER)), _MOD._TRUNCATION_MARKER)
+
+    def test_cap_never_leaves_a_partial_truncation_marker_in_assembled_content(self):
+        """R2-c07, end to end: engineer H1 + section6 so section2's
+        remaining budget lands at exactly 7 (inside the dangerous 1..13
+        band) and confirm the assembled content carries no marker
+        fragment -- section2 is dropped whole instead."""
+        h1 = "# T"
+        section6 = "A" * (_MOD._CONTENT_CAP - 9 - len(h1) - len("\n\n"))
+        section2 = "B" * 500
+        content = _MOD._assemble_content(h1, section6, section2)
+        self.assertLessEqual(len(content), _MOD._CONTENT_CAP)
+        self.assertNotIn("…[", content)  # no partial marker fragment anywhere
+        self.assertNotIn("B", content)  # section2 dropped whole, not partially
 
     def test_a_credential_spanning_the_cut_point_does_not_reach_the_wire(self):
         """R1-c02/c11: the OLD hard mid-line cut could land inside a value
@@ -626,6 +758,24 @@ class TestOptOut(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(_MOD._opted_out({"nexus-ingest": value}))
 
+    def test_a_quoted_value_with_an_inline_comment_still_opts_out(self):
+        """R2-c02: _split_frontmatter only strips a matching pair of quotes
+        when they sit at the very start AND end of the WHOLE value -- a
+        trailing inline comment means the closing quote is no longer the
+        last character, so a quoted `"skip"  # reason` / `'skip' # reason`
+        value still carries its quotes by the time it reaches here. Both
+        quote styles must still be recognised once the comment is gone."""
+        self.assertTrue(_MOD._opted_out({"nexus-ingest": '"skip"  # leaked a token'}))
+        self.assertTrue(_MOD._opted_out({"nexus-ingest": "'skip' # leaked a token"}))
+
+    def test_a_value_merely_containing_skip_does_not_opt_out(self):
+        """R2-c15: guards the exact-match comparison against a future
+        widening to a substring check (e.g. `"skip" in value`), which would
+        silently opt out documents whose value merely mentions "skip"."""
+        for value in ("skipped", "no-skip-please", "unskippable"):
+            with self.subTest(value=value):
+                self.assertFalse(_MOD._opted_out({"nexus-ingest": value}))
+
 
 class TestMetadata(unittest.TestCase):
     """_build_metadata: aria.* keys and `branch` are OMITTED (not sent as an
@@ -672,21 +822,43 @@ class TestPointerTargetReadSafety(_HandoffDirCase):
     the hook or exhaust memory just to find one pointer line."""
 
     def test_a_non_regular_latest_md_reads_as_no_pointer(self):
+        """R2-c13: ``_pointer_target`` runs on a watchdog thread of THIS
+        test's own, with its own 1 s bound (the ``test_hook_runner.py``
+        pattern, ``test_a_budget_that_stopped_working_fails_fast_not_
+        slow``) rather than being called directly on the main test
+        thread. ``unittest`` has NO per-test default timeout -- an
+        earlier revision of this docstring claimed there was one -- so if
+        the ``os.path.isfile`` guard this test means to pin ever
+        regressed, ``open()`` on a FIFO with no writer blocks forever,
+        and calling it directly here would hang this test, and the whole
+        suite behind it, rather than failing fast."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         fifo_path = os.path.join(self.handoff_dir, "latest.md")
         os.mkfifo(fifo_path)  # a directory would also fail isfile(); a FIFO is the risk this guards
         self.addCleanup(os.remove, fifo_path)
+
+        result = {}
+
+        def call_it():
+            result["pointer"] = _MOD._pointer_target(self.handoff_dir)
+
+        watchdog = threading.Thread(target=call_it, daemon=True)
+        watchdog.start()
+        watchdog.join(1.0)
+        self.assertFalse(
+            watchdog.is_alive(), "_pointer_target did not return within 1s (FIFO open() blocked?)"
+        )
         # Reads as "no pointer" (falls back to newest updated-at), NOT a
-        # blocking open() -- the assertion is really that this call returns
-        # at all, promptly, under the test runner's own default timeout.
-        self.assertEqual(_MOD._pointer_target(self.handoff_dir), None)
+        # blocking open().
+        self.assertIsNone(result.get("pointer"))
         self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
 
 
 # ════════════════════════════════════════════════════════════════════════
 # end-to-end through the REAL IngestClient (scripted loopback backend)
 # ════════════════════════════════════════════════════════════════════════
+
 
 class _WriteCase(unittest.TestCase):
     """A throwaway project + a scripted loopback backend, driving the hook
@@ -792,6 +964,16 @@ class TestOwnerAndOptOut(_WriteCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "opted_out")
 
+    def test_nexus_ingest_quoted_skip_with_inline_comment_is_opted_out(self):
+        """R2-c02, end to end: the recovery path in memory-layers.md §3.2
+        writes `nexus-ingest: "skip"  # <reason>` (quoted, commented) after
+        a server-side row was soft-deleted; the opt-out must still be
+        honoured, or the row gets recreated on the very next SessionEnd."""
+        self._write("2026-09-20-1000-x.md", nexus_ingest='"skip"  # leaked a token in §6')
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "opted_out")
+
     def test_a_pointer_resolved_candidate_missing_owner_container_falls_through(self):
         """A4-5 note: it does not silently skip -- it reaches the owner
         check, which reports identity_unresolved (there is no value to
@@ -807,6 +989,32 @@ class TestOwnerAndOptOut(_WriteCase):
         self._run()
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "identity_unresolved")
+
+
+class TestChosenDocumentReadCap(_WriteCase):
+    """R2-c18: R1-c13 added ``_MAX_DOCUMENT_BYTES`` for TWO reads -- the
+    ``latest.md`` pointer probe (``_pointer_target``, fixture in
+    ``TestPointerTargetReadSafety``) and the CHOSEN document's own read
+    inside ``_collect`` (``fh.read(_MAX_DOCUMENT_BYTES)``) -- but only the
+    first of the two had a fixture. An abnormally huge candidate would
+    otherwise be read into memory in full before anything here gets a
+    chance to cap it."""
+
+    def test_the_chosen_documents_read_is_bounded(self):
+        # Patched well ABOVE the frontmatter block (~114 chars for this
+        # fixture's defaults) so parsing still succeeds, but well BELOW
+        # where the marker sits -- and the marker itself sits well below
+        # `_CONTENT_CAP` (4000), so if the read cap were the only thing
+        # missing, nothing downstream would ALSO have trimmed it away.
+        marker = "MARKERBEYONDCAP"
+        section6 = "## §6 Next session 入口 + 优先级建议\n\n" + ("A" * 300) + marker
+        with mock.patch.object(_MOD, "_MAX_DOCUMENT_BYTES", 200):
+            self._write("2026-09-20-1000-x.md", section6=section6)
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+            self._run()
+        sent = self.requests[1]["json"]["content"]
+        self.assertLess(len(sent), _MOD._CONTENT_CAP)  # nowhere near the OTHER cap
+        self.assertNotIn(marker, sent)
 
 
 class TestPointerUnresolvedIsReported(_WriteCase):
@@ -827,6 +1035,37 @@ class TestPointerUnresolvedIsReported(_WriteCase):
         self.assertEqual(self._last_entry()["reason"], "no_handoff")
         findings, _marks = _INJECT_MOD._failure_report(self.cwd)
         self.assertFalse(any("handoff-sync" in f for f in findings), findings)
+
+
+class TestContentReasonsEndToEnd(_WriteCase):
+    """R2-c10: the content-level split (ruling 3 / R1-c01) -- empty_sections
+    quiet, sections_unparsed a failure reported at the next SessionStart --
+    was previously exercised only at the pure-function level
+    (``_build_content`` in ``TestContent``). This drives it through a real
+    file, ``main()``, and the ledger: the missing link was ``_collect``'s
+    own wiring from ``_build_content``'s ``content_reason`` to the run's
+    ``reason`` (:content_reason: return content_reason` a few lines below
+    the call), not the pure function itself."""
+
+    def test_an_empty_handoff_body_is_quiet(self):
+        self._write("2026-09-20-1000-x.md", body="   \n\n  ")
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "empty_sections")
+        findings, _marks = _INJECT_MOD._failure_report(self.cwd)
+        self.assertFalse(any("handoff-sync" in f for f in findings), findings)
+
+    def test_renamed_headings_on_a_real_file_is_reported_next_session_start(self):
+        body = "# Title\n\n" + ("prose with no known section headings at all. " * 10)
+        self.assertGreaterEqual(len(body.strip()), _MOD._MIN_NONTRIVIAL_BODY)
+        self._write("2026-09-20-1000-x.md", body=body)
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "sections_unparsed")
+        findings, _marks = _INJECT_MOD._failure_report(self.cwd)
+        self.assertTrue(
+            any("handoff-sync" in f and "sections_unparsed" in f for f in findings), findings
+        )
 
 
 class TestWritePath(_WriteCase):
@@ -987,6 +1226,34 @@ class TestWritePath(_WriteCase):
         self.assertIn("[redacted:url-userinfo]", sent_content)
         self.assertEqual(self._last_entry()["redacted"], 1)
 
+    def test_redaction_can_grow_content_past_the_4000_char_cap(self):
+        """R2-c08: `_build_content` caps at `_CONTENT_CAP` BEFORE
+        `_ingest_client` redacts -- and a redaction marker is LONGER than a
+        short secret it replaces (a 4-char URL password becomes the
+        23-char "[redacted:url-userinfo]" marker, +19 net per hit).
+        Content this hook built at EXACTLY the cap, honouring its own
+        invariant, can still leave the process longer than the cap by the
+        time it reaches the wire -- `filler` below was sized (empirically,
+        against the current H1/section2 defaults) so the built content
+        lands exactly at `_CONTENT_CAP` with the secret intact."""
+        secret_line = "See db: postgresql://nexus:abcd@db-host:5432/nexus"
+        self.assertEqual(len(_redact.find(secret_line)), 1)  # the fixture must actually be caught
+        filler = "A" * 3869
+        section6 = "## §6 Next session 入口\n\n" + filler + "\n" + secret_line
+        path = self._write("2026-09-20-1000-x.md", section6=section6)
+
+        with open(path, encoding="utf-8") as fh:
+            _fm, body = _MOD._split_frontmatter(fh.read())
+        content, reason = _MOD._build_content(body)
+        self.assertIsNone(reason)
+        self.assertEqual(len(content), _MOD._CONTENT_CAP)  # the hook's own cap invariant holds
+        self.assertIn(secret_line, content)  # intact, uncut -- not a cap-boundary artefact
+
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+        sent_content = self.requests[1]["json"]["content"]
+        self.assertLessEqual(len(sent_content), _MOD._CONTENT_CAP)  # the WIRE content must not exceed it either
+
     def test_session_id_missing_is_loud_and_writes_nothing(self):
         self._write("2026-09-20-1000-x.md")
         with mock.patch("sys.stderr"):
@@ -1085,6 +1352,109 @@ class TestWritePath(_WriteCase):
         state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
         self.assertEqual(state.get("container_id"), CONTAINER)
 
+    def test_identity_drift_row_survives_a_persist_that_stalls_past_the_ledger_budget(self):
+        """R2-c01: the row for THIS run must exist independently of how long
+        the container_id persist (which follows it) takes. The earlier
+        ordering wrote the persist FIRST, inside the same budgeted write();
+        a persist slow/contended enough to eat the whole ledger budget could
+        commit the new container_id to disk and then run out of budget
+        before record_run ever ran at all -- silently and PERMANENTLY
+        losing identity_changed (the next run's drift check would then find
+        the state already at the new id and detect nothing). Reordering
+        alone fixes this: record_run must complete before the persist
+        attempt even starts.
+
+        The persist step is stalled here (not the ledger write itself) via
+        a released Event, the same pattern as
+        test_calls_is_recorded_as_unknown_not_zero_when_the_work_is_abandoned
+        above -- a real subprocess kill is exercised separately by
+        TestSubprocess; what matters at this level is the ORDER of the two
+        writes, not the abandonment mechanics themselves.
+        """
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "none")
+
+        release = threading.Event()
+        self.addCleanup(release.set)  # let the stalled persist finish so it does not leak into later tests
+
+        def stalled_update_state(name, cwd, mutate):
+            release.wait(30)
+            return dict(mutate({})), []
+
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
+                mock.patch.object(_hook_state, "update_state", side_effect=stalled_update_state), \
+                mock.patch.object(_MOD, "_LEDGER_BUDGET_SECONDS", 0.2):
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
+            with mock.patch("sys.stderr"):  # the abandoned-write warning is expected here
+                self._run(session_id="sess-1")
+
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "identity_changed")
+        self.assertTrue(entry["identity_changed"])
+        # The persist itself has not gone through yet (still stalled): proof
+        # that the row above was NOT gated on it finishing first.
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), CONTAINER)
+
+    def test_state_write_failed_from_persisting_does_not_vanish(self):
+        """Ruling 2 / R2-c11: a persist failure discovered AFTER the run's
+        own row is already written must still show up in the ledger, and
+        the drift itself must still be detected on the NEXT run (the old
+        container_id was never actually replaced on disk, so it is not a
+        one-time report that then falls silent)."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-1")
+
+        def failing_update_state(name, cwd, mutate):
+            return {}, ["state_write_failed"]
+
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
+                mock.patch.object(_hook_state, "update_state", side_effect=failing_update_state):
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
+            with mock.patch("sys.stderr"):
+                self._run(session_id="sess-1")
+
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        self.assertGreaterEqual(len(entries), 2)
+        identity_row, persist_row = entries[-2], entries[-1]
+        self.assertEqual(identity_row["reason"], "identity_changed")
+        self.assertTrue(identity_row["identity_changed"])
+        self.assertEqual(persist_row["reason"], "state_write_failed")
+        self.assertFalse(persist_row["ok"])
+
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), CONTAINER)  # never actually persisted
+
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
+            self.backend.reply(200, _page()).reply(201, {"memory_id": "m3"})
+            self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "identity_changed")  # still unresolved
+
+    def test_identity_drift_unknown_does_not_set_identity_changed(self):
+        """R2-c06: `_hook_state.identity_drift` returns `['unknown']` --
+        NOT `['identity_changed']` -- when the previous identity is
+        UNKNOWABLE (state exists but carries no `container_id`, e.g. a
+        corrupted or pre-migration state file): a genuinely different
+        condition from "the identity changed". The old code treated ANY
+        non-empty `drift_reasons` as `identity_changed=True`, conflating
+        the two and sending a debugger chasing a container swap that never
+        happened."""
+        self._write("2026-09-20-1000-x.md")
+        _hook_state.update_state(_MOD.HOOK, self.cwd, lambda s: {**s, "some_other_key": "x"})
+        self.assertTrue(_hook_state.state_exists(_MOD.HOOK, self.cwd))
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertNotIn("container_id", state)
+
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        with mock.patch("sys.stderr"):
+            self._run(session_id="sess-1")
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertNotIn("identity_changed", entry)
+
     def test_calls_is_recorded_as_unknown_not_zero_when_the_work_is_abandoned(self):
         """R1-c09: `run["calls"]` is only assigned AFTER `upsert` returns --
         a thread abandoned while still INSIDE it (the outer work budget, not
@@ -1106,6 +1476,30 @@ class TestWritePath(_WriteCase):
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "timeout")
         self.assertIsNone(entry["calls"])
+
+    def test_a_broken_stderr_pipe_does_not_cost_the_ledger_row(self):
+        """R2-c05: the timeout/exception branches in `main()` used to print
+        their diagnostic line to stderr BEFORE calling `_record` -- so a
+        stderr write that fails (the host has already closed the pipe, on
+        its own way out) raised OUT of `main()` before the ledger row was
+        ever written, silently losing the record of this run entirely
+        (and, via `_hook_runner.finish`'s own interpreter-shutdown flush,
+        risked the "always exit 0" contract too, on the real subprocess
+        path). The ledger write must not depend on stderr succeeding."""
+        self._write("2026-09-20-1000-x.md")
+        release = threading.Event()
+        self.addCleanup(release.set)  # let the abandoned worker finish and exit
+
+        def stall(*args, **kwargs):
+            release.wait(30)
+            return _ingest_client.Outcome()
+
+        with mock.patch.object(_ingest_client.IngestClient, "upsert", stall), \
+                mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.2), \
+                mock.patch("sys.stderr", _BrokenStderr()):
+            self._run(session_id="sess-1")  # must not raise BrokenPipeError
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "timeout")
 
     def test_source_name_is_the_backend_allowlisted_value(self):
         """R1-c27: SOURCE_NAME is a literal string the backend attributes by
@@ -1317,6 +1711,34 @@ class TestRuns(unittest.TestCase):
             self._run(non_repo)
         self.assertEqual([r["method"] for r in self.backend.requests], ["GET", "POST"])
         entries, _ = _hook_state.read_ledger(_MOD.HOOK, non_repo)
+        self.assertEqual(entries[-1]["reason"], "none")
+
+    def test_a_non_string_cwd_value_is_ignored_and_falls_back_to_process_cwd(self):
+        """R2-c19: the type/non-empty guard on the SessionEnd event's `cwd`
+        exists for exactly this shape -- a non-string but still TRUTHY
+        value (a list, say) must be IGNORED, falling back to the hook's own
+        process cwd, the same as an absent `cwd` -- not surfaced as an
+        `unknown` failure. The host's own contract guarantees `cwd` is a
+        string; this pins what happens if that is ever not true, rather
+        than trusting the contract blindly and letting a non-string value
+        flow into `_identity`/`_hook_state`, where it would eventually
+        raise (a `subprocess.run` argument list cannot contain a list) and
+        surface as a loud but unhelpful `unknown`."""
+        _write_handoff(self.handoff_dir, "2026-09-20-1000-x.md", owner=f"owner/{LOCAL_UUID}")
+        _write_latest_pointer(self.handoff_dir, "2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        with mock.patch.object(_MOD.os, "getcwd", return_value=self.repo):
+            _run_main(
+                _MOD,
+                {"cwd": ["not", "a", "string"], "session_id": "s"},
+                {
+                    "NEXUS_API_URL": self.backend.url,
+                    "NEXUS_HOOK_STATE_DIR": self.state_dir,
+                    "NEXUS_DEFAULT_USER_ID": USER,
+                },
+            )
+        self.assertEqual([r["method"] for r in self.backend.requests], ["GET", "POST"])
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.repo)
         self.assertEqual(entries[-1]["reason"], "none")
 
     def test_not_configured_makes_no_request_when_no_api_url(self):

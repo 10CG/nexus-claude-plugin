@@ -115,6 +115,15 @@ class TestSessionEndBudget(unittest.TestCase):
             self.assertGreater(
                 hook["timeout"], mod._WORK_BUDGET_SECONDS + mod._LEDGER_BUDGET_SECONDS, hook
             )
+        # R2-c17: the capture hook's sibling test above also pins its work
+        # budget against its OWN HTTP timeout (line 98) -- this test only
+        # copied the timeout-vs-manifest half of that guarantee. Without
+        # this line, growing handoff_sync.py's `_HTTP_TIMEOUT_SECONDS` well
+        # past its `_WORK_BUDGET_SECONDS` still passes every other test
+        # here (the manifest-vs-budget arithmetic does not involve the HTTP
+        # timeout at all), yet a single slow-but-not-quite-timed-out
+        # request could then eat nearly the whole work budget by itself.
+        self.assertGreater(mod._WORK_BUDGET_SECONDS, 2 * 5 + mod._HTTP_TIMEOUT_SECONDS)
 
     def test_the_handoff_sync_hook_is_one_of_them(self):
         commands = [hook["command"] for _, hook in _commands("SessionEnd")]

@@ -155,10 +155,20 @@ def finish(left_behind):
     shutdown step, entirely -- including the narrower stderr-lock race
     described in the module docstring.
 
-    Without a left-behind thread there is nothing to protect against, so the
-    ordinary ``sys.exit(0)`` is used instead: it runs the normal shutdown
-    sequence, which matters for anything elsewhere in the interpreter that
-    relies on it (buffered file writes, atexit handlers).
+    Without a left-behind thread there is LESS to protect against -- no
+    daemon thread racing this shutdown -- but not NOTHING (an earlier
+    revision of this paragraph claimed there was, corrected in
+    handoff_sync.py's TASK-005 R2 fix round, finding R2-c05): a pipe the
+    host has already closed makes THIS path's own ordinary stdout flush
+    fail too, the same exit-120 outcome described above, just without a
+    daemon thread to blame it on. ``sys.exit(0)`` is still used here
+    anyway, because running the normal shutdown sequence matters for
+    anything elsewhere in the interpreter that relies on it (buffered file
+    writes, atexit handlers), and because there is no daemon thread for
+    this path to protect the process FROM -- a caller that wants the
+    closed-pipe case covered unconditionally, thread or not, has to do
+    what handoff_sync.py's own stderr writes now do: swallow the write
+    failure before it ever reaches this function.
     """
     if left_behind:
         try:
