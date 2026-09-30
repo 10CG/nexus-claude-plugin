@@ -28,6 +28,7 @@ import builtins
 import glob
 import http.server
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -84,8 +85,21 @@ def setUpModule():
     patcher = mock.patch.dict(os.environ, env, clear=True)
     patcher.start()
     unittest.addModuleCleanup(patcher.stop)
-    unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs first
+    # R6-c03: registration order matters here, not just presence -- LIFO
+    # means whichever addModuleCleanup call is LAST in this function's own
+    # source order fires FIRST, and unittest.case.doModuleCleanups runs
+    # every registered cleanup but re-raises only the FIRST exception it
+    # collects, silently dropping the rest (confirmed empirically,
+    # TestModuleCleanupOrdering below). `_assert_stderr_not_left_wrapped`
+    # must therefore be registered BEFORE `_assert_home_untouched`, so the
+    # HOME assertion -- a hermeticity violation, the more actionable of
+    # the two -- is the one whose error survives if both ever fail on the
+    # same run, rather than being swallowed by the other. An earlier
+    # revision of this function registered them in the opposite order,
+    # with a "LIFO: this runs first" comment on `_assert_home_untouched`
+    # that the registration order right above it made false.
     unittest.addModuleCleanup(_assert_stderr_not_left_wrapped)
+    unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs first
 
 
 def _load_module(path, name):
@@ -131,7 +145,9 @@ def _run_main(mod, event, extra_env):
     process via ``unittest discover``, used to execute with ``sys.stderr``
     silently wrapped from this file's very first ``_run_main`` call
     onward (``test_handoff_sync.py`` sorts FIRST, alphabetically, among
-    this plugin's ten test files). ``mock.patch.object`` restores whatever
+    this plugin's eleven test files, R6-c08: a count that has already
+    gone stale once as files were added -- ``ls hooks/test_*.py`` is the
+    source of truth, not this number). ``mock.patch.object`` restores whatever
     ``sys.stderr`` was at ENTRY, regardless of what ``main()`` did to it
     meanwhile -- the same isolation pattern ``os.environ`` gets from
     ``mock.patch.dict`` two lines below, just for an attribute instead of
@@ -871,7 +887,10 @@ class TestLocate(_HandoffDirCase):
         `open` (EIO / ESTALE shapes chmod cannot produce, and that run
         identically whether or not the suite happens to run as root --
         R2-c09's own reasoning for pairing a real-chmod test with a mocked
-        one)."""
+        one). R6-c07: also asserts on the diagnostic TEXT, not just that
+        `latest.md` is named -- the exception's own `repr()` (its class
+        name and errno) is what actually tells a reader an I/O error from
+        a renamed heading or a bad timestamp."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
@@ -883,12 +902,15 @@ class TestLocate(_HandoffDirCase):
                 raise OSError(5, "Input/output error")
             return builtins.open(target, *a, **kw)
 
+        extra = {}
         stderr = io.StringIO()
         with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open), \
                 mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, extra)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", stderr.getvalue())
+        self.assertIn("latest.md", extra["detail"])
+        self.assertIn("OSError(", extra["detail"])
 
     def test_a_dangling_latest_md_symlink_with_multiple_candidates_is_pointer_unresolved(self):
         """R5-c01: latest.md ITSELF (not its target line's basename, R4-c03's
@@ -908,39 +930,209 @@ class TestLocate(_HandoffDirCase):
         """R5-c01: latest.md -> latest.md (ELOOP). `os.lstat` alone cannot
         catch this (it does not follow the final component, so it succeeds
         on the symlink entry itself) -- resolving what is really there
-        needs a FOLLOWING stat, which is where ELOOP actually surfaces."""
+        needs a FOLLOWING stat, which is where ELOOP actually surfaces.
+        R6-c07: also pins the diagnostic TEXT -- the `repr()` of the
+        `OSError` `os.stat` raises for ELOOP, not just that SOME failure
+        was reported."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         loop_path = os.path.join(self.handoff_dir, "latest.md")
         os.symlink(loop_path, loop_path)
-        result = _MOD._locate(self.handoff_dir)
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra)
         self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("OSError(", extra["detail"])
 
     def test_a_directory_named_latest_md_with_multiple_candidates_is_pointer_unresolved(self):
         """R5-c01: a directory named latest.md is confirmed by `os.lstat`
         (something IS there) but fails the regular-file check that follows
         -- it must never be opened (a directory raises `IsADirectoryError`
         on `open`, but this must not even try, matching the FIFO/device
-        guard R1-c13 already established for the "no pointer" leg)."""
+        guard R1-c13 already established for the "no pointer" leg). R6-c07:
+        also pins the diagnostic TEXT -- the literal "not a regular file",
+        the one leg here with no exception object to format instead."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
-        result = _MOD._locate(self.handoff_dir)
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra)
         self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("not a regular file", extra["detail"])
 
     def test_an_unresolved_latest_md_with_a_single_candidate_falls_back_quietly(self):
-        """The R2-c13 carve-out (R5-c01): with only ONE candidate in the
-        directory, an unresolved latest.md cannot change WHICH document
-        gets ingested -- there is nothing else it could be -- so this stays
-        the quiet, successful fallback rather than a failure, exactly like
-        R2-c13's own FIFO fixture (`TestPointerTargetReadSafety`). A
-        directory-shaped latest.md exercises the same carve-out through
-        the `os.stat`-follows-symlinks leg instead of R2-c13's FIFO leg."""
+        """The R2-c13 carve-out (R5-c01, tightened by R6-c01 to count
+        `undecidable` too, see the group right below): with only ONE
+        `*.md` entry in the directory TOTAL -- one resolvable candidate,
+        ZERO undecidable siblings -- an unresolved latest.md cannot change
+        WHICH document gets ingested -- there is nothing else it could
+        have named -- so this stays the quiet, successful fallback rather
+        than a failure, exactly like R2-c13's own FIFO fixture
+        (`TestPointerTargetReadSafety`). A directory-shaped latest.md
+        exercises the same carve-out through the `os.stat`-follows-
+        symlinks leg instead of R2-c13's FIFO leg."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
+        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+
+    def test_an_unresolved_latest_md_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
+        """R6-c01: the exemption above counts ONLY `candidates`, the
+        RESOLVABLE `*.md` entries -- not `undecidable` (a dangling or
+        self-referential `*.md` symlink: listed by `_candidates`, but its
+        own stat cannot be resolved). A directory holding exactly one
+        resolvable candidate ALONGSIDE an undecidable sibling used to
+        satisfy `len(candidates) == 1` and fall through to the quiet
+        fallback anyway -- even though the (also unresolved) `latest.md`
+        could perfectly well have named the undecidable sibling instead of
+        the lone candidate. That is the SAME silent which-document swap
+        ruling 13 forbids; the exemption just failed to count both places
+        a second document could be hiding. Directory form here (matching
+        the control test right above); the two tests below repeat this
+        with a dangling `latest.md` symlink and a mocked read failure,
+        mirroring the three forms already pinned for the multi-candidate
+        case earlier in this class."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-undecidable-target.md"),
+            os.path.join(self.handoff_dir, "b.md"),
+        )
+        os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("latest.md", extra["detail"])
+
+    def test_a_dangling_latest_md_symlink_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
+        """R6-c01, second form: `latest.md` ITSELF a dangling symlink (as
+        opposed to the undecidable `*.md` SIBLING entry) -- a different
+        path through the same exemption as the directory form above."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-undecidable-target.md"),
+            os.path.join(self.handoff_dir, "b.md"),
+        )
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-latest-target.md"),
+            os.path.join(self.handoff_dir, "latest.md"),
+        )
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("latest.md", extra["detail"])
+
+    def test_a_mocked_read_failure_on_latest_md_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
+        """R6-c01, third form: injected via a mocked `open` (root-safe,
+        matching R5-c01's own mocked sibling below) rather than a real
+        dangling symlink or directory."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-undecidable-target.md"),
+            os.path.join(self.handoff_dir, "b.md"),
+        )
+        latest_path = os.path.join(self.handoff_dir, "latest.md")
+        _write_latest_pointer(self.handoff_dir, "a.md")
+
+        def failing_open(target, *a, **kw):
+            if os.path.abspath(target) == os.path.abspath(latest_path):
+                raise OSError(5, "Input/output error")
+            return builtins.open(target, *a, **kw)
+
+        extra = {}
+        with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open):
+            result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("latest.md", extra["detail"])
+
+    def test_an_unresolved_latest_mds_single_candidate_with_no_parseable_updated_at_still_names_latest_md_in_detail(self):
+        """R6-c02: the single-entry exemption falls through with
+        `target=None` (never a real filename) to the newest-`updated-at`
+        scan -- so when the lone candidate ALSO has no parseable
+        `updated-at`, this run reaches `_locate`'s OWN final "none with a
+        parseable updated-at" exit. That exit used to build its `detail`
+        from scratch, discarding the `pointer_unresolved` reason
+        `_pointer_target` already computed -- so a session where BOTH
+        `latest.md` (here, a directory) AND the single candidate's
+        frontmatter are broken reported a ledger `detail` that only
+        mentions frontmatter, sending whoever reads it to fix the wrong
+        file, and no stderr line naming `latest.md` at all."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "track-id: x", "---"])
+        os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
+        extra = {}
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("latest.md", extra["detail"])
+        self.assertIn("not a regular file", extra["detail"])
+        self.assertIn("latest.md", stderr.getvalue())
+
+    def test_an_unstattable_latest_md_is_pointer_unresolved_not_a_silent_older_pick(self):
+        """R6-c04: `_pointer_target`'s FIRST existence check (`os.lstat`)
+        has its own `except OSError as exc: return None, f"{exc!r}"` leg,
+        distinct from the SECOND check's (`os.stat`, which the ELOOP /
+        directory / dangling-symlink tests elsewhere in this class already
+        pin) -- but nothing exercised it directly: the only EIO-shaped
+        fixture in this class targeting `latest.md` (the mocked-`open`
+        test above) fails at the THIRD step (reading the file), past both
+        stat calls, so this FIRST leg stayed provably dead even though
+        R5-c01 claims to cover 'EIO / ESTALE'. Root-safe (mocked, not
+        chmod, and run for both errno shapes via subTest): EACCES / EIO /
+        ESTALE on `os.lstat` itself is the real-world trigger (a directory
+        that lost its search bit, an NFS mount that dropped mid-call), and
+        must not silently fall through to the newest-`updated-at` scan and
+        pick the OLDER candidate over the one `latest.md` actually names."""
+        self._mkdir()
+        older = _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "a.md")
+        latest_path = os.path.abspath(os.path.join(self.handoff_dir, "latest.md"))
+        real_lstat = os.lstat
+        for exc in (OSError(5, "Input/output error"), OSError(116, "Stale file handle")):
+            with self.subTest(exc=exc):
+
+                def failing_lstat(path, *a, _exc=exc, **kw):
+                    if os.path.abspath(path) == latest_path:
+                        raise _exc
+                    return real_lstat(path, *a, **kw)
+
+                extra = {}
+                stderr = io.StringIO()
+                with mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat), \
+                        mock.patch.object(sys, "stderr", stderr):
+                    result = _MOD._locate(self.handoff_dir, extra)
+                self.assertEqual(result, (None, "pointer_unresolved"))
+                self.assertNotEqual(result, (os.path.basename(older), None))
+                self.assertIn("latest.md", extra["detail"])
+                self.assertIn("OSError(", extra["detail"])
+                self.assertIn("latest.md", stderr.getvalue())
+
+    def test_a_healthy_symlinked_latest_md_resolves_its_target(self):
+        """R6-c06: `_pointer_target` deliberately uses `os.stat` (which
+        FOLLOWS symlinks), not `os.lstat`, to resolve what a symlinked
+        `latest.md` actually points at -- Aether's own `docs/handoff/
+        latest.md` is exactly this shape, a `git`-tracked symlink
+        (`standards/conventions/session-handoff.md`). Nothing pinned the
+        HEALTHY case before this test; only dangling and self-referential
+        symlinks were covered, and both stay `unresolved` no matter which
+        stat call is used to tell them apart, so neither would catch a
+        regression to `os.lstat` here -- which would read a healthy
+        symlinked pointer as `not a regular file` (`lstat` reports the
+        SYMLINK's own mode, never `S_ISREG`) and report `pointer_
+        unresolved` on a project with two or more candidates every single
+        session, even though nothing is actually broken."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        real_pointer = os.path.join(self.tmp.name, "real-latest.md")
+        with open(real_pointer, "w", encoding="utf-8") as fh:
+            fh.write("# Latest\n\n**Latest**: [a.md](./a.md)\n")
+        os.symlink(real_pointer, os.path.join(self.handoff_dir, "latest.md"))
         self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
 
     def test_a_missing_latest_md_with_multiple_candidates_still_falls_back_quietly(self):
@@ -1411,25 +1603,29 @@ class TestParseInstantIsShared(unittest.TestCase):
 
 
 class TestPointerTargetReadSafety(_HandoffDirCase):
-    """R1-c13: latest.md is checked with os.path.isfile before it is
-    opened, and its read is capped -- a FIFO or a huge file must not block
-    the hook or exhaust memory just to find one pointer line."""
+    """R1-c13: latest.md is confirmed a regular file (``os.lstat`` then
+    ``os.stat`` + ``stat.S_ISREG``, R5-c01 -- originally ``os.path.
+    isfile``, R6-c08) before it is opened, and its read is capped -- a
+    FIFO or a huge file must not block the hook or exhaust memory just to
+    find one pointer line."""
 
-    def test_a_non_regular_latest_md_reads_as_no_pointer(self):
+    def test_a_non_regular_latest_md_reads_as_unresolved(self):
         """R2-c13: ``_pointer_target`` runs on a watchdog thread of THIS
         test's own, with its own 1 s bound (the ``test_hook_runner.py``
         pattern, ``test_a_budget_that_stopped_working_fails_fast_not_
         slow``) rather than being called directly on the main test
         thread. ``unittest`` has NO per-test default timeout -- an
         earlier revision of this docstring claimed there was one -- so if
-        the ``os.path.isfile`` guard this test means to pin ever
-        regressed, ``open()`` on a FIFO with no writer blocks forever,
-        and calling it directly here would hang this test, and the whole
-        suite behind it, rather than failing fast."""
+        the ``stat.S_ISREG`` guard this test means to pin (R6-c08: this
+        docstring, the method name, and the comment below previously
+        described the R1-c13-era ``os.path.isfile`` check R5-c01
+        replaced) ever regressed, ``open()`` on a FIFO with no writer
+        blocks forever, and calling it directly here would hang this
+        test, and the whole suite behind it, rather than failing fast."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         fifo_path = os.path.join(self.handoff_dir, "latest.md")
-        os.mkfifo(fifo_path)  # a directory would also fail isfile(); a FIFO is the risk this guards
+        os.mkfifo(fifo_path)  # a directory would also fail S_ISREG; a FIFO is the risk this guards
         self.addCleanup(os.remove, fifo_path)
 
         result = {}
@@ -1704,9 +1900,10 @@ class TestRunMainRestoresStderr(_WriteCase):
     nothing undoes that -- `_run_main` (every `_WriteCase` test's own
     in-process harness) patches `os.environ` and `sys.stdin` around the
     call but never touched `sys.stderr`. `unittest discover` sorts
-    `test_handoff_sync.py` FIRST among this plugin's ten `test_*.py`
-    files (alphabetical), so every test in the other nine, run in the
-    SAME process via `python3 -m unittest discover`, used to run with
+    `test_handoff_sync.py` FIRST among this plugin's eleven `test_*.py`
+    files (alphabetical, R6-c08: this count has already gone stale once),
+    so every test in the other ten, run in the SAME process via
+    `python3 -m unittest discover`, used to run with
     `sys.stderr` silently wrapped in this guard from this file's very
     first `_run_main` call onward -- confirmed empirically (a probe that
     runs one `TestWritePath` test via `unittest`, then inspects
@@ -1762,6 +1959,77 @@ class TestMainDoesNotDoubleWrapStderr(unittest.TestCase):
                 self.assertIs(sys.stderr._real, sentinel)
         finally:
             sys.stdin = old_stdin
+
+
+class TestModuleCleanupOrdering(unittest.TestCase):
+    """R6-c03: `setUpModule`'s two hermeticity backstops (`_assert_home_
+    untouched`, `_assert_stderr_not_left_wrapped`) are registered via
+    `unittest.addModuleCleanup`, which runs LIFO -- whichever call is LAST
+    in `setUpModule`'s own source order fires FIRST. `unittest.case.
+    doModuleCleanups` (confirmed below, against a throwaway registration
+    list, not the real module-wide one) runs every registered cleanup
+    regardless of earlier failures, but re-raises only the FIRST exception
+    it collects -- so if BOTH ever fail on the same run, only the one
+    registered LAST is ever reported; the other's `AssertionError` is
+    silently dropped, not merely deprioritised."""
+
+    def test_the_home_leak_check_is_registered_after_the_stderr_check(self):
+        """Reads `setUpModule`'s own source (rather than re-registering
+        the two functions here in a hand-picked order) to pin the actual
+        PRODUCTION registration order -- a reimplementation could quietly
+        drift away from what `setUpModule` really does, the way an
+        earlier revision of that function did (it registered
+        `_assert_home_untouched` FIRST, right next to a "LIFO: this runs
+        first" comment that the registration order made false: `_assert_
+        stderr_not_left_wrapped`, registered second, actually ran first
+        and swallowed the home-leak report whenever both failed
+        together)."""
+        # The full `unittest.addModuleCleanup(...)` CALL, not the bare
+        # function name: `setUpModule`'s own explanatory comment above
+        # these two calls (necessarily) mentions both names too, and a
+        # bare-name search would find whichever one that PROSE happens to
+        # say first, regardless of the actual call order below it --
+        # silently vacuous, not merely a weaker check.
+        source = inspect.getsource(setUpModule)
+        home_pos = source.index("unittest.addModuleCleanup(_assert_home_untouched")
+        stderr_pos = source.index("unittest.addModuleCleanup(_assert_stderr_not_left_wrapped")
+        self.assertGreater(
+            home_pos, stderr_pos,
+            "_assert_home_untouched must be the LAST addModuleCleanup call in "
+            "setUpModule so it is the FIRST to run (LIFO) and its AssertionError "
+            "is not the one doModuleCleanups silently drops",
+        )
+
+    def test_doModuleCleanups_only_reports_the_first_of_several_failing_cleanups(self):
+        """Confirms the stdlib mechanism the test above relies on, against
+        a throwaway registration list (saved and restored below) rather
+        than the real module-wide one `setUpModule` already populated --
+        clearing that for real mid-suite would drop this module's own
+        HOME/stderr backstops for every test that runs after this one.
+        Both cleanups RUN (side effect observed via `called`, confirming
+        `doModuleCleanups` does not stop at the first failure), but only
+        the LAST-REGISTERED one's exception survives to be reported --
+        this is what makes the source-order assertion above load-bearing
+        rather than cosmetic."""
+        saved = list(unittest.case._module_cleanups)
+        unittest.case._module_cleanups.clear()
+        self.addCleanup(unittest.case._module_cleanups.extend, saved)
+        called = []
+
+        def first():
+            called.append("first")
+            raise AssertionError("first failed")
+
+        def second():
+            called.append("second")
+            raise AssertionError("second failed")
+
+        unittest.addModuleCleanup(first)
+        unittest.addModuleCleanup(second)  # registered last -> runs first -> wins
+        with self.assertRaises(AssertionError) as ctx:
+            unittest.case.doModuleCleanups()
+        self.assertEqual(called, ["second", "first"])  # both ran, in LIFO order
+        self.assertEqual(str(ctx.exception), "second failed")  # only the last-registered survives
 
 
 class TestWritePath(_WriteCase):
@@ -2119,6 +2387,70 @@ class TestWritePath(_WriteCase):
         state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
         self.assertEqual(state.get("container_id"), "dev-box-a")  # unchanged by the skip-class run
 
+    def test_a_content_failure_does_not_persist_a_drifted_container_id_empty_sections(self):
+        """R6-c05: the test right above only proves the persist flag was
+        not moved ahead of the OWNER check -- a regression that moved it
+        to right AFTER the owner check but still BEFORE `_build_content`
+        (still well ahead of the one real assignment site, right after
+        `client.upsert` returns) would pass every existing test INCLUDING
+        that one, because `not_owner` returns even earlier and never
+        reaches such a mutant at all (confirmed: applying exactly that
+        mutation to a temp copy left the whole suite green). `empty_
+        sections` is decided strictly AFTER the owner check (ruling 3 /
+        R1-c01) -- the same shape ruling 2 protects against, just for a
+        different early-return reason, and one this class's own R2-c10
+        sibling (`TestContentReasonsEndToEnd`) never combined with a
+        drifted id."""
+        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-a"):
+            self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "none")
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-box-a")
+
+        # A second, NEWER document -- same owner, but an empty body -- with
+        # this container's own id already drifted to dev-box-b.
+        self._write(
+            "2026-09-20-1100-y.md", body="   \n\n  ", updated_at="2026-09-20T11:00:00Z",
+        )
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
+            self._run(session_id="sess-2")
+        self.assertEqual(self._last_entry()["reason"], "empty_sections")
+        # Only the FIRST run's GET+POST -- the second made zero requests.
+        self.assertEqual([r["method"] for r in self.requests], ["GET", "POST"])
+
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-box-a")  # unchanged by the skip-class run
+
+    def test_a_content_failure_does_not_persist_a_drifted_container_id_sections_unparsed(self):
+        """R6-c05, second form: `sections_unparsed` -- a NONTRIVIAL body
+        (>= `_MIN_NONTRIVIAL_BODY`) with neither section parseable -- is
+        the FAILURE-class sibling of the quiet `empty_sections` case right
+        above; both are decided inside `_build_content`, strictly after
+        the owner check, so both close the same gap in `test_a_skip_
+        class_reason_does_not_persist_a_drifted_container_id`."""
+        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-a"):
+            self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "none")
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-box-a")
+
+        body = "# Title\n\n" + ("prose with no known section headings at all. " * 10)
+        self.assertGreaterEqual(len(body.strip()), _MOD._MIN_NONTRIVIAL_BODY)
+        self._write(
+            "2026-09-20-1100-y.md", body=body, updated_at="2026-09-20T11:00:00Z",
+        )
+        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
+            self._run(session_id="sess-2")
+        self.assertEqual(self._last_entry()["reason"], "sections_unparsed")
+        self.assertEqual([r["method"] for r in self.requests], ["GET", "POST"])
+
+        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-box-a")  # unchanged by the failure-class run
+
     def _drift_then_fail(self, act):
         """Shared setup for the three ruling-2 (R1-c04) tests below: a clean
         first run under CONTAINER, then ``act()`` -- which must patch
@@ -2333,15 +2665,19 @@ class TestWritePath(_WriteCase):
         self.assertEqual(self._last_entry()["reason"], "identity_changed")  # still unresolved
 
     def test_a_transient_container_id_failure_during_the_persist_check_does_not_swallow_state_write_failed(self):
-        """R4-c05: `write()` calls `_identity.container_id()` up to THREE
-        times in a full write-path run with drift -- `identity_drift`'s
-        own `current=` (inside `_collect`), the `IngestClient` constructor
-        (also inside `_collect`), and -- protected by its OWN try/except,
-        the actual fix -- the precompute right before `update_state`. This
-        pins that the fix HOLDS for the precompute's own call specifically
-        raising: `update_state` is never even reached (the `except`
-        branch sets `state_write_failed` directly, see below), but the
-        supplementary row it guarantees must still land.
+        """R4-c05: a full write-path run with drift calls `_identity.
+        container_id()` up to THREE times, across TWO different functions
+        (R6-c08: an earlier revision of this docstring attributed all
+        three to `write()` alone, though its own very next clause already
+        named two of them as being inside `_collect` instead) --
+        `identity_drift`'s own `current=` and the `IngestClient`
+        constructor, BOTH inside `_collect`, and -- protected by its OWN
+        try/except, the actual fix -- the precompute right before
+        `update_state`, inside `_record`'s own nested `write()` closure.
+        This pins that the fix HOLDS for the precompute's own call
+        specifically raising: `update_state` is never even reached (the
+        `except` branch sets `state_write_failed` directly, see below),
+        but the supplementary row it guarantees must still land.
 
         R5-c05: an EARLIER revision of this docstring (and the comment
         below) described the THIRD call as "the unprotected comparison"
@@ -3320,11 +3656,22 @@ class TestSubprocess(unittest.TestCase):
         (wrapping the `None` this test starts with) BEFORE the work thread
         even runs, so by the time THIS `_warn(diagnostic)` call happens,
         `sys.stderr` is already a `_StderrGuard` instance, never literally
-        `None` again. What this test actually pins is the GUARD's own
-        `self._real is None` handling (see `TestImportGuards`' sibling
-        test below for the one shape that DOES exercise `_warn`'s own
-        branch: a missing sibling module, whose bare `print` runs before
-        any `_StderrGuard` exists to wrap anything)."""
+        `None` again. What this test actually pins is only the GUARD's
+        FLUSH-side `self._real is None` handling, not its write-side one
+        (R6-c08): this run's exit code is what CPython's shutdown-time
+        reflush produces, and that reflush only ever calls `.flush()` --
+        removing `write`'s own `None` guard instead still exits 0 through
+        this exact path (the `AttributeError` it would raise escapes
+        `_warn`, is caught by `__main__`'s own blanket `except Exception`,
+        and `flush`'s still-intact guard no-ops at shutdown same as ever;
+        confirmed empirically against a temp copy -- see the `_StderrGuard`
+        class docstring's own two-guards paragraph). `write`'s side is
+        pinned directly instead, by `test_stderr_guard_wrapping_none_
+        does_not_raise` above (see `TestImportGuards`' sibling test above
+        for the one shape that DOES exercise `_warn`'s OWN `sys.stderr is
+        None` branch, a different guard again: a missing sibling module,
+        whose bare `print` runs before any `_StderrGuard` exists to wrap
+        anything)."""
         run_env = _scrub_subprocess_env()
         run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
         proc = subprocess.Popen(

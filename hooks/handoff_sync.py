@@ -531,23 +531,32 @@ def _locate(handoff_dir, extra=None):
     stderr from a SessionEnd hook is not a channel anyone reads. ``None``
     (the default) skips this -- callers that only care about the reason,
     like most of this file's own tests, need not provide one. Every such
-    exit calls ``_warn`` (R3-c03/c04) EXCEPT ONE -- "no candidate resolved
-    a parseable updated-at", the LAST `return` in this function's own
-    source order -- which only sets ``detail`` (R4-c16: an earlier
-    revision of this paragraph claimed ALL exits called `_warn`, which
-    stopped being true the moment a second exit existed; R5-c10 then found
-    the revision that was meant to correct that instead pointed at the
-    wrong item in THIS paragraph's own listing -- "the last" refers to
-    the last `return` in the function body, not whichever origin happens
-    to be listed last in this prose). A bare ``print`` here, on a closed
-    stderr pipe, would raise BrokenPipeError OUT of this function (a
-    ``ConnectionError`` subclass, which ``_hook_state.reason_for_exception``
-    reads as ``http_error`` one layer up) before ``extra["detail"]`` was
-    ever set -- turning "docs/handoff could not be listed" into a
-    misleading network-failure report with no detail at all. A future
-    author adding a `_warn` call to that one remaining silent exit should
-    update this paragraph rather than re-widening the claim back to
-    "every exit calls _warn, full stop".
+    exit calls ``_warn`` (R3-c03/c04) -- INCLUDING, since R6-c02, the LAST
+    `return` in this function's own source order ("no candidate resolved
+    a parseable updated-at"), which used to be the one exception (R4-c16:
+    an earlier revision of THIS paragraph claimed ALL exits called
+    `_warn`, which stopped being true the moment a second exit existed;
+    R5-c10 then found the revision meant to correct that instead pointed
+    at the wrong item in THIS paragraph's own listing -- "the last"
+    refers to the last `return` in the function body, not whichever
+    origin happens to be listed last in this prose; R6-c02 closed the gap
+    itself -- giving that exit the SAME `_warn` call every other one
+    already had, once a directory where BOTH latest.md and the lone
+    candidate's frontmatter were broken was found reporting a `detail`
+    that named only the frontmatter, with no stderr line at all -- rather
+    than just correcting the claim about it a third time). A bare
+    ``print`` here, on a closed stderr pipe, would raise BrokenPipeError
+    OUT of this function (a ``ConnectionError`` subclass, which
+    ``_hook_state.reason_for_exception`` reads as ``http_error`` one layer
+    up) before ``extra["detail"]`` was ever set -- turning "docs/handoff
+    could not be listed" into a misleading network-failure report with no
+    detail at all; irrelevant to the exit R6-c02 just changed specifically
+    (it goes through ``_warn``, which never raises this way, R3-c03), but
+    still why ``extra["detail"]`` is set BEFORE the diagnostic write is
+    even attempted on every exit, not only this one. A future exit added
+    to this function without a matching `_warn` call would make this
+    paragraph wrong a third time -- update it rather than letting the
+    claim silently drift again.
     """
     try:
         candidates, undecidable = _candidates(handoff_dir)
@@ -584,22 +593,36 @@ def _locate(handoff_dir, extra=None):
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
     target, pointer_unresolved = _pointer_target(handoff_dir)
-    if pointer_unresolved is not None and len(candidates) > 1:
+    if pointer_unresolved is not None and len(candidates) + len(undecidable) > 1:
         # R5-c01 / ruling 13: latest.md exists in SOME form but could not
         # be resolved (a dangling or self-referential symlink, a
         # directory, a permission error, a stale handle) -- a DIFFERENT
-        # shape from simply being absent. With two or more candidates to
-        # choose between, silently falling through to the newest-
-        # `updated-at` scan below risks ingesting a DIFFERENT document
-        # than whatever the unreadable pointer might actually have named
-        # -- the same silent which-document swap R4-c03 already closes one
-        # level down (an EXPLICIT pointer TARGET landing in
+        # shape from simply being absent. With two or more `*.md` entries
+        # to choose between -- RESOLVABLE candidates and undecidable ones
+        # alike (R6-c01: originally just `len(candidates) > 1`, which
+        # missed the case below) -- silently falling through to the
+        # newest-`updated-at` scan below risks ingesting a DIFFERENT
+        # document than whatever the unreadable pointer might actually
+        # have named -- the same silent which-document swap R4-c03 already
+        # closes one level down (an EXPLICIT pointer TARGET landing in
         # `undecidable`), just caught here for the pointer FILE itself.
-        # With only ONE candidate there is nothing else it could have
-        # named, so that leg falls through unchanged below (`target` is
-        # `None` here, which never matches a real filename, so the
-        # fallback scan runs exactly as it would for a genuinely absent
-        # pointer) -- R2-c13's FIFO fixture stays quiet, not a failure.
+        # With only ONE `*.md` entry in the directory TOTAL there is
+        # nothing else it could have named, so that leg falls through
+        # unchanged below (`target` is `None` here, which never matches a
+        # real filename, so the fallback scan runs exactly as it would for
+        # a genuinely absent pointer) -- R2-c13's FIFO fixture stays quiet,
+        # not a failure. R6-c01: an UNDECIDABLE sibling counts toward that
+        # total exactly like a resolvable one -- latest.md could just as
+        # well have named the undecidable entry as the lone candidate, so
+        # one healthy candidate PLUS one undecidable sibling is still two
+        # things it could have meant, not one. The original `len(
+        # candidates) > 1` check missed this: a directory holding exactly
+        # one resolvable candidate alongside an undecidable entry (a
+        # dangling/looping `*.md` symlink, or one an EIO/EACCES lstat could
+        # not resolve at all) satisfied `len(candidates) == 1` and fell
+        # through to the quiet fallback -- silently picking the lone
+        # candidate even though the unreadable pointer might have named
+        # the undecidable sibling instead.
         detail = f"latest.md: {pointer_unresolved}"
         if extra is not None:
             extra["detail"] = _short(detail)
@@ -646,11 +669,28 @@ def _locate(handoff_dir, extra=None):
             newest_name, newest_ts = name, ts
     if newest_name:
         return newest_name, None
-    if extra is not None:
-        extra["detail"] = _short(
+    # R6-c02: `pointer_unresolved`, when set, was computed by `_pointer_
+    # target` above and then DELIBERATELY not acted on yet -- the
+    # single-total-entry exemption a few lines up lets this fallback scan
+    # run anyway (`target` stays `None`, which never matches a real
+    # filename). Discarding it here, once the scan ALSO fails to find a
+    # parseable `updated-at`, used to build this exit's `detail` from
+    # scratch -- so a directory where BOTH latest.md (unreadable) AND the
+    # lone candidate's frontmatter (unparseable) are broken reported a
+    # ledger `detail` that only names the frontmatter problem, sending
+    # whoever reads it to fix the wrong file. Naming `latest.md`
+    # explicitly here is the same courtesy every OTHER `pointer_unresolved`
+    # exit in this function already extends.
+    if pointer_unresolved is not None:
+        detail = f"latest.md: {pointer_unresolved}"
+    else:
+        detail = (
             f"{len(candidates)} candidate(s) in docs/handoff, none with a parseable "
             f"updated-at and no pointer resolved to one"
         )
+    if extra is not None:
+        extra["detail"] = _short(detail)
+    _warn(f"[{HOOK}] {detail}")
     return None, "pointer_unresolved"
 
 
@@ -1344,11 +1384,17 @@ class _StderrGuard:
     ``os.devnull`` via ``_silence_stderr``, on the FIRST such failure --
     the same dance ``_warn`` already does for its own writes (R3-c03) --
     stops a LATER write through this object from failing at all, which is
-    worth doing, but is not what keeps exit at 0 for anything that reaches
-    this class specifically: an EARLIER revision of this paragraph
-    conflated the two (confirmed empirically: a ``_silence_stderr``
-    mutated to a true no-op still leaves every closed-pipe subprocess test
-    that reaches ``main()`` -- and therefore this wrapper -- exiting 0).
+    worth doing, but for THIS class specifically it is a second,
+    redundant layer over the per-call ``except`` above, not the reason
+    exit stays 0: an EARLIER revision of this paragraph conflated the two
+    (confirmed empirically: a ``_silence_stderr`` mutated to a true no-op
+    still leaves every closed-pipe subprocess test that reaches ``main()``
+    -- and therefore this wrapper -- exiting 0, because the per-call
+    ``except`` alone already catches every later retry through the SAME
+    guard OBJECT, reroute or none; R6-c08: this does not make ``_silence_
+    stderr`` pointless here -- a write that keeps failing is still merely
+    SWALLOWED without it, never actually delivered, where the reroute
+    would let it through).
     Contrast ``_warn``'s own bare top-level guard, protecting the three
     import-guard ``print`` calls above (R4-c04): those run BEFORE this
     class is ever installed, against the raw, unwrapped stream, with no
@@ -1359,30 +1405,74 @@ class _StderrGuard:
 
     ``real`` may itself be ``None`` (R4-c07): ``sys.stderr`` -- what this
     wraps -- is ``None``, never a stream, when fd 2 was already closed
-    BEFORE the interpreter even started. Calling ``.write``/``.flush`` on
-    ``None`` would raise ``AttributeError``, which the ``except OSError``
-    above does NOT catch -- that exception escapes this wrapper, with a
-    DIFFERENT consequence depending on which thread hits it (R5-c02: an
-    earlier revision of this paragraph claimed one "exactly as fatal (exit
-    120)" outcome for both, confirmed wrong for the second). On the MAIN
-    thread -- ``_warn``'s own final diagnostic call in ``main()``, after
-    the work thread has already finished -- nothing between it and
-    ``__main__``'s own blanket ``except Exception`` catches anything
-    narrower, so CPython's later shutdown reflush hits the same unguarded
-    ``None`` a second time with no Python-level ``except`` left at all:
-    exit 120, confirmed empirically. On the WORK thread -- ``_ingest_
-    client``'s own prints, this class's PRIMARY motivation (see above) --
-    ``_hook_runner.run_with_deadline`` catches ``AttributeError`` the same
-    as any other ``Exception`` its target raises, turns it into
-    ``outcome["error"]``, and ``_hook_state.reason_for_exception`` (which
+    BEFORE the interpreter even started. ``write`` and ``flush`` BOTH
+    check ``self._real is None`` and no-op before ever touching it, so
+    NEITHER actually raises ``AttributeError`` today -- the two guards
+    protect two DIFFERENT call sites, though, so losing just ONE of them
+    (a future edit that "simplifies" one method but not the other) has a
+    different, and unequal, consequence (R6-c08, correcting the previous
+    revision of this paragraph, confirmed empirically by mutating away
+    one check at a time against a REAL closed-fd subprocess, matching
+    ``TestSubprocess.test_fd_2_closed_before_the_interpreter_starts_
+    still_exits_zero_with_no_stdout`` below): it depends on WHICH guard
+    is missing, not on which thread happens to reach it (R5-c02: an
+    earlier revision claimed one "exactly as fatal (exit 120)" outcome
+    tied to which thread, already wrong for one of the two; that revision
+    then tied exit 120 to the MAIN thread specifically instead, which
+    R6-c08 found was ALSO wrong -- exit 120 turns on which guard
+    regresses, and a main-thread diagnostic can reach either).
+
+    Losing ``write``'s own check: whichever diagnostic call this class
+    exists to protect (``_warn``'s, or one of ``_ingest_client``'s own
+    unguarded prints, this class's PRIMARY motivation, see above) hits
+    ``None.write(...)``, raising ``AttributeError`` the ``except OSError``
+    here does NOT catch. On the WORK thread -- ``_ingest_client``'s own
+    prints -- ``_hook_runner.run_with_deadline`` catches that the same as
+    any other ``Exception`` its target raises, turns it into ``outcome
+    ["error"]``, and ``_hook_state.reason_for_exception`` (which
     recognises no ``AttributeError`` shape) resolves that to the generic
     ``unknown`` -- the run ends there, with whatever dedup/write call it
     was mid-loop on silently abandoned: quieter than exit 120, but the
     same "silently skips dedup/write" failure this class exists to prevent
     in the first place (see above), just triggered by ``None`` instead of
-    a closed pipe. There is no real file descriptor behind a ``None``
-    stream to redirect either, so both methods simply no-op in that case,
-    same as after ``_silence_stderr`` has already run once.
+    a closed pipe -- and still exit 0 (``flush``'s OWN check is untouched
+    by this mutation). On the MAIN thread -- ``_warn``'s own final
+    diagnostic call in ``main()``, after the work thread has already
+    finished -- nothing between it and ``__main__``'s own blanket
+    ``except Exception`` catches anything narrower, so THAT catches it
+    instead, and execution reaches ``_hook_runner.finish`` exactly as if
+    the diagnostic write had simply been skipped: ``flush``'s check is
+    still intact, so the shutdown reflush below still no-ops, and the run
+    still exits 0 -- confirmed empirically (mutating away ONLY ``write``'s
+    check leaves a real closed-fd subprocess run through this exact path
+    exiting 0, unchanged from baseline).
+
+    Losing ``flush``'s own check instead: CPython's shutdown sequence
+    (``flush_std_files``, behind every plain ``sys.exit()`` -- see
+    ``_hook_runner.finish``) unconditionally calls ``.flush()`` on
+    whatever ``sys.stderr`` currently is ONE MORE TIME once this function
+    returns control to it -- regardless of which thread is finishing,
+    and regardless of whether ANY write was ever attempted through this
+    object, this run's own diagnostic included. With ``self._real`` still
+    ``None`` and nothing here to catch it, that hits ``None.flush()`` --
+    ``AttributeError``, with NO Python-level ``except`` anywhere near it
+    any more: CPython's own response to an exception escaping THIS
+    particular internal call is exit code 120, the same code a genuinely
+    broken pipe produces at the same call site (confirmed empirically,
+    independently of the ``write`` case above: mutating away ONLY
+    ``flush``'s check turns that SAME real closed-fd subprocess run 120,
+    with no diagnostic write involved anywhere in the run at all). This
+    is the ONLY one of the two guards ``TestSubprocess.test_fd_2_closed_
+    before_the_interpreter_starts_still_exits_zero_with_no_stdout`` below
+    actually pins (see that test's own docstring): its assertion on the
+    process's exit code is blind to ``write``'s check specifically, which
+    ``test_stderr_guard_wrapping_none_does_not_raise`` covers instead, by
+    calling ``write`` (and ``flush``) directly against ``_StderrGuard
+    (None)`` rather than through a subprocess's exit code.
+
+    There is no real file descriptor behind a ``None`` stream to redirect
+    either, so both methods simply no-op in that case, same as after
+    ``_silence_stderr`` has already run once.
     """
 
     def __init__(self, real):
