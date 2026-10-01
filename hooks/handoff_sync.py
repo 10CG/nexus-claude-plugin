@@ -1356,165 +1356,18 @@ def _record(reason, started, run, work_left_behind):
     return left_behind
 
 
-class _StderrGuard:
-    """Wraps ``sys.stderr`` so that ANY later write to it cannot raise out
-    into its caller (R4-c06).
-
-    ``_warn`` above already protects every stderr write THIS file makes.
-    But the work thread ``main()`` starts below calls into
-    ``_ingest_client``, which has SEVERAL of its own unguarded
-    ``print(..., file=sys.stderr)`` calls (a full lookup page, an
-    empty-content caller bug, a missing ``session_id``) -- a closed pipe
-    there raises ``BrokenPipeError`` straight out of ``_lookup``/``upsert``,
-    which ``_hook_state.reason_for_exception`` reads as ``http_error`` one
-    layer up (``BrokenPipeError`` is a ``ConnectionError`` subclass) --
-    misreporting a purely LOCAL "could not write a diagnostic" condition
-    as a network failure, and silently skipping whatever dedup/write that
-    perfectly good response called for. Ruling 15 forbids fixing this
-    inside ``_ingest_client.py`` itself, so this wraps the GLOBAL
-    ``sys.stderr`` object instead: every module that does
-    ``print(..., file=sys.stderr)`` looks up ``sys.stderr`` fresh at call
-    time, so replacing the attribute here protects writes from ANY module,
-    not just this file's own.
-
-    A write failing here is swallowed by the ``except OSError`` below, and
-    NOT only on the first such failure (R5-c10): that clause protects
-    EVERY call through this object, including the ``.flush()`` CPython's
-    own unconditional reflush at shutdown makes against this SAME guard
-    again -- the identical except catches that retry too, whichever
-    attempt it is. Redirecting the underlying file descriptor to
-    ``os.devnull`` via ``_silence_stderr``, on the FIRST such failure --
-    the same dance ``_warn`` already does for its own writes (R3-c03) --
-    stops a LATER write through this object from failing at all, which is
-    worth doing, but for THIS class specifically it is a second,
-    redundant layer over the per-call ``except`` above, not the reason
-    exit stays 0: an EARLIER revision of this paragraph conflated the two
-    (confirmed empirically: a ``_silence_stderr`` mutated to a true no-op
-    still leaves every closed-pipe subprocess test that reaches ``main()``
-    -- and therefore this wrapper -- exiting 0, because the per-call
-    ``except`` alone already catches every later retry through the SAME
-    guard OBJECT, reroute or none; R6-c08: this does not make ``_silence_
-    stderr`` pointless here -- a write that keeps failing is still merely
-    SWALLOWED without it, never actually delivered, where the reroute
-    would let it through).
-    Contrast ``_warn``'s own bare top-level guard, protecting the three
-    import-guard ``print`` calls above (R4-c04): those run BEFORE this
-    class is ever installed, against the raw, unwrapped stream, with no
-    per-call ``except`` of its own -- there, ``_silence_stderr`` really is
-    the only thing standing between the first failure and CPython's later,
-    uncaught retry (exit 120; the same mutation applied there instead
-    makes exactly those tests start failing).
-
-    ``real`` may itself be ``None`` (R4-c07): ``sys.stderr`` -- what this
-    wraps -- is ``None``, never a stream, when fd 2 was already closed
-    BEFORE the interpreter even started. ``write`` and ``flush`` BOTH
-    check ``self._real is None`` and no-op before ever touching it, so
-    NEITHER actually raises ``AttributeError`` today -- the two guards
-    protect two DIFFERENT call sites, though, so losing just ONE of them
-    (a future edit that "simplifies" one method but not the other) has a
-    different, and unequal, consequence (R6-c08, correcting the previous
-    revision of this paragraph, confirmed empirically by mutating away
-    one check at a time against a REAL closed-fd subprocess, matching
-    ``TestSubprocess.test_fd_2_closed_before_the_interpreter_starts_
-    still_exits_zero_with_no_stdout`` below): it depends on WHICH guard
-    is missing, not on which thread happens to reach it (R5-c02: an
-    earlier revision claimed one "exactly as fatal (exit 120)" outcome
-    tied to which thread, already wrong for one of the two; that revision
-    then tied exit 120 to the MAIN thread specifically instead, which
-    R6-c08 found was ALSO wrong -- exit 120 turns on which guard
-    regresses, and a main-thread diagnostic can reach either).
-
-    Losing ``write``'s own check: whichever diagnostic call this class
-    exists to protect (``_warn``'s, or one of ``_ingest_client``'s own
-    unguarded prints, this class's PRIMARY motivation, see above) hits
-    ``None.write(...)``, raising ``AttributeError`` the ``except OSError``
-    here does NOT catch. On the WORK thread -- ``_ingest_client``'s own
-    prints -- ``_hook_runner.run_with_deadline`` catches that the same as
-    any other ``Exception`` its target raises, turns it into ``outcome
-    ["error"]``, and ``_hook_state.reason_for_exception`` (which
-    recognises no ``AttributeError`` shape) resolves that to the generic
-    ``unknown`` -- the run ends there, with whatever dedup/write call it
-    was mid-loop on silently abandoned: quieter than exit 120, but the
-    same "silently skips dedup/write" failure this class exists to prevent
-    in the first place (see above), just triggered by ``None`` instead of
-    a closed pipe -- and still exit 0 (``flush``'s OWN check is untouched
-    by this mutation). On the MAIN thread -- ``_warn``'s own final
-    diagnostic call in ``main()``, after the work thread has already
-    finished -- nothing between it and ``__main__``'s own blanket
-    ``except Exception`` catches anything narrower, so THAT catches it
-    instead, and execution reaches ``_hook_runner.finish`` exactly as if
-    the diagnostic write had simply been skipped: ``flush``'s check is
-    still intact, so the shutdown reflush below still no-ops, and the run
-    still exits 0 -- confirmed empirically (mutating away ONLY ``write``'s
-    check leaves a real closed-fd subprocess run through this exact path
-    exiting 0, unchanged from baseline).
-
-    Losing ``flush``'s own check instead: CPython's shutdown sequence
-    (``flush_std_files``, behind every plain ``sys.exit()`` -- see
-    ``_hook_runner.finish``) unconditionally calls ``.flush()`` on
-    whatever ``sys.stderr`` currently is ONE MORE TIME once this function
-    returns control to it -- regardless of which thread is finishing,
-    and regardless of whether ANY write was ever attempted through this
-    object, this run's own diagnostic included. With ``self._real`` still
-    ``None`` and nothing here to catch it, that hits ``None.flush()`` --
-    ``AttributeError``, with NO Python-level ``except`` anywhere near it
-    any more: CPython's own response to an exception escaping THIS
-    particular internal call is exit code 120, the same code a genuinely
-    broken pipe produces at the same call site (confirmed empirically,
-    independently of the ``write`` case above: mutating away ONLY
-    ``flush``'s check turns that SAME real closed-fd subprocess run 120,
-    with no diagnostic write involved anywhere in the run at all). This
-    is the ONLY one of the two guards ``TestSubprocess.test_fd_2_closed_
-    before_the_interpreter_starts_still_exits_zero_with_no_stdout`` below
-    actually pins (see that test's own docstring): its assertion on the
-    process's exit code is blind to ``write``'s check specifically, which
-    ``test_stderr_guard_wrapping_none_does_not_raise`` covers instead, by
-    calling ``write`` (and ``flush``) directly against ``_StderrGuard
-    (None)`` rather than through a subprocess's exit code.
-
-    There is no real file descriptor behind a ``None`` stream to redirect
-    either, so both methods simply no-op in that case, same as after
-    ``_silence_stderr`` has already run once.
-    """
-
-    def __init__(self, real):
-        self._real = real
-
-    def write(self, s):
-        if self._real is None:
-            return len(s)
-        try:
-            return self._real.write(s)
-        except OSError:
-            _silence_stderr()
-            return len(s)
-
-    def flush(self):
-        if self._real is None:
-            return
-        try:
-            self._real.flush()
-        except OSError:
-            _silence_stderr()
-
-    def fileno(self):
-        return self._real.fileno()
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-
 def main():
     """Run the hook. Returns True when a worker thread had to be left behind."""
     started = time.monotonic()
-    if not isinstance(sys.stderr, _StderrGuard):
-        # Installed before the work thread starts (R4-c06): _collect, on
-        # that thread, calls into _ingest_client, whose own stderr writes
-        # this file does not own (ruling 15) but must still not let crash
-        # the run. Guarded against double-wrapping across repeated
-        # in-process main() calls within the same test process (production
-        # runs this once per process, so it never matters there).
-        sys.stderr = _StderrGuard(sys.stderr)
+    # Installed before the work thread starts (R4-c06; the class itself
+    # moved into _hook_runner under Amendment A9-21 -- see that module's own
+    # docstring): _collect, on that thread, calls into _ingest_client, whose
+    # own stderr writes this file does not own (ruling 15) but must still
+    # not let crash the run. guard_stderr() is idempotent, so repeated
+    # in-process main() calls within the same test process do not
+    # double-wrap (production runs this once per process, so it never
+    # matters there).
+    _hook_runner.guard_stderr()
     run = {
         "cwd": None,
         "calls": 0,

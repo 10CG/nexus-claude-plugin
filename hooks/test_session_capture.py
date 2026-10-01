@@ -39,6 +39,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+import _hook_runner
 import _hook_state
 import _identity
 
@@ -62,6 +63,26 @@ def _assert_home_untouched(home):
         raise AssertionError(f"a test wrote under HOME instead of the state dir: {leaked}")
 
 
+def _assert_stderr_not_left_wrapped():
+    """Amendment A9-21 regression guard, mirroring test_handoff_sync.py's
+    own (that file sorts first, alphabetically, so its backstop would catch
+    a leak from an EARLIER file too -- this one catches a leak from THIS
+    file reaching every test_*.py module sorted after it). ``mod.main()``
+    now permanently replaces the GLOBAL ``sys.stderr`` with a
+    ``_StderrGuard`` (``_hook_runner.guard_stderr()``, called before the
+    work thread starts) the first time it runs in this process;
+    ``_run_main_capturing`` (every in-process test's own harness here)
+    saves and restores ``sys.stderr`` around each call for exactly this
+    reason, and this is the module-wide backstop for a future test that
+    calls ``mod.main()`` directly instead."""
+    if isinstance(sys.stderr, _hook_runner._StderrGuard):
+        raise AssertionError(
+            "a test left sys.stderr wrapped in _StderrGuard -- every OTHER "
+            "test_*.py module run in this same `unittest discover` process "
+            "would inherit it"
+        )
+
+
 def setUpModule():
     root = tempfile.mkdtemp(prefix="nexus-hooktest-")
     unittest.addModuleCleanup(shutil.rmtree, root, ignore_errors=True)
@@ -72,6 +93,13 @@ def setUpModule():
     )
     patcher.start()
     unittest.addModuleCleanup(patcher.stop)
+    # Registration order matters (LIFO): the stderr check is registered
+    # BEFORE the home check, so the home-leak report -- the more actionable
+    # of the two -- is the one whose error survives if both ever fail on the
+    # same run (unittest.case.doModuleCleanups re-raises only the FIRST
+    # exception it collects, silently dropping the rest; see
+    # test_handoff_sync.py's TestModuleCleanupOrdering for the mechanism).
+    unittest.addModuleCleanup(_assert_stderr_not_left_wrapped)
     unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs first
 
 
@@ -115,6 +143,31 @@ def _run_hook(stdin_text, env=None, drop=(), script=None, want_stderr=False):
     if want_stderr:
         return result.stdout, result.returncode, result.stderr.decode()
     return result.stdout, result.returncode
+
+
+def _communicate_kill_on_timeout(proc, payload, timeout):
+    """``proc.communicate(payload, timeout=timeout)``, but a regression that
+    makes the hook hang fails FAST and leaves no orphan.
+
+    Duplicated from test_handoff_sync.py's own copy (not shared -- each
+    test_*.py file here is independently runnable): the real-closed-pipe
+    tests below cannot use ``subprocess.run``'s own ``timeout=`` (its
+    cleanup already kills the child) -- they need the Popen object alive
+    afterward to read ``returncode``. A bare ``try: communicate(timeout=)
+    finally: proc.wait(timeout=)`` looks safe but is not: on a genuine
+    timeout, ``communicate`` raises ``TimeoutExpired`` with the child STILL
+    running, and the ``finally``'s own ``proc.wait(timeout=)`` then raises a
+    SECOND ``TimeoutExpired`` (replacing the first, inside a ``finally``).
+    Killing the child explicitly on timeout, then re-raising, is what
+    actually reports the hang quickly and does not leak a process."""
+    try:
+        return proc.communicate(payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
+        raise
+    finally:
+        proc.wait(timeout=timeout)
 
 
 # ── Transcript fixture helpers ──────────────────────────────────────────────────
@@ -185,20 +238,31 @@ class _UrlopenCapture:
 
 
 def _run_main_capturing(mod, stdin_event):
-    """Run mod.main() with urllib monkeypatched; return (capture, stdout_str)."""
+    """Run mod.main() with urllib monkeypatched; return (capture, stdout_str).
+
+    ``sys.stderr`` is saved and restored too (Amendment A9-21), not just
+    stdin/stdout: ``mod.main()`` now permanently replaces the GLOBAL
+    ``sys.stderr`` with a ``_StderrGuard`` (``_hook_runner.guard_stderr()``,
+    called before the work thread starts) the FIRST time it runs in this
+    process, and never restores it on its own -- mirroring the same fix
+    test_handoff_sync.py's own ``_run_main`` already needed for the same
+    reason (R5-c03 there): without this, every test in every OTHER
+    test_*.py module run in the SAME process via ``unittest discover``
+    would inherit whichever ``sys.stderr`` this file's own first call left
+    behind."""
     cap = _UrlopenCapture()
     orig_urlopen = mod.urllib.request.urlopen
     orig_branch = mod._current_branch
     mod.urllib.request.urlopen = cap
     mod._current_branch = lambda cwd: "feat/p1-capture"
-    old_stdin, old_stdout = sys.stdin, sys.stdout
+    old_stdin, old_stdout, old_stderr = sys.stdin, sys.stdout, sys.stderr
     sys.stdin = io.StringIO(json.dumps(stdin_event))
     sys.stdout = io.StringIO()
     try:
         mod.main()
         out = sys.stdout.getvalue()
     finally:
-        sys.stdin, sys.stdout = old_stdin, old_stdout
+        sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
         mod.urllib.request.urlopen = orig_urlopen
         mod._current_branch = orig_branch
     return cap, out
@@ -968,6 +1032,95 @@ class TestSharedModulesUnavailable(_LedgerCase):
         self.assertIn("_hook_runner", stderr)
         self.assertNotIn("Traceback", stderr)
 
+
+class TestStderrAndFd2Hygiene(_LedgerCase):
+    """Amendment A9-21: ``_hook_runner.guard_stderr()`` (installed at the
+    top of ``main()``, before the work thread starts) fixes two real-
+    subprocess failure modes that existed before this change -- mirrors
+    test_handoff_sync.py's own ``TestSubprocess`` closed-pipe tests, the
+    first hook that needed this protection (this hook had none of it: no
+    local ``_warn``, no local ``_silence_stderr``, every stderr write a bare
+    ``print(..., file=sys.stderr)``).
+
+    Garbage stdin (not valid JSON) drives ``_collect`` to raise immediately,
+    before it ever reaches the line that would have copied the event's own
+    ``cwd`` into ``run["cwd"]`` -- so ``main()`` reports it via the bare
+    ``print(..., file=sys.stderr)`` in its own ``elif "result" not in
+    outcome:`` branch (same shape as ``TestFailOpen.test_non_json_stdin``
+    above, just with a broken stderr this time), and the eventual ledger
+    row is keyed by ``_record``'s own ``cwd or os.getcwd()`` fallback --
+    which is why every subprocess below runs with ``cwd=self.cwd`` (the
+    Popen kwarg, the real OS-level working directory), not just an event
+    payload field that garbage stdin never lets `_collect` read anyway."""
+
+    def _popen_env(self):
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        return run_env
+
+    def test_fd_2_closed_before_the_interpreter_starts_still_exits_zero_with_no_stdout(self):
+        """Before this change: CPython sets ``sys.stderr`` to ``None`` (not
+        a stream) when fd 2 is closed BEFORE the interpreter even starts,
+        and a bare ``print(msg, file=None)`` silently FALLS BACK to ``sys.
+        stdout`` -- confirmed empirically -- putting the diagnostic on the
+        one channel this SessionEnd hook's contract requires to stay empty,
+        while still exiting 0 (the return code alone cannot tell the two
+        apart, which is why this asserts ``stdout``, not just ``code``)."""
+        proc = subprocess.Popen(
+            [sys.executable, _HOOK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, env=self._popen_env(),
+            cwd=self.cwd, preexec_fn=lambda: os.close(2),
+        )
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
+        self.assertEqual((stdout, proc.returncode), (b"", 0))
+
+    def test_garbage_stdin_with_a_closed_stderr_pipe_still_exits_zero_and_records_the_run(self):
+        """Before this change: the bare ``print(..., file=sys.stderr)`` in
+        ``main()``'s ``elif "result" not in outcome:`` branch raises
+        ``BrokenPipeError`` against a closed pipe, escaping ``main()``
+        BEFORE ``_record()`` -- the very next line -- ever runs, losing
+        this run's ledger row entirely; then CPython's own unconditional
+        reflush at shutdown (behind ``_hook_runner.finish``'s
+        ``sys.exit(0)``) retries the SAME write against the SAME closed
+        pipe, this time with no Python-level ``except`` anywhere near it --
+        exit code 120, not 0. A REAL closed pipe is the only way to observe
+        this: ``subprocess.run(..., capture_output=True)`` keeps its own
+        read end of the stderr pipe open for the whole run, which can never
+        reproduce it."""
+        r, w = os.pipe()
+        os.close(r)  # closed BEFORE the child ever writes: every write to `w` is EPIPE
+        proc = subprocess.Popen(
+            [sys.executable, _HOOK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=w, env=self._popen_env(),
+            cwd=self.cwd,
+        )
+        os.close(w)  # only the child holds the write end now
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
+        self.assertEqual((stdout, proc.returncode), (b"", 0))
+        ledgers = glob.glob(os.path.join(self.state_dir, "*", "session-capture.json"))
+        self.assertEqual(len(ledgers), 1, ledgers)
+        with open(ledgers[0], encoding="utf-8") as fh:
+            entry = json.load(fh)[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
+
+    def test_a_real_run_with_stdout_read_end_closed_still_exits_zero(self):
+        """This hook never writes to stdout on any path, closed pipe or
+        not -- a companion to the two tests above, pinning the third axis
+        (stdout's reader already gone) does not somehow block or crash a
+        process that never touches that pipe, and in particular that the
+        now-protected stderr diagnostic (garbage stdin still drives one)
+        does not get redirected there either."""
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        try:
+            proc = subprocess.run(
+                [sys.executable, _HOOK_SCRIPT], input=b"{not json",
+                stdout=write_end, stderr=subprocess.PIPE, env=self._popen_env(),
+                cwd=self.cwd, timeout=20,
+            )
+        finally:
+            os.close(write_end)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
 
 
 class TestLedgerStepIsBounded(_LedgerCase):

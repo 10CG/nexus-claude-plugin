@@ -38,6 +38,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+import _hook_runner
 import _hook_state
 import _identity
 
@@ -61,6 +62,26 @@ def _assert_home_untouched(home):
         raise AssertionError(f"a test wrote under HOME instead of the state dir: {leaked}")
 
 
+def _assert_stderr_not_left_wrapped():
+    """Amendment A9-21 regression guard, mirroring test_handoff_sync.py's
+    own (that file sorts first, alphabetically, so its backstop would catch
+    a leak from an EARLIER file too -- this one catches a leak from THIS
+    file reaching every test_*.py module sorted after it). ``_MOD.main()``
+    now permanently replaces the GLOBAL ``sys.stderr`` with a
+    ``_StderrGuard`` (``_hook_runner.guard_stderr()``, called before the
+    work thread starts) the first time it runs in this process; every
+    in-process test harness here (``TestRequestParams._run_main_capturing``,
+    ``_LedgerCase._main``) saves and restores ``sys.stderr`` around each
+    call for exactly this reason, and this is the module-wide backstop for
+    a future test that calls ``_MOD.main()`` directly instead."""
+    if isinstance(sys.stderr, _hook_runner._StderrGuard):
+        raise AssertionError(
+            "a test left sys.stderr wrapped in _StderrGuard -- every OTHER "
+            "test_*.py module run in this same `unittest discover` process "
+            "would inherit it"
+        )
+
+
 def setUpModule():
     root = tempfile.mkdtemp(prefix="nexus-hooktest-")
     unittest.addModuleCleanup(shutil.rmtree, root, ignore_errors=True)
@@ -71,6 +92,13 @@ def setUpModule():
     )
     patcher.start()
     unittest.addModuleCleanup(patcher.stop)
+    # Registration order matters (LIFO): the stderr check is registered
+    # BEFORE the home check, so the home-leak report -- the more actionable
+    # of the two -- is the one whose error survives if both ever fail on the
+    # same run (unittest.case.doModuleCleanups re-raises only the FIRST
+    # exception it collects, silently dropping the rest; see
+    # test_handoff_sync.py's TestModuleCleanupOrdering for the mechanism).
+    unittest.addModuleCleanup(_assert_stderr_not_left_wrapped)
     unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs first
 
 
@@ -363,16 +391,26 @@ class TestRequestParams(unittest.TestCase):
             os.environ.pop(k, None)
 
     def _run_main_capturing(self, responses, stdin_event):
+        """``sys.stderr`` is saved and restored too (Amendment A9-21), not
+        just stdin/stdout: ``_MOD.main()`` now permanently replaces the
+        GLOBAL ``sys.stderr`` with a ``_StderrGuard``
+        (``_hook_runner.guard_stderr()``, called before the work thread
+        starts) the FIRST time it runs in this process, and never restores
+        it on its own -- mirroring the same fix test_handoff_sync.py's own
+        ``_run_main`` already needed for the same reason (R5-c03 there):
+        without this, every test in every OTHER test_*.py module run in the
+        SAME process via ``unittest discover`` would inherit whichever
+        ``sys.stderr`` this file's own first call left behind."""
         cap = _UrlopenCapture(responses)
         _MOD.urllib.request.urlopen = cap
-        old_stdin, old_stdout = sys.stdin, sys.stdout
+        old_stdin, old_stdout, old_stderr = sys.stdin, sys.stdout, sys.stderr
         sys.stdin = io.StringIO(json.dumps(stdin_event))
         sys.stdout = io.StringIO()
         try:
             _MOD.main()
             out = sys.stdout.getvalue()
         finally:
-            sys.stdin, sys.stdout = old_stdin, old_stdout
+            sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
         return cap, out
 
     def test_body_uses_profile_limit_not_limit(self):
@@ -1119,6 +1157,116 @@ class TestAsARealProcess(unittest.TestCase):
             os.close(write_end)
         self.assertEqual(proc.returncode, 0, proc.stderr.decode())
         self.assertEqual(self._last_entry()["reason"], "unknown")
+
+
+def _communicate_kill_on_timeout(proc, payload, timeout):
+    """``proc.communicate(payload, timeout=timeout)``, but a regression that
+    makes the hook hang fails FAST and leaves no orphan.
+
+    Duplicated from test_handoff_sync.py's own copy (not shared -- each
+    test_*.py file here is independently runnable): the real-closed-pipe
+    tests below cannot use ``subprocess.run``'s own ``timeout=`` (its
+    cleanup already kills the child) -- they need the Popen object alive
+    afterward to read ``returncode``. A bare ``try: communicate(timeout=)
+    finally: proc.wait(timeout=)`` looks safe but is not: on a genuine
+    timeout, ``communicate`` raises ``TimeoutExpired`` with the child STILL
+    running, and the ``finally``'s own ``proc.wait(timeout=)`` then raises a
+    SECOND ``TimeoutExpired`` (replacing the first, inside a ``finally``).
+    Killing the child explicitly on timeout, then re-raising, is what
+    actually reports the hang quickly and does not leak a process."""
+    try:
+        return proc.communicate(payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
+        raise
+    finally:
+        proc.wait(timeout=timeout)
+
+
+class TestStderrAndFd2Hygiene(unittest.TestCase):
+    """Amendment A9-21: ``_hook_runner.guard_stderr()`` (installed at the
+    top of ``main()``, before the work thread starts) fixes two real-
+    subprocess failure modes that existed before this change -- mirrors
+    test_handoff_sync.py's own ``TestSubprocess`` closed-pipe tests, the
+    first hook that needed this protection. The third axis (stdout's reader
+    gone) already has real coverage above, in ``TestAsARealProcess.test_a_
+    stdout_nobody_is_reading_still_exits_zero`` -- a genuine successful
+    injection whose own stdout write fails, pre-dating this change and
+    unaffected by it.
+
+    Garbage stdin (not valid JSON) drives ``_collect`` to raise
+    immediately, before it ever reaches the line that would have copied
+    the event's own ``cwd`` into ``run["cwd"]`` -- so ``main()`` reports it
+    via ``_warn(reason, exc)`` (a bare ``print(..., file=sys.stderr)``,
+    line 505 at the time of Amendment A9-21's proposal analysis), and the
+    eventual ledger row is keyed by ``_record``'s own ``cwd or
+    os.getcwd()`` fallback -- which is why every subprocess below runs
+    with ``cwd=self.cwd`` (the Popen kwarg, the real OS-level working
+    directory), not just an event payload field that garbage stdin never
+    lets ``_collect`` read anyway. For THIS hook specifically, a leaked
+    diagnostic landing on stdout is not merely an empty-channel violation:
+    stdout IS the injected context SessionStart reads, so a leak here
+    would corrupt it, not just add noise."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.path.join(self.tmp.name, "proj")
+        os.makedirs(self.cwd)
+        self.state_dir = os.path.join(self.tmp.name, "state")
+
+    def _popen_env(self):
+        run_env = {k: v for k, v in os.environ.items()
+                   if k not in _PROXY_VARS and not k.startswith("NEXUS_")}
+        run_env.update(_NO_PROXY)
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        return run_env
+
+    def test_fd_2_closed_before_the_interpreter_starts_still_exits_zero_with_no_stdout(self):
+        """Before this change: CPython sets ``sys.stderr`` to ``None`` (not
+        a stream) when fd 2 is closed BEFORE the interpreter even starts,
+        and a bare ``print(msg, file=None)`` silently FALLS BACK to ``sys.
+        stdout`` -- confirmed empirically -- putting the diagnostic on the
+        one channel this SessionStart hook's contract treats as the
+        injected context itself, while still exiting 0 (the return code
+        alone cannot tell the two apart, which is why this asserts
+        ``stdout``, not just ``code``)."""
+        proc = subprocess.Popen(
+            [sys.executable, _HOOK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, env=self._popen_env(),
+            cwd=self.cwd, preexec_fn=lambda: os.close(2),
+        )
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
+        self.assertEqual((stdout, proc.returncode), (b"", 0))
+
+    def test_garbage_stdin_with_a_closed_stderr_pipe_still_exits_zero_and_records_the_run(self):
+        """Before this change: ``_warn``'s own bare ``print(..., file=sys.
+        stderr)`` raises ``BrokenPipeError`` against a closed pipe,
+        escaping ``main()`` well before ``_record()`` -- several lines
+        later, at the very end -- ever runs, losing this run's ledger row
+        entirely; then CPython's own unconditional reflush at shutdown
+        (behind ``_hook_runner.finish``'s ``sys.exit(0)``) retries the SAME
+        write against the SAME closed pipe, this time with no Python-level
+        ``except`` anywhere near it -- exit code 120, not 0. A REAL closed
+        pipe is the only way to observe this: ``subprocess.run(...,
+        capture_output=True)`` keeps its own read end of the stderr pipe
+        open for the whole run, which can never reproduce it."""
+        r, w = os.pipe()
+        os.close(r)  # closed BEFORE the child ever writes: every write to `w` is EPIPE
+        proc = subprocess.Popen(
+            [sys.executable, _HOOK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=w, env=self._popen_env(),
+            cwd=self.cwd,
+        )
+        os.close(w)  # only the child holds the write end now
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
+        self.assertEqual((stdout, proc.returncode), (b"", 0))
+        ledgers = glob.glob(os.path.join(self.state_dir, "*", "session-inject.json"))
+        self.assertEqual(len(ledgers), 1, ledgers)
+        with open(ledgers[0], encoding="utf-8") as fh:
+            entry = json.load(fh)[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
 
 
 class TestTheWorkerDiedQuietly(_LedgerCase):

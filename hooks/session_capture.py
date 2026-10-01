@@ -901,6 +901,23 @@ def _record(reason, started, run):
 def main():
     """Run the hook. Returns True when a worker thread had to be left behind."""
     started = time.monotonic()
+    # Installed before the work thread starts (Amendment A9-21, carried over
+    # from handoff_sync.py's TASK-005 original): every later print(...,
+    # file=sys.stderr) in this process -- the two diagnostic prints below,
+    # _record's own ledger-write prints, _hook_runner.write_with_budget's own
+    # fallback print -- looks up sys.stderr fresh at call time, so this one
+    # call protects all of them, whichever thread reaches them. Without it,
+    # either print below raising on a closed stderr pipe escaped main()
+    # entirely, skipping the _record() call just past it and losing this
+    # run's ledger row, then exiting 120 (not 0) when CPython's own
+    # unconditional reflush at shutdown retried the same write with no
+    # Python-level except left to catch it; and with fd 2 closed before the
+    # interpreter even started, sys.stderr is None, and a bare print(msg,
+    # file=None) silently falls back to sys.stdout -- which this hook's
+    # contract requires to stay empty. guard_stderr() is idempotent, so
+    # repeated in-process main() calls within the same test process do not
+    # double-wrap (production runs this once per process).
+    _hook_runner.guard_stderr()
     run = {"cwd": None, "calls": 0, "extra": {}}
 
     # The work runs against a deadline of its own. urllib's timeout is per
