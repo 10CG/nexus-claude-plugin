@@ -21,6 +21,7 @@ Coverage maps to workflow A acceptance:
 import glob
 import http.server
 import importlib.util
+import inspect
 import io
 import itertools
 import json
@@ -1267,6 +1268,101 @@ class TestStderrAndFd2Hygiene(unittest.TestCase):
         with open(ledgers[0], encoding="utf-8") as fh:
             entry = json.load(fh)[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
+
+
+class _NonOSErrorBrokenStderr:
+    """A stand-in for ``sys.stderr`` whose ``write``/``flush`` raise
+    something ``_StderrGuard``'s own ``except OSError:`` does NOT catch --
+    isolates the ``_record``-before-print ordering (R2-c05, mirrored from
+    handoff_sync.py / session_capture.py) from ``guard_stderr()``'s own,
+    independent protection, which only swallows ``OSError`` (a closed pipe
+    -- the realistic trigger ``TestStderrAndFd2Hygiene`` above already
+    covers with a REAL pipe). That real-pipe coverage cannot tell the two
+    defenses apart: a closed OS pipe is fully absorbed by ``guard_stderr()``
+    alone, so it stays green even if every ``_warn(...)`` call in ``main()``
+    quietly went back to firing immediately instead of after ``_record``."""
+
+    def write(self, *args, **kwargs):
+        raise ValueError("stderr broke in a way guard_stderr() does not swallow")
+
+    def flush(self):
+        raise ValueError("stderr broke in a way guard_stderr() does not swallow")
+
+
+class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):
+    """R2-c05 (mirrored from handoff_sync.py / session_capture.py): every
+    ``_warn(...)`` call in ``main()`` is deferred and only actually printed
+    AFTER ``_record`` has run, so the ledger row for this run does not
+    depend on any of them succeeding. Uses ``_NonOSErrorBrokenStderr`` (see
+    its own docstring for why a real closed pipe cannot stand in for it
+    here)."""
+
+    def _run_with_broken_stderr(self, stdin_text):
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin_text)), \
+                mock.patch.object(sys, "stdout", io.StringIO()), \
+                mock.patch.object(sys, "stderr", _NonOSErrorBrokenStderr()):
+            with self.assertRaises(ValueError):
+                _MOD.main()
+
+    def test_malformed_stdin_still_records_despite_the_stderr_failure(self):
+        """The ``"result" not in outcome`` branch: garbage stdin makes
+        ``_collect`` raise immediately, ``main()`` tries to report it via
+        ``_warn``, and -- before this fix -- that print happened before
+        ``_record``, losing the row."""
+        self._run_with_broken_stderr("not json at all")
+        entries = self._entries()
+        self.assertEqual(len(entries), 1, "the ledger row must survive the stderr failure")
+        self.assertEqual((entries[-1]["ok"], entries[-1]["reason"]), (False, "unknown"))
+
+    def test_timeout_still_records_despite_the_stderr_failure(self):
+        """The ``left_behind`` branch: a stalled worker thread times out,
+        ``main()`` tries to report it via ``_warn``, and -- before this fix
+        -- that print happened before ``_record``, losing the row."""
+        release = threading.Event()
+        self.addCleanup(release.set)  # let the abandoned worker finish and exit
+
+        def stall(req, timeout=None):
+            release.wait(30)
+
+        with mock.patch.object(urllib.request, "urlopen", stall), \
+                mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.2):
+            self._run_with_broken_stderr(json.dumps({"cwd": self.cwd}))
+        entries = self._entries()
+        self.assertEqual(len(entries), 1, "the ledger row must survive the stderr failure")
+        self.assertEqual(entries[-1]["reason"], "timeout")
+
+
+class TestModuleCleanupOrdering(unittest.TestCase):
+    """Mirrors test_handoff_sync.py's own class of the same name (see there
+    for the full mechanism this pins: ``unittest.case.doModuleCleanups``
+    runs every registered module cleanup LIFO -- whichever call is LAST in
+    ``setUpModule``'s own source order fires FIRST -- but re-raises only
+    the FIRST exception it collects, silently dropping the rest). This
+    file's own ``setUpModule`` (above) must register
+    ``_assert_stderr_not_left_wrapped`` BEFORE ``_assert_home_untouched``,
+    so the home-leak report -- the more actionable of the two -- is the
+    one that survives if both ever fail on the same run, rather than being
+    silently swallowed by the other."""
+
+    def test_the_home_leak_check_is_registered_after_the_stderr_check(self):
+        """Reads ``setUpModule``'s own source (rather than re-registering
+        the two functions here in a hand-picked order) to pin the actual
+        PRODUCTION registration order -- a reimplementation could quietly
+        drift away from what ``setUpModule`` really does."""
+        # The full `unittest.addModuleCleanup(...)` CALL, not the bare
+        # function name: `setUpModule`'s own explanatory comment above
+        # these two calls (necessarily) mentions both names too, and a
+        # bare-name search would find whichever one that PROSE happens to
+        # say first, regardless of the actual call order below it.
+        source = inspect.getsource(setUpModule)
+        home_pos = source.index("unittest.addModuleCleanup(_assert_home_untouched")
+        stderr_pos = source.index("unittest.addModuleCleanup(_assert_stderr_not_left_wrapped")
+        self.assertGreater(
+            home_pos, stderr_pos,
+            "_assert_home_untouched must be the LAST addModuleCleanup call in "
+            "setUpModule so it is the FIRST to run (LIFO) and its AssertionError "
+            "is not the one doModuleCleanups silently drops",
+        )
 
 
 class TestTheWorkerDiedQuietly(_LedgerCase):

@@ -599,18 +599,23 @@ def main():
     # file=sys.stderr) in this process -- _warn's own calls below, _record's
     # ledger-write prints, _hook_runner.write_with_budget's own fallback
     # print -- looks up sys.stderr fresh at call time, so this one call
-    # protects all of them, whichever thread reaches them. Without it, a
-    # closed stderr pipe made _warn raise, which could escape main() and
-    # lose this run's ledger row, then exit 120 (not 0) when CPython's own
-    # unconditional reflush at shutdown retried the same write with no
-    # Python-level except left to catch it; and with fd 2 closed before the
+    # protects all of them, whichever thread reaches them. Every _warn(...)
+    # call below now runs AFTER _record (see the comment right above that
+    # call, further down), so this guard is no longer the ONLY thing
+    # standing between a closed stderr pipe and a lost ledger row -- but it
+    # still matters independently of that ordering: CPython's own
+    # unconditional reflush of stdout AND stderr at interpreter shutdown
+    # (behind every exit path, including the "clean" one) retries the SAME
+    # write against the SAME closed pipe regardless of what main() itself
+    # already did, with no Python-level except left anywhere near it --
+    # that is exit code 120, not 0. And with fd 2 closed before the
     # interpreter even started, sys.stderr is None, and a bare print(msg,
     # file=None) silently falls back to sys.stdout -- which for THIS hook is
     # the injected context itself, not an empty channel: a leaked diagnostic
-    # here would corrupt the very brief SessionStart reads. guard_stderr()
-    # is idempotent, so repeated in-process main() calls within the same
-    # test process do not double-wrap (production runs this once per
-    # process).
+    # here would corrupt the very brief SessionStart reads, independent of
+    # ordering too. guard_stderr() is idempotent, so repeated in-process
+    # main() calls within the same test process do not double-wrap
+    # (production runs this once per process).
     _hook_runner.guard_stderr()
     run = {"cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None}
 
@@ -623,10 +628,17 @@ def main():
         lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
     )
 
+    # Every _warn(...) call below used to fire immediately; now each one is
+    # deferred (appended here as a (label, detail) pair) and only actually
+    # printed AFTER _record has run -- see the comment right before that
+    # _record call, further down, for why (R2-c05, mirrored from
+    # handoff_sync.py / session_capture.py).
+    diagnostics = []
+
     reason, brief = "unknown", None
     if left_behind:
         reason = "timeout"
-        _warn(reason, f"no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind")
+        diagnostics.append((reason, f"no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind"))
     elif "result" not in outcome:
         # Still exit 0 with no stdout -- but no longer without a trace.
         # `.get`: a worker that died of something `except Exception` does not
@@ -638,11 +650,11 @@ def main():
             reason = "http_error"
         else:
             reason = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
-        _warn(reason, exc)
+        diagnostics.append((reason, exc))
     else:
         reason, brief = outcome["result"]
         if run["extra"].get("backend_errors"):
-            _warn(reason, f"backend reported failures in {run['extra']['backend_errors']}")
+            diagnostics.append((reason, f"backend reported failures in {run['extra']['backend_errors']}"))
 
     findings = run["report"]
     if findings:
@@ -668,10 +680,26 @@ def main():
             sys.stdout.flush()
         except Exception as exc:
             reason = "unknown"
-            _warn("could not write the brief", exc)
+            diagnostics.append(("could not write the brief", exc))
             _silence_stdout()
 
-    return _record(reason, started, run) or left_behind
+    # _record (the ledger row for THIS run) runs BEFORE any of the deferred
+    # diagnostics above are actually printed, not after (R2-c05, mirrored
+    # from handoff_sync.py): the old order called _warn as it went, and a
+    # stderr write that fails -- a closed pipe, the host already exiting --
+    # used to raise straight out of main() before _record ever ran, silently
+    # losing the row for a run that had a genuine, useful reason to report.
+    # guard_stderr() above is a first, independent net (it keeps a stderr
+    # write from raising at all); this ordering is a second, independent
+    # one -- it still protects the ledger row even if some OTHER exception
+    # source in a diagnostic (not an OSError) were to escape that guard. The
+    # stdout brief write just above still runs BEFORE this, unchanged: that
+    # ordering protects the session's injection from a slow/stuck ledger
+    # write, a different concern from the one this reorder addresses.
+    record_left_behind = _record(reason, started, run)
+    for label, detail in diagnostics:
+        _warn(label, detail)
+    return record_left_behind or left_behind
 
 
 if __name__ == "__main__":

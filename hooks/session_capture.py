@@ -903,20 +903,25 @@ def main():
     started = time.monotonic()
     # Installed before the work thread starts (Amendment A9-21, carried over
     # from handoff_sync.py's TASK-005 original): every later print(...,
-    # file=sys.stderr) in this process -- the two diagnostic prints below,
+    # file=sys.stderr) in this process -- the diagnostic print below,
     # _record's own ledger-write prints, _hook_runner.write_with_budget's own
     # fallback print -- looks up sys.stderr fresh at call time, so this one
-    # call protects all of them, whichever thread reaches them. Without it,
-    # either print below raising on a closed stderr pipe escaped main()
-    # entirely, skipping the _record() call just past it and losing this
-    # run's ledger row, then exiting 120 (not 0) when CPython's own
-    # unconditional reflush at shutdown retried the same write with no
-    # Python-level except left to catch it; and with fd 2 closed before the
-    # interpreter even started, sys.stderr is None, and a bare print(msg,
-    # file=None) silently falls back to sys.stdout -- which this hook's
-    # contract requires to stay empty. guard_stderr() is idempotent, so
-    # repeated in-process main() calls within the same test process do not
-    # double-wrap (production runs this once per process).
+    # call protects all of them, whichever thread reaches them. The
+    # diagnostic print below now runs AFTER _record (see the comment right
+    # above that call), so this guard is no longer the ONLY thing standing
+    # between a closed stderr pipe and a lost ledger row -- but it still
+    # matters independently of that ordering: CPython's own unconditional
+    # reflush of stdout AND stderr at interpreter shutdown (behind every
+    # exit path, including the "clean" one -- see _hook_runner.finish)
+    # retries the SAME write against the SAME closed pipe regardless of
+    # what main() itself already did, with no Python-level except left
+    # anywhere near it -- that is exit code 120, not 0. And with fd 2
+    # closed before the interpreter even started, sys.stderr is None, and a
+    # bare print(msg, file=None) silently falls back to sys.stdout -- which
+    # this hook's contract requires to stay empty -- independent of
+    # ordering too. guard_stderr() is idempotent, so repeated in-process
+    # main() calls within the same test process do not double-wrap
+    # (production runs this once per process).
     _hook_runner.guard_stderr()
     run = {"cwd": None, "calls": 0, "extra": {}}
 
@@ -930,11 +935,11 @@ def main():
     )
 
     reason = "unknown"
+    diagnostic = None
     if left_behind:
         reason = "timeout"
-        print(
-            f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind",
-            file=sys.stderr,
+        diagnostic = (
+            f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind"
         )
     elif "result" not in outcome:
         # Still exit 0 with no stdout -- but no longer without a trace.
@@ -947,10 +952,24 @@ def main():
             reason = "http_error"
         else:
             reason = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
-        print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+        diagnostic = f"[{HOOK}] {reason}: {exc!r}"
     else:
         reason = outcome["result"]
-    return _record(reason, started, run) or left_behind
+
+    # _record (the ledger row for THIS run) runs BEFORE the diagnostic
+    # print, not after (R2-c05, mirrored from handoff_sync.py): the old
+    # order printed first, and a stderr write that fails -- a closed pipe,
+    # the host already exiting -- used to raise straight out of main()
+    # before _record ever ran, silently losing the row for a run that had
+    # a genuine, useful reason to report (timeout / a real exception).
+    # guard_stderr() above is a first, independent net (it keeps a stderr
+    # write from raising at all); this ordering is a second, independent
+    # one -- it still protects the ledger row even if some OTHER exception
+    # source in the diagnostic (not an OSError) were to escape that guard.
+    record_left_behind = _record(reason, started, run)
+    if diagnostic is not None:
+        print(diagnostic, file=sys.stderr)
+    return record_left_behind or left_behind
 
 
 if __name__ == "__main__":
