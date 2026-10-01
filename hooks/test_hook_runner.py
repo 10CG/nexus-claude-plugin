@@ -228,11 +228,19 @@ class TestSilenceStderr(unittest.TestCase):
     """``_hook_runner._silence_stderr`` backs ``_StderrGuard`` below -- a
     SEPARATE copy from any hook's own local ``_silence_stderr`` (handoff_
     sync.py keeps one, for its import guards; see this module's own
-    docstring for why that copy cannot simply call this one instead)."""
+    docstring for why that copy cannot simply call this one instead).
+
+    Takes the target stream explicitly (A9-21 R1 fix round, finding C3: an
+    earlier revision took no argument and read the GLOBAL ``sys.stderr``
+    instead -- see the function's own docstring for why that silences the
+    WRONG stream for a guard used without first being installed as
+    ``sys.stderr``). This test passes its stand-in stream straight to the
+    function rather than patching the global, which is no longer what the
+    function even looks at."""
 
     def test_does_not_leak_a_devnull_fd_when_fileno_is_unavailable(self):
         """Mirrors test_handoff_sync.py's own pin for its hook-local copy:
-        resolving ``sys.stderr.fileno()`` BEFORE ``os.open`` means a
+        resolving ``stream.fileno()`` BEFORE ``os.open`` means a
         target-less devnull fd is never opened in the first place when
         ``fileno()`` itself raises (a test double, or any future ``sys.
         stderr`` replacement with no real descriptor behind it) -- the
@@ -246,9 +254,8 @@ class TestSilenceStderr(unittest.TestCase):
             opened.append(fd)
             return fd
 
-        with mock.patch.object(_hook_runner.os, "open", side_effect=tracking_open), \
-                mock.patch.object(sys, "stderr", _BrokenStderr()):  # no .fileno() at all
-            _hook_runner._silence_stderr()  # must not raise
+        with mock.patch.object(_hook_runner.os, "open", side_effect=tracking_open):
+            _hook_runner._silence_stderr(_BrokenStderr())  # no .fileno() at all; must not raise
         for fd in opened:
             with self.assertRaises(OSError):
                 os.fstat(fd)  # fstat on a closed fd raises EBADF; a leaked one would not
@@ -342,6 +349,54 @@ class TestStderrGuard(unittest.TestCase):
         guard = _hook_runner._StderrGuard(None)
         self.assertEqual(guard.write("x"), 1)
         guard.flush()  # must not raise
+
+    # ── A9-21 R1 fix round (findings C3 / C8): the except branches below
+    # must silence THIS guard's own wrapped stream (``self._real``), not
+    # whatever ``sys.stderr`` happens to be at call time. Every test above
+    # keeps that distinction invisible by first patching the GLOBAL
+    # ``sys.stderr`` to be this SAME guard (`mock.patch.object(sys,
+    # "stderr", guard)`) -- in production, once ``guard_stderr()`` has
+    # installed a guard, ``sys.stderr`` and ``self._real`` agree by
+    # construction, so every existing hook path exercises this correctly
+    # either way. A test (or any future caller) that instead builds a
+    # ``_StderrGuard`` directly and uses it WITHOUT installing it as
+    # ``sys.stderr`` first does not: the old, no-argument
+    # ``_silence_stderr()`` read the global ``sys.stderr`` regardless,
+    # silencing -- in a real process -- the WRONG descriptor (the actual
+    # fd 2 of whatever process is running, not this guard's own broken
+    # stream). Patching ``_hook_runner._silence_stderr`` itself, rather
+    # than driving a real descriptor, is what lets this test assert the
+    # exact call without ever touching a real fd either way.
+
+    def test_write_failure_silences_the_wrapped_stream_not_the_global_one(self):
+        real = _BrokenStderr()
+        guard = _hook_runner._StderrGuard(real)
+        with mock.patch.object(_hook_runner, "_silence_stderr") as fake_silence:
+            self.assertEqual(guard.write("x"), 1)  # still swallowed, not raised
+        fake_silence.assert_called_once_with(real)
+
+    def test_flush_failure_silences_the_wrapped_stream_not_the_global_one(self):
+        real = _BrokenStderr()
+        guard = _hook_runner._StderrGuard(real)
+        with mock.patch.object(_hook_runner, "_silence_stderr") as fake_silence:
+            guard.flush()  # still swallowed, not raised
+        fake_silence.assert_called_once_with(real)
+
+    def test_a_successful_write_never_silences_anything(self):
+        guard = _hook_runner._StderrGuard(io.StringIO())
+        with mock.patch.object(_hook_runner, "_silence_stderr") as fake_silence:
+            self.assertEqual(guard.write("x"), 1)
+        fake_silence.assert_not_called()
+
+    def test_a_none_real_never_silences_anything(self):
+        """``self._real is None`` no-ops before ever reaching the
+        ``except OSError`` in either method -- there is nothing to
+        silence."""
+        guard = _hook_runner._StderrGuard(None)
+        with mock.patch.object(_hook_runner, "_silence_stderr") as fake_silence:
+            guard.write("x")
+            guard.flush()
+        fake_silence.assert_not_called()
 
 
 class TestGuardStderr(unittest.TestCase):

@@ -1033,6 +1033,75 @@ class TestSharedModulesUnavailable(_LedgerCase):
         self.assertIn("_hook_runner", stderr)
         self.assertNotIn("Traceback", stderr)
 
+    # ── A9-21 R1 fix round (finding C1): the two import guards above used a
+    # bare ``print(..., file=sys.stderr)`` -- unlike every OTHER stderr write
+    # in this file, none of which route through this partial-install case
+    # with BROKEN stdio. ``_hook_runner.guard_stderr()`` (installed at the
+    # top of ``main()``) cannot protect these: both guards run BEFORE
+    # ``_hook_runner`` is even imported, by construction (one of them is
+    # reporting that EXACT import failing). The two helpers below drive a
+    # partial install (`_copy_hook_without`, above) under the same two
+    # broken-stdio shapes `TestStderrAndFd2Hygiene` already covers for a
+    # FULLY installed hook.
+
+    def _run_with_fd2_closed_before_start(self, script):
+        """fd 2 closed BEFORE the interpreter starts: CPython sets
+        ``sys.stderr`` to ``None`` rather than a stream object, and a bare
+        ``print(msg, file=None)`` does not raise -- it silently FALLS BACK
+        to ``sys.stdout``, which would put the import guard's diagnostic on
+        the one channel this SessionEnd hook's contract requires to stay
+        empty (confirmed empirically, same as ``_hook_runner``'s own
+        ``_StderrGuard`` docstring)."""
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+            env=run_env, cwd=self.cwd, preexec_fn=lambda: os.close(2),
+        )
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{}", 20)
+        return stdout, proc.returncode
+
+    def _run_with_closed_stderr_read_end(self, script):
+        """stderr's READ end already closed (the host is already exiting):
+        every write to the write end is EPIPE, so a bare
+        ``print(..., file=sys.stderr)`` raises ``BrokenPipeError`` straight
+        out of the import guard, and CPython's own unconditional reflush at
+        shutdown then retries the SAME write with no Python-level
+        ``except`` anywhere near it -- exit code 120, not 0."""
+        r, w = os.pipe()
+        os.close(r)  # closed BEFORE the child ever writes: every write to `w` is EPIPE
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=w,
+            env=run_env, cwd=self.cwd,
+        )
+        os.close(w)  # only the child holds the write end now
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{}", 20)
+        return stdout, proc.returncode
+
+    def test_without_identity_and_fd_2_closed_before_start_puts_nothing_on_stdout(self):
+        script = self._copy_hook_without("_identity.py")
+        stdout, code = self._run_with_fd2_closed_before_start(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_hook_runner_and_fd_2_closed_before_start_puts_nothing_on_stdout(self):
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code = self._run_with_fd2_closed_before_start(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_identity_and_a_closed_stderr_read_end_still_exits_zero(self):
+        script = self._copy_hook_without("_identity.py")
+        stdout, code = self._run_with_closed_stderr_read_end(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_hook_runner_and_a_closed_stderr_read_end_still_exits_zero(self):
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code = self._run_with_closed_stderr_read_end(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
 
 class TestStderrAndFd2Hygiene(_LedgerCase):
     """Amendment A9-21: ``_hook_runner.guard_stderr()`` (installed at the
@@ -1108,20 +1177,41 @@ class TestStderrAndFd2Hygiene(_LedgerCase):
         """This hook never writes to stdout on any path, closed pipe or
         not -- a companion to the two tests above, pinning the third axis
         (stdout's reader already gone) does not somehow block or crash a
-        process that never touches that pipe, and in particular that the
-        now-protected stderr diagnostic (garbage stdin still drives one)
-        does not get redirected there either."""
+        process that never touches that pipe.
+
+        A9-21 R1 fix round (finding C7) -- an earlier revision of this test
+        gave the child a NORMAL ``stderr=subprocess.PIPE``, so ``sys.
+        stderr`` was never ``None`` in that run and the one shape this test
+        claimed to pin (the now-protected stderr diagnostic getting
+        redirected to stdout when fd 2 is missing) was never actually
+        exercised -- it passed whether or not that protection existed at
+        all (confirmed: deleting ``guard_stderr()`` from this hook's
+        ``main()`` still left this exact test green). Combining BOTH
+        broken-stdio shapes at once -- fd 2 closed before the interpreter
+        starts (``sys.stderr`` is ``None``) AND stdout's read end already
+        closed -- is what actually distinguishes the two: before this fix,
+        this combination was ``rc=120`` on ``main`` (the diagnostic
+        falls back to the now-also-broken stdout, raising on write, same
+        as ``TestStderrAndFd2Hygiene.test_fd_2_closed_before_the_
+        interpreter_starts_still_exits_zero_with_no_stdout`` already pins
+        for the CLEAN-stdout case)."""
         read_end, write_end = os.pipe()
         os.close(read_end)
         try:
-            proc = subprocess.run(
-                [sys.executable, _HOOK_SCRIPT], input=b"{not json",
-                stdout=write_end, stderr=subprocess.PIPE, env=self._popen_env(),
-                cwd=self.cwd, timeout=20,
+            proc = subprocess.Popen(
+                [sys.executable, _HOOK_SCRIPT],
+                stdin=subprocess.PIPE, stdout=write_end, stderr=None,
+                env=self._popen_env(), cwd=self.cwd, preexec_fn=lambda: os.close(2),
             )
+            _stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
         finally:
             os.close(write_end)
-        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        self.assertEqual(proc.returncode, 0)
+        ledgers = glob.glob(os.path.join(self.state_dir, "*", "session-capture.json"))
+        self.assertEqual(len(ledgers), 1, ledgers)
+        with open(ledgers[0], encoding="utf-8") as fh:
+            entry = json.load(fh)[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
 
 
 class _NonOSErrorBrokenStderr:

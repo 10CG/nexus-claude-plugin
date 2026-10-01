@@ -114,6 +114,71 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+
+def _import_warn(message):
+    """Print one diagnostic line to stderr, never raising (A9-21 R1 fix
+    round, finding C1).
+
+    Used ONLY by the two import guards immediately below: at this point in
+    the file ``_hook_runner`` may itself be the missing piece (one of these
+    guards exists to report exactly that), so nothing here may depend on
+    it -- in particular not ``_hook_runner.guard_stderr()``, which is what
+    protects every OTHER stderr write in this file (installed at the top of
+    ``main()``, before the work thread starts). Named distinctly from this
+    file's own ``_warn(reason, exc)`` (defined further down, after these
+    guards, with a different signature for the main-path diagnostics) --
+    a same-named redefinition would silently shadow whichever one is
+    defined first -- mirroring ``handoff_sync.py``'s identical local pair:
+    Amendment A9-21 moved the ``_StderrGuard`` CLASS into ``_hook_runner``,
+    but left each hook's own import-time ``_warn`` / ``_silence_stderr``
+    local on purpose.
+
+    ``sys.stderr is None`` (fd 2 closed before the interpreter even
+    started) is checked first: a bare ``print(message, file=None)`` does
+    not raise -- it silently FALLS BACK to ``sys.stdout``, which for THIS
+    hook is the injected context itself, not an empty channel (confirmed
+    empirically). There is no real file descriptor to redirect in this
+    shape, so this simply skips the write.
+
+    A closed stderr PIPE is a different shape (a live stream whose
+    ``write`` raises ``BrokenPipeError``, an ``OSError`` subclass):
+    swallowing that from this one call is not enough on its own, because
+    CPython's own interpreter shutdown unconditionally reflushes stdout
+    AND stderr again once this process is on its way out, retrying the
+    SAME write against the SAME closed pipe with no Python-level ``except``
+    left near it at that point -- exit code 120, not 0.
+    ``_silence_stderr`` below reroutes the underlying descriptor to
+    ``os.devnull`` so that retry lands somewhere that accepts anything.
+    """
+    if sys.stderr is None:
+        return
+    try:
+        print(message, file=sys.stderr)
+    except OSError:
+        _silence_stderr()
+
+
+def _silence_stderr():
+    """After a failed write through ``_import_warn`` above, stop the
+    interpreter retrying it on the way out.
+
+    ``sys.stderr.fileno()`` is resolved BEFORE ``os.open``: the reverse
+    order opened the devnull fd first, and a failing ``fileno()`` (a test
+    double, or any future stderr replacement with no real descriptor)
+    would then leave it dangling, swallowed by the blanket
+    ``except Exception: pass`` below.
+    """
+    try:
+        target_fd = sys.stderr.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, target_fd)
+        finally:
+            os.close(devnull)
+    except Exception:
+        pass  # not a real file descriptor (tests), or nothing left to protect
+
+
 try:
     import _identity
 except Exception as exc:  # a broken or partial install
@@ -122,7 +187,7 @@ except Exception as exc:  # a broken or partial install
     # every single session start.
     if __name__ != "__main__":
         raise
-    print(f"[session-inject] cannot import _identity: {exc!r}", file=sys.stderr)
+    _import_warn(f"[session-inject] cannot import _identity: {exc!r}")
     sys.exit(0)
 
 try:
@@ -136,7 +201,7 @@ except Exception as exc:  # a broken or partial install
     # bookkeeping like _hook_state below.
     if __name__ != "__main__":
         raise
-    print(f"[session-inject] cannot import _hook_runner: {exc!r}", file=sys.stderr)
+    _import_warn(f"[session-inject] cannot import _hook_runner: {exc!r}")
     sys.exit(0)
 
 try:
@@ -623,7 +688,19 @@ def main():
     # socket operation, not per request -- one "6 s" request was measured at
     # 24 s against a server that drips bytes -- and a hook the host has to kill
     # leaves no record and, for SessionStart, no brief. So leave first.
-    # _collect never prints: a thread that may be abandoned must stay off stdio.
+    # NOTE (A9-21 R1 fix round, finding C2 -- corrects an earlier revision of
+    # this comment, which claimed "_collect never prints: a thread that may
+    # be abandoned must stay off stdio"): _collect DOES print, on this same
+    # worker thread -- its own `except Exception` around `_failure_report`
+    # below reports a broken ledger read via a bare `print(...,
+    # file=sys.stderr)`. That is exactly WHY `guard_stderr()` above must run
+    # before this call, not after: without it, that print would hit the
+    # SAME two failure shapes `_warn` itself guards against (fd 2 closed
+    # before start -> falls back to sys.stdout, corrupting this hook's own
+    # injected-context channel; stderr's read end already closed ->
+    # BrokenPipeError escapes `_collect` entirely, turning a benign
+    # `not_configured` run into a spurious `http_error`). Pinned by
+    # test_session_inject.py's TestGuardStderrPrecedesTheWorkerThread.
     outcome, left_behind = _hook_runner.run_with_deadline(
         lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
     )

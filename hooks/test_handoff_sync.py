@@ -3580,12 +3580,15 @@ class TestSubprocess(unittest.TestCase):
         and `flush`'s still-intact guard no-ops at shutdown same as ever;
         confirmed empirically against a temp copy -- see the `_StderrGuard`
         class docstring's own two-guards paragraph). `write`'s side is
-        pinned directly instead, by `test_stderr_guard_wrapping_none_
-        does_not_raise` above (see `TestImportGuards`' sibling test above
-        for the one shape that DOES exercise `_warn`'s OWN `sys.stderr is
-        None` branch, a different guard again: a missing sibling module,
-        whose bare `print` runs before any `_StderrGuard` exists to wrap
-        anything)."""
+        pinned directly instead, by `test_hook_runner.TestStderrGuard.
+        test_wrapping_none_does_not_raise` (A9-21 moved `_StderrGuard`
+        itself into `_hook_runner`, and that test with it -- NOT "above",
+        and NOT in this file any more, correcting an earlier revision of
+        this paragraph written before that move) -- see `TestImportGuards`'
+        sibling test above for the one shape that DOES exercise `_warn`'s
+        OWN `sys.stderr is None` branch, a different guard again: a
+        missing sibling module, whose bare `print` runs before any
+        `_StderrGuard` exists to wrap anything)."""
         run_env = _scrub_subprocess_env()
         run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
         proc = subprocess.Popen(

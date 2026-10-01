@@ -824,6 +824,73 @@ class TestSharedModulesUnavailable(_LedgerCase):
         self.assertIn("_hook_runner", stderr)
         self.assertNotIn("Traceback", stderr)
 
+    # ── A9-21 R1 fix round (finding C1): the two import guards above used a
+    # bare ``print(..., file=sys.stderr)`` -- unlike every OTHER stderr write
+    # in this file, none of which route through this partial-install case
+    # with BROKEN stdio. ``_hook_runner.guard_stderr()`` (installed at the
+    # top of ``main()``) cannot protect these: both guards run BEFORE
+    # ``_hook_runner`` is even imported, by construction (one of them is
+    # reporting that EXACT import failing). The two helpers below drive a
+    # partial install (`_copy_hook_without`, above) under the same two
+    # broken-stdio shapes `TestStderrAndFd2Hygiene` already covers for a
+    # FULLY installed hook.
+
+    def _run_with_fd2_closed_before_start(self, script):
+        """fd 2 closed BEFORE the interpreter starts: CPython sets
+        ``sys.stderr`` to ``None`` rather than a stream object, and a bare
+        ``print(msg, file=None)`` does not raise -- it silently FALLS BACK
+        to ``sys.stdout``, which for THIS hook is the injected context
+        itself, not an empty channel (confirmed empirically, same as
+        ``_hook_runner``'s own ``_StderrGuard`` docstring)."""
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+            env=run_env, cwd=self.cwd, preexec_fn=lambda: os.close(2),
+        )
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{}", 20)
+        return stdout, proc.returncode
+
+    def _run_with_closed_stderr_read_end(self, script):
+        """stderr's READ end already closed (the host is already exiting):
+        every write to the write end is EPIPE, so a bare
+        ``print(..., file=sys.stderr)`` raises ``BrokenPipeError`` straight
+        out of the import guard, and CPython's own unconditional reflush at
+        shutdown then retries the SAME write with no Python-level
+        ``except`` anywhere near it -- exit code 120, not 0."""
+        r, w = os.pipe()
+        os.close(r)  # closed BEFORE the child ever writes: every write to `w` is EPIPE
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=w,
+            env=run_env, cwd=self.cwd,
+        )
+        os.close(w)  # only the child holds the write end now
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{}", 20)
+        return stdout, proc.returncode
+
+    def test_without_identity_and_fd_2_closed_before_start_puts_nothing_on_stdout(self):
+        script = self._copy_hook_without("_identity.py")
+        stdout, code = self._run_with_fd2_closed_before_start(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_hook_runner_and_fd_2_closed_before_start_puts_nothing_on_stdout(self):
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code = self._run_with_fd2_closed_before_start(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_identity_and_a_closed_stderr_read_end_still_exits_zero(self):
+        script = self._copy_hook_without("_identity.py")
+        stdout, code = self._run_with_closed_stderr_read_end(script)
+        self.assertEqual((stdout, code), (b"", 0))
+
+    def test_without_hook_runner_and_a_closed_stderr_read_end_still_exits_zero(self):
+        script = self._copy_hook_without("_hook_runner.py")
+        stdout, code = self._run_with_closed_stderr_read_end(script)
+        self.assertEqual((stdout, code), (b"", 0))
 
 
 class TestLedgerStepIsBounded(_LedgerCase):
@@ -1269,6 +1336,125 @@ class TestStderrAndFd2Hygiene(unittest.TestCase):
             entry = json.load(fh)[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (False, "unknown"))
 
+    def test_fd_2_closed_before_start_and_stdouts_read_end_closed_still_exits_zero(self):
+        """A9-21 R1 fix round (finding C7, mirrored from
+        test_session_capture.py's own companion): combining BOTH
+        broken-stdio shapes at once -- fd 2 closed before the interpreter
+        starts (``sys.stderr`` is ``None``) AND stdout's read end already
+        closed -- is what actually distinguishes "the diagnostic no-ops"
+        from "the diagnostic silently fell back to stdout": with a NORMAL
+        stdout (as ``test_fd_2_closed_before_the_interpreter_starts_still_
+        exits_zero_with_no_stdout`` above already uses), a fallback write
+        to stdout would simply succeed and only be caught by asserting
+        ``stdout == b""``; closing stdout's read end too means that same
+        fallback would instead raise, turning this into ``rc=120`` --
+        confirmed empirically against ``main`` (both this hook and
+        session_capture.py exit 120 under this exact combination there)."""
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, _HOOK_SCRIPT],
+                stdin=subprocess.PIPE, stdout=write_end, stderr=None,
+                env=self._popen_env(), cwd=self.cwd, preexec_fn=lambda: os.close(2),
+            )
+            _communicate_kill_on_timeout(proc, b"{not json", 20)
+        finally:
+            os.close(write_end)
+        self.assertEqual(proc.returncode, 0)
+
+
+class TestGuardStderrPrecedesTheWorkerThread(unittest.TestCase):
+    """A9-21 R1 fix round (finding C2): ``guard_stderr()`` must run BEFORE
+    the worker thread starts, not merely somewhere inside ``main()`` --
+    ``_collect`` itself prints on that very thread (its own
+    ``except Exception`` around ``_failure_report``, a bare
+    ``print(..., file=sys.stderr)``), so a regression that moved the
+    ``guard_stderr()`` call to AFTER ``_hook_runner.run_with_deadline``
+    would leave exactly that one print unprotected while every OTHER
+    stderr write in this file stayed fixed. Nothing in
+    ``TestStderrAndFd2Hygiene`` above exercises this: that class drives
+    GARBAGE stdin, which makes ``_collect`` raise before it ever reaches
+    the ledger read, never printing on the worker thread at all. Confirmed
+    by mutation: moving the ``guard_stderr()`` call to run after
+    ``run_with_deadline`` instead of before left the whole suite green
+    before this class existed.
+
+    Pre-seeds a malformed ``session-capture`` ledger (its last entry's
+    ``reason`` a list, not a string) so ``_hook_state.is_failure_reason``
+    raises ``TypeError`` INSIDE ``_failure_report``, reached from
+    ``_collect`` on the worker thread. ``NEXUS_API_URL`` is left unset
+    (``_popen_env`` below strips every ``NEXUS_*`` var first) so the run
+    falls through to ``not_configured`` right after that print -- nothing
+    past it ever makes a real HTTP call, keeping the two stdio shapes
+    below isolated to the one print this class exists to pin."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.path.join(self.tmp.name, "proj")
+        os.makedirs(self.cwd)
+        self.state_dir = os.path.join(self.tmp.name, "state")
+        # Same slug derivation `_identity.project_slug` itself uses (git
+        # toplevel basename, else cwd basename) -- `self.cwd` is not a git
+        # repository, so this is just `os.path.basename`, stable regardless
+        # of how the child subprocess's own `os.getcwd()` happens to spell
+        # the same directory.
+        slug = _identity.project_slug(self.cwd)
+        project_dir = os.path.join(self.state_dir, slug)
+        os.makedirs(project_dir)
+        with open(os.path.join(project_dir, "session-capture.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                [{"hook": "session-capture", "ts": "2026-01-01T00:00:00Z",
+                  "ok": False, "reason": ["not", "a", "string"],
+                  "elapsed_ms": 1, "calls": 0}],
+                fh,
+            )
+
+    def _popen_env(self):
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith("NEXUS_")}
+        run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
+        return run_env
+
+    def _own_ledger_entry(self):
+        ledgers = glob.glob(os.path.join(self.state_dir, "*", "session-inject.json"))
+        self.assertEqual(len(ledgers), 1, ledgers)
+        with open(ledgers[0], encoding="utf-8") as fh:
+            return json.load(fh)[-1]
+
+    def test_fd_2_closed_before_start_puts_nothing_on_stdout(self):
+        """If ``guard_stderr()`` ran AFTER the thread started: fd 2 is
+        closed before the interpreter starts, so ``sys.stderr`` is ``None``
+        at the moment ``_collect``'s own print runs -- a bare
+        ``print(msg, file=None)`` silently falls back to ``sys.stdout``,
+        which for this SessionStart hook IS the injected context."""
+        proc = subprocess.Popen(
+            [sys.executable, _HOOK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, env=self._popen_env(),
+            cwd=self.cwd, preexec_fn=lambda: os.close(2),
+        )
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{}", 20)
+        self.assertEqual((stdout, proc.returncode), (b"", 0))
+
+    def test_a_closed_stderr_read_end_does_not_turn_this_run_into_an_http_error(self):
+        """If ``guard_stderr()`` ran AFTER the thread started: the read end
+        already closed means every write to the write end is EPIPE, so
+        ``_collect``'s bare print raises ``BrokenPipeError`` straight out
+        of ``_collect`` -- a ``ConnectionError`` subclass, which
+        ``_hook_state.reason_for_exception`` maps to ``http_error`` -- and
+        this run never reaches its own ``not_configured`` return at all."""
+        r, w = os.pipe()
+        os.close(r)  # closed BEFORE the child ever writes: every write to `w` is EPIPE
+        proc = subprocess.Popen(
+            [sys.executable, _HOOK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=w, env=self._popen_env(),
+            cwd=self.cwd,
+        )
+        os.close(w)  # only the child holds the write end now
+        stdout, _stderr = _communicate_kill_on_timeout(proc, b"{}", 20)
+        self.assertEqual((stdout, proc.returncode), (b"", 0))
+        self.assertEqual(self._own_ledger_entry()["reason"], "not_configured")
+
 
 class _NonOSErrorBrokenStderr:
     """A stand-in for ``sys.stderr`` whose ``write``/``flush`` raise
@@ -1287,6 +1473,18 @@ class _NonOSErrorBrokenStderr:
 
     def flush(self):
         raise ValueError("stderr broke in a way guard_stderr() does not swallow")
+
+
+class _RaisingStdout:
+    """A stand-in for ``sys.stdout`` whose ``write`` always raises -- what a
+    closed stdout pipe (the host already gone) looks like to
+    ``sys.stdout.write(...)``. No ``flush``/``fileno`` needed: ``write``
+    itself raises before ``main()`` ever reaches its own
+    ``sys.stdout.flush()``, and ``_silence_stdout``'s own blanket
+    ``except Exception: pass`` tolerates a missing ``fileno`` just fine."""
+
+    def write(self, *args, **kwargs):
+        raise OSError("stdout closed")
 
 
 class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):
@@ -1330,6 +1528,42 @@ class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):
         entries = self._entries()
         self.assertEqual(len(entries), 1, "the ledger row must survive the stderr failure")
         self.assertEqual(entries[-1]["reason"], "timeout")
+
+    def test_backend_errors_still_record_http_error_despite_the_stderr_failure(self):
+        """The ``else`` branch's own ``if run["extra"].get("backend_errors")``
+        case (A9-21 R1 fix round, finding C6): the backend answered 200
+        with SOME rows but also an ``errors`` entry for a recognised task,
+        so ``_collect`` returns ``("http_error", brief)`` and ``main()``
+        defers ITS OWN diagnostic the same way the other two branches
+        already do. Neither test above covers this: both hit the
+        ``"result" not in outcome`` branch instead (garbage stdin / a
+        stalled worker), never this ``else`` branch at all."""
+        capture = _UrlopenCapture([
+            {"profile": [_profile_row("despite the backend error")],
+             "errors": {"profile": "boom upstream"}},
+        ])
+        with mock.patch.object(urllib.request, "urlopen", capture):
+            self._run_with_broken_stderr(json.dumps({"cwd": self.cwd}))
+        entries = self._entries()
+        self.assertEqual(len(entries), 1, "the ledger row must survive the stderr failure")
+        self.assertEqual((entries[-1]["ok"], entries[-1]["reason"]), (False, "http_error"))
+
+    def test_a_broken_stdout_write_still_records_despite_the_stderr_failure(self):
+        """The ``if brief: ... except Exception`` case (finding C6): a
+        failed write of the brief itself defers ITS OWN diagnostic the
+        same way. Neither test above reaches this block at all: garbage
+        stdin and a stalled worker each short-circuit before ``brief`` is
+        ever computed, let alone written."""
+        capture = _UrlopenCapture([{"profile": [_profile_row("a settled row")]}])
+        with mock.patch.object(urllib.request, "urlopen", capture), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", _RaisingStdout()), \
+                mock.patch.object(sys, "stderr", _NonOSErrorBrokenStderr()):
+            with self.assertRaises(ValueError):
+                _MOD.main()
+        entries = self._entries()
+        self.assertEqual(len(entries), 1, "the ledger row must survive the stderr failure")
+        self.assertEqual((entries[-1]["ok"], entries[-1]["reason"]), (False, "unknown"))
 
 
 class TestModuleCleanupOrdering(unittest.TestCase):

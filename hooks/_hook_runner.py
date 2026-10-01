@@ -180,23 +180,55 @@ def finish(left_behind):
     this path to protect the process FROM.
 
     A caller cannot cover the closed-pipe case merely by swallowing a
-    write's own ``OSError`` (R3-c03, correcting an earlier revision of
-    this paragraph that claimed handoff_sync.py's stderr writes already
-    did, by doing exactly that): CPython's shutdown sequence
+    write's own ``OSError`` in the ORDINARY sense -- wrapping just THAT one
+    call in a try/except (R3-c03, correcting an earlier revision of this
+    paragraph that claimed handoff_sync.py's stderr writes already did,
+    by doing exactly that): CPython's shutdown sequence
     (``flush_std_files``, behind every plain ``sys.exit()``) flushes
     stdout AND stderr again UNCONDITIONALLY once this function returns
     control to it, and a buffered writer whose earlier ``write()`` raised
     does not discard what it failed to write -- the retry targets the
-    SAME closed pipe and fails again, this time with no Python-level
-    ``except`` anywhere near it (confirmed empirically against a real
+    SAME closed pipe and fails again (confirmed empirically against a real
     closed pipe, not a mock stand-in: swallowing every explicit
-    ``print(..., file=sys.stderr)`` in a hook still exits 120). The only
-    thing that actually stops the retry from failing too is rerouting the
-    file descriptor itself to ``os.devnull`` on the first failure --
-    ``session_inject._silence_stdout`` for stdout, ``handoff_sync._silence_
-    stderr`` for stderr -- so that BOTH this function's own flush above
-    and the interpreter's later one land on a descriptor that accepts
-    anything.
+    ``print(..., file=sys.stderr)`` in a hook still exits 120 unless
+    something ELSE also protects this later, unconditional retry).
+
+    Two DIFFERENT things stand between that retry and exit 120 today, one
+    per stream -- STDOUT's predates Amendment A9-21 and is unchanged;
+    STDERR's is what that amendment added (A9-21 R1 fix round, finding
+    C4 -- corrects an earlier revision of this paragraph, which named only
+    the reroute below and did not yet distinguish the two streams, written
+    before the guard class existed here at all):
+
+      * STDOUT has no guard object wrapping it. ``session_inject.
+        _silence_stdout`` reroutes the underlying file descriptor itself
+        to ``os.devnull`` on the FIRST failed write, so this function's
+        own ``sys.stdout.flush()`` above, and the interpreter's later
+        unconditional one, both land on a descriptor that accepts
+        anything -- reroute is the WHOLE story for this stream; nothing
+        here catches a stdout ``OSError`` directly.
+      * STDERR, once ``guard_stderr()`` has installed a ``_StderrGuard``
+        as ``sys.stderr`` (every hook that starts a worker thread calls it
+        before doing so), is different: this function's own
+        ``sys.stderr.flush()`` above, and CPython's later unconditional
+        one, both go THROUGH that guard, whose own ``except OSError``
+        swallows the failure directly -- the SAME protection every other
+        stderr write in the process gets from it once installed. That is
+        what actually stops THIS retry from reaching Python with no
+        ``except`` anywhere near it; the guard's own reroute
+        (``_hook_runner._silence_stderr``, called from that same
+        ``except``) is a SECOND, independent layer on top -- it is what
+        makes a LATER write through the SAME guard actually succeed
+        rather than merely not raise, not what protects this one.
+
+    Before any guard is installed at all -- the import guards each hook
+    runs before anything in this module is even imported -- there is no
+    ``_StderrGuard`` yet for an ``except OSError`` to live on, and a
+    hook's own LOCAL ``_silence_stderr`` (handoff_sync.py's original;
+    session_capture.py / session_inject.py each gained an identical local
+    copy of their own in the A9-21 R1 fix round) is the only thing on
+    that narrower, earlier path -- reroute, by itself, is the whole story
+    THERE.
     """
     if left_behind:
         try:
@@ -211,10 +243,20 @@ def finish(left_behind):
 
 # ── shared stderr guard (Amendment A9-21) ───────────────────────────────
 
-def _silence_stderr():
+def _silence_stderr(stream):
     """After a failed write THROUGH an installed ``_StderrGuard``, stop the
     interpreter retrying it on the way out -- the ``_StderrGuard.write`` /
-    ``.flush`` methods below call this from their own ``except OSError``.
+    ``.flush`` methods below call this, from their own ``except OSError``,
+    passing their OWN ``self._real`` (A9-21 R1 fix round, finding C3: an
+    earlier revision of this function took no argument and read the
+    GLOBAL ``sys.stderr`` instead -- in every current hook path those agree
+    by construction, since nothing calls ``guard_stderr()``'s installed
+    guard's ``write``/``flush`` before ``sys.stderr`` IS that guard, but a
+    test -- or a future caller -- that builds a ``_StderrGuard`` directly
+    WITHOUT first installing it as ``sys.stderr`` does not: the old
+    no-argument form would then silence whatever ``sys.stderr`` happened
+    to be at that moment -- in a real process, the actual fd 2 -- instead
+    of the stream this guard actually wraps).
 
     This is NOT the same function as a hook's own local ``_silence_stderr``
     (handoff_sync.py keeps one, for its import guards -- see the module
@@ -222,19 +264,22 @@ def _silence_stderr():
     this copy exists only to back the guard CLASS that lives here now, and
     is never called before ``guard_stderr()`` has installed that guard.
 
-    ``sys.stderr.fileno()`` is resolved BEFORE ``os.open``: by the time this
-    runs, ``sys.stderr`` IS the installed ``_StderrGuard`` (whose own
-    ``fileno()`` delegates to ``self._real.fileno()``), so resolving it
-    first means a guard wrapping something with no real descriptor at all
-    (a test double, or ``self._real is None``) never leaves a target-less
-    devnull fd open for the blanket ``except Exception: pass`` below to
-    silently leak -- the reverse order opened the devnull fd first, and a
-    failing ``fileno()`` afterward left it dangling (this ordering carries
-    over the same fix handoff_sync.py's own local copy already made, R4-c08
-    in its history, now made once here instead of risked again per copy).
+    ``stream.fileno()`` is resolved BEFORE ``os.open``: a stream with no
+    real descriptor at all (a test double, or ``self._real is None`` --
+    the guard checks that itself before ever calling this) never leaves a
+    target-less devnull fd open for the blanket ``except Exception: pass``
+    below to silently leak -- the reverse order opened the devnull fd
+    first, and a failing ``fileno()`` afterward left it dangling (this
+    ordering carries over the same fix handoff_sync.py's own local copy
+    already made, R4-c08 in its history, now made once here instead of
+    risked again per copy). For an INSTALLED guard this is the same
+    descriptor ``sys.stderr.fileno()`` would have resolved to anyway (the
+    guard's own ``fileno()`` delegates to ``self._real.fileno()``), so
+    production behaviour is unchanged; only a caller that never installed
+    the guard it is using sees a different (correct) target now.
     """
     try:
-        target_fd = sys.stderr.fileno()
+        target_fd = stream.fileno()
         devnull = os.open(os.devnull, os.O_WRONLY)
         try:
             os.dup2(devnull, target_fd)
@@ -316,7 +361,7 @@ class _StderrGuard:
         try:
             return self._real.write(s)
         except OSError:
-            _silence_stderr()
+            _silence_stderr(self._real)
             return len(s)
 
     def flush(self):
@@ -325,7 +370,7 @@ class _StderrGuard:
         try:
             self._real.flush()
         except OSError:
-            _silence_stderr()
+            _silence_stderr(self._real)
 
     def fileno(self):
         return self._real.fileno()
