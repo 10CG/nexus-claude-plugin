@@ -155,6 +155,18 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     ABANDONED thread can still do after that structure's own last line
     runs, and the A10 write-back must not restate O1 as if it covered the
     abandoned path too.**
+  - **R5-F2 correction (hygiene round before merge, 2026-10-02):** the
+    paragraph above's claim that R4-C1 already moved "a confirmed
+    deletion" before its own blocking persist was true only ACROSS files
+    in the pending-delete loop (an EARLIER slug's count survived a LATER
+    slug's hang), not for a file's OWN confirmed deletion surviving ITS
+    OWN hung persist: ``_collect`` counted ``run["extra"]["deleted"]``
+    from ``_delete_file``'s return value, which only arrives AFTER that
+    same call's own blocking state-drop write -- exactly the window this
+    paragraph says was already closed. ``_delete_file`` now counts it
+    itself, the instant ``cleared`` is known, strictly before that
+    persist (see its own docstring) -- the claim above is accurate as
+    written only as of this fix.
   - **A9-20 (owner 2026-10-01): every ledger row carries
     ``extra["also_failed"]``** -- the other failure-class reasons this round
     produced besides the one ``worst_reason`` chose as the scalar
@@ -165,6 +177,21 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     will not be there to delete again, so if a same-run higher-priority
     failure (an ``http_error`` on a later file, say) wins the scalar slot,
     ``orphans_deleted`` would otherwise vanish from the record for good.
+  - **H1 (hygiene round before merge, 2026-10-02): ``_memory_state_path
+    (key)`` is resolved ONCE per round.** ``_collect`` resolves it a
+    single time and threads the result down to ``_sync_file`` /
+    ``_delete_file`` as ``state_path``, rather than each of them calling
+    ``_memory_state_path``/``_hook_state.state_root()`` again per file --
+    cheap hardening against re-reading ``NEXUS_HOOK_STATE_DIR`` mid-round
+    (this module's own test suite found a worker thread abandoned past
+    its OWN test's work budget, then resolving a state path a second
+    time after that test's ``tearDown`` had already restored HOME /
+    NEXUS_HOOK_STATE_DIR, and landing a stray state file + lock in the
+    developer's real ``~/.nexus``). The real fix for that incident is on
+    the TEST side (``_hang_point`` / ``_WriteCase._join_hung_worker`` in
+    ``test_memory_sync.py``: no thread may outlive the test that started
+    it, full stop) -- this module-side change is the belt the task also
+    asked for, alongside that buckle.
   - **Frontmatter: two structures, both accepted** (flat top-level keys, or
     one level of indentation under a top-level ``metadata:`` block -- real
     Claude Code memory files on this machine split roughly 42:60 between
@@ -958,10 +985,30 @@ def _fold_persist_reasons(reasons, persist_reasons, run=None):
     pending-delete bookkeeping, while (correctly, per owner ruling item 4 --
     a repaired file whose write still landed is not a failure) this
     round's own ``reason``/``ok`` stay clean. This is visibility only: it
-    does not become a failure reason, and it does not undo the rebuild."""
+    does not become a failure reason, and it does not undo the rebuild.
+
+    R5-F1 (hygiene round before merge, 2026-10-02): ``"unknown"`` in
+    ``persist_reasons`` does NOT by itself mean a rebuild was written --
+    ``_hook_state._update_state_file`` also returns it (ALONGSIDE
+    ``"state_write_failed"``) for two shapes where nothing new ever
+    reached disk: a REFUSED write (R2-C06's own ``safe_to_rebuild=False``,
+    a transient, non-corruption read failure such as EIO/ESTALE, never
+    attempted at all) and a write that itself FAILED after a self-heal
+    read (``_atomic_write`` raising, caught by this same function's outer
+    ``except OSError``) -- both leave the file exactly as it was, which is
+    not what "rebuilt" means. Requiring ``"state_write_failed"`` to be
+    ABSENT excludes both: the one shape that genuinely replaces the file's
+    content (a self-heal read whose own write then lands) never sets
+    ``"state_write_failed"`` in the first place, so this adds no new way
+    to miss a real rebuild."""
     if "state_write_failed" in persist_reasons:
         reasons.append("state_write_failed")
-    if run is not None and run.get("state_read_clean_at_start") and "unknown" in persist_reasons:
+    if (
+        run is not None
+        and run.get("state_read_clean_at_start")
+        and "unknown" in persist_reasons
+        and "state_write_failed" not in persist_reasons
+    ):
         run["extra"]["state_rebuilt"] = run["extra"].get("state_rebuilt", 0) + 1
 
 
@@ -1089,6 +1136,23 @@ def _tally_result(run, slug, reasons, outcome):
     received, which a dedup DELETE or an unrelated lookup GET can leave
     stale once the call that actually decided the outcome gets no response
     at all; see ``_ingest_client.Outcome.decided_status``'s own docstring).
+
+    R5-F4 (hygiene round before merge, 2026-10-02): ``status`` is NEVER
+    attached when ``dedup_merged`` is this entry's own ``reason`` -- the
+    shape R4-C4 above calls "of course still reported" when it is the
+    ONLY failure-class reason in the outcome. ``decided_status`` always
+    names the WRITE call (the POST/PATCH that follows a dedup, or the
+    lookup that preceded it); ``dedup_merged``'s own call is the dedup
+    DELETE, which this field never tracks. Attaching the write's status
+    next to ``reason: "dedup_merged"`` is the exact cross-call splice
+    R4-C4 removed for the "co-occurring with ANOTHER failure" shape ({
+    "reason": "dedup_merged", "status": 422} reading as if 422 explained
+    the dedup) -- it does not stop being a splice just because the write
+    happened to succeed (the MOST COMMON dedup shape: a duplicate pair
+    merges and the following PATCH/POST returns 200/201 normally). Every
+    OTHER ``failed[]`` entry is unaffected: this only ever removes
+    ``status`` from the one reason whose own call it was never describing
+    in the first place.
     """
     if outcome is not None:
         if outcome.redacted:
@@ -1106,7 +1170,7 @@ def _tally_result(run, slug, reasons, outcome):
         return
     entry = {"slug": slug, "reason": failure}
     if outcome is not None:
-        if outcome.decided_status is not None:
+        if failure != "dedup_merged" and outcome.decided_status is not None:
             entry["status"] = outcome.decided_status
         if outcome.detail:
             entry["detail"] = str(outcome.detail)[:200]
@@ -1135,10 +1199,15 @@ def _advance_cursor_only(state_path, next_cursor):
     return persist_reasons
 
 
-def _sync_file(client, key, project_name, slug, path, fingerprint, run, *, next_cursor=None):
+def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_path, *, next_cursor=None):
     """Attempt to sync one memory file as a ``layer=fact`` row. Returns
     ``(reasons, aborts, calls)``. Tallies into ``run["extra"]`` as it goes
     (K08) -- see ``_tally_result``.
+
+    ``state_path`` (H1 hygiene round, 2026-10-02): the caller's own,
+    already-resolved ``_memory_state_path(key)`` -- see ``_delete_file``'s
+    own docstring for why this is now resolved once, by ``_collect``, and
+    passed down rather than re-resolved by every file this round touches.
 
     On a non-aborting, COMPLETED write (created / updated / unchanged /
     stale_local) this ALSO persists the file's own state entry immediately
@@ -1185,7 +1254,6 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, *, next_
     for the same "what state records must describe the bytes actually
     sent" reason.
     """
-    state_path = _memory_state_path(key)
     try:
         with open(path, "rb") as fh:
             st = os.fstat(fh.fileno())
@@ -1277,10 +1345,19 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, *, next_
     return reasons, False, outcome.calls
 
 
-def _delete_file(client, key, slug, run):
+def _delete_file(client, key, slug, run, state_path):
     """Attempt to delete the server-side row(s) for a locally-vanished
     file. Returns ``(reasons, aborts, calls, cleared)``. Tallies into
     ``run["extra"]`` as it goes (K08) -- see ``_tally_result``.
+
+    ``state_path`` (H1 hygiene round, 2026-10-02): the caller's own,
+    already-resolved ``_memory_state_path(key)`` -- resolved ONCE per run
+    rather than this function (and ``_sync_file``) each separately calling
+    ``_memory_state_path``/``state_root()`` again, which re-reads
+    ``NEXUS_HOOK_STATE_DIR`` from the environment every time. Cheap
+    hardening, not a behaviour change under normal operation (``key`` and
+    the environment do not change mid-round) -- see the module docstring's
+    H1 paragraph for the incident this closes off.
 
     On confirmed deletion (or an honest "nothing_to_do" -- the row was
     already gone) this ALSO clears the file's local state entry; on any
@@ -1326,6 +1403,23 @@ def _delete_file(client, key, slug, run):
     own blocking persist call, not after -- the same reordering
     ``_sync_file`` makes and for the same reason (an abandoned thread stuck
     in that persist must not lose this file's own failure tally).
+
+    R5-F2 (hygiene round before merge, 2026-10-02): ``run["extra"]
+    ["deleted"]`` -- the confirmed-deletion count the module docstring's
+    R4-C1 paragraph names alongside ``dedup_merged`` and a dirty-scan
+    error as a one-time fact moved before the blocking persist -- used to
+    be counted by the CALLER, ``_collect``, from this function's own
+    ``cleared`` return value, which only arrives once this call returns.
+    That is AFTER this exact call's own blocking persist below (the one
+    the ``if cleared:`` branch makes), not before it: a thread abandoned
+    stuck inside THAT persist never returns here at all, so THIS file's
+    own already-confirmed deletion was lost, even though an EARLIER
+    slug's (counted by that same caller, once ITS OWN call already
+    returned) was not. Counting it here instead, the instant ``cleared``
+    is known -- mirroring ``_tally_result``'s own placement below -- closes
+    that gap: it is now written into ``run`` before EITHER this file's own
+    tally or its own persist call, so no shape of abandonment on THIS
+    file can lose it.
     """
     outcome = client.delete("fact", f"{key}/{slug}")
     if outcome.aborts_round:
@@ -1336,10 +1430,15 @@ def _delete_file(client, key, slug, run):
     cleared = "nothing_to_do" in outcome.reasons or (
         outcome.found > 0 and outcome.deleted == outcome.found and not page_full
     )
+    if cleared:
+        # R5-F2: see this function's own docstring -- written into `run`
+        # strictly before `_tally_result` AND the blocking persist below,
+        # not after this function returns to its caller.
+        run["extra"]["deleted"] = run["extra"].get("deleted", 0) + 1
     _tally_result(run, slug, reasons, outcome)
     if cleared:
         _, persist_reasons = _hook_state.update_state_at(
-            _memory_state_path(key), lambda s, slug=slug: _drop_file_entry(s, slug)
+            state_path, lambda s, slug=slug: _drop_file_entry(s, slug)
         )
         _fold_persist_reasons(reasons, persist_reasons, run)
     return reasons, False, outcome.calls, cleared
@@ -1859,21 +1958,16 @@ def _collect(run):
                 reasons.append("budget_exhausted")
                 aborted = True
                 break
-            r, ab, c, cleared = _delete_file(client, key, slug, run)
+            # R5-F2: `_delete_file` itself counts `run["extra"]["deleted"]`
+            # now, the instant ITS OWN `cleared` is known -- strictly
+            # before its own blocking state-drop persist, not after this
+            # call returns (that return is already AFTER that persist, so
+            # a thread stuck inside it never reached this line at all --
+            # see `_delete_file`'s own docstring).
+            r, ab, c, _cleared = _delete_file(client, key, slug, run, state_path)
             reasons.extend(r)
             run["calls"] += c
             budget -= 1
-            if cleared:
-                # R4-C1: written into `run` the INSTANT this deletion is
-                # confirmed -- mirroring `_reconcile_orphans`'s own R2-C07
-                # pattern for `orphans_deleted` -- not accumulated in a
-                # local counter only flushed once this WHOLE loop finishes.
-                # A worker thread abandoned mid-loop (stuck in a LATER
-                # slug's own state-drop persist) used to lose every EARLIER
-                # slug's already-confirmed deletion too, because the local
-                # counter never reached the line that copies it into
-                # `run["extra"]`.
-                run["extra"]["deleted"] = run["extra"].get("deleted", 0) + 1
             if ab:
                 aborted = True
 
@@ -2013,7 +2107,9 @@ def _collect(run):
                 reasons.append("budget_exhausted")
                 aborted = True
                 break
-            r, ab, c = _sync_file(client, key, project_name, slug, local_files[slug], fingerprint, run)
+            r, ab, c = _sync_file(
+                client, key, project_name, slug, local_files[slug], fingerprint, run, state_path,
+            )
             reasons.extend(r)
             run["calls"] += c
             budget -= 1
@@ -2043,7 +2139,7 @@ def _collect(run):
                     aborted = True
                     break
                 r, ab, c = _sync_file(
-                    client, key, project_name, slug, local_files[slug], fingerprint, run,
+                    client, key, project_name, slug, local_files[slug], fingerprint, run, state_path,
                     next_cursor=i,
                 )
                 reasons.extend(r)

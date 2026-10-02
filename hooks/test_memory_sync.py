@@ -57,6 +57,54 @@ _HOOK_SCRIPT = os.path.join(_HOOKS_DIR, "memory_sync.py")
 _PROXY_VARS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
 _NO_PROXY = {"no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"}
 
+# H1 (hermeticity incident, 2026-10-02): captured at IMPORT time, before
+# setUpModule below ever patches HOME -- this is the developer's own real
+# home, never the throwaway one `root`/`home` (below) point every hook at
+# for the rest of this module's run.
+_REAL_HOME = os.path.expanduser("~")
+_REAL_NEXUS_DIR = os.path.join(_REAL_HOME, ".nexus")
+
+
+def _snapshot_real_nexus_dir():
+    """``None`` when the real ``~/.nexus`` does not exist (the common case
+    on a throwaway box); otherwise its full recursive listing, as paths
+    relative to it, sorted. Read-only: this must never CREATE the
+    directory just to check it, or the check would produce the exact
+    leak it exists to catch."""
+    if not os.path.isdir(_REAL_NEXUS_DIR):
+        return None
+    found = []
+    for base, _dirs, files in os.walk(_REAL_NEXUS_DIR):
+        for name in files:
+            found.append(os.path.relpath(os.path.join(base, name), _REAL_NEXUS_DIR))
+    return sorted(found)
+
+
+def _assert_real_nexus_dir_untouched(before):
+    """H1: every hook test in this module runs under a throwaway HOME (see
+    setUpModule) specifically so none of them ever needs to touch the
+    developer's real ``~/.nexus`` -- but a worker thread abandoned past its
+    own test's work budget (timeout) keeps running, unobserved, after
+    tearDown restores the real HOME / NEXUS_HOOK_STATE_DIR (or deletes the
+    fake one): if that thread is still resolving `_hook_state.state_root()`
+    when it finally gets to the write it was stuck in, it resolves into
+    whatever those now point at, for real. Observed once in exactly this
+    form: a state file AND its `.lock` landed in the developer's real
+    `~/.nexus/hooks/memory-sync/`, created by a test whose OWN memory
+    directory lived under `/tmp`. The actual fix is making sure no thread
+    outlives its own test (see `_hang_point` / `_join_hung_worker` below);
+    this is the backstop that would have caught it regardless -- a STRICT
+    equality check, not merely "still empty", because the real ~/.nexus may
+    legitimately pre-exist on a developer's machine and this module must
+    leave it exactly as found, whichever way that cuts."""
+    after = _snapshot_real_nexus_dir()
+    if after != before:
+        raise AssertionError(
+            "a test wrote under the REAL ~/.nexus (not the fake, per-module "
+            f"HOME this module otherwise points every hook at): before={before!r} "
+            f"after={after!r}"
+        )
+
 
 def _assert_home_untouched(home):
     leaked = sorted(os.listdir(home))
@@ -81,6 +129,7 @@ def _assert_stderr_not_left_wrapped():
 
 
 def setUpModule():
+    real_nexus_before = _snapshot_real_nexus_dir()  # H1: before any patch touches HOME
     root = tempfile.mkdtemp(prefix="nexus-hooktest-")
     unittest.addModuleCleanup(shutil.rmtree, root, ignore_errors=True)
     home = os.path.join(root, "home")
@@ -97,7 +146,12 @@ def setUpModule():
     # actionable of the two -- is the one that survives if both ever fail on
     # the same run.
     unittest.addModuleCleanup(_assert_stderr_not_left_wrapped)
-    unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs first
+    unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs second
+    # H1: registered LAST, so it runs FIRST of all three and is the one that
+    # survives if more than one cleanup fails on the same run -- writing
+    # into the developer's REAL home is the most severe of the three shapes
+    # this module guards against.
+    unittest.addModuleCleanup(_assert_real_nexus_dir_untouched, real_nexus_before)
 
 
 def _load_module(path, name):
@@ -555,6 +609,49 @@ class TestMetadataBuilding(unittest.TestCase):
 # End-to-end against a real loopback backend
 # ════════════════════════════════════════════════════════════════════════
 
+class _HungCallReleased(Exception):
+    """Raised by a test's own hang wrapper once ``_hang_point``'s event is
+    released (see ``_WriteCase._join_hung_worker``): lets the abandoned
+    worker thread unwind immediately via ``_hook_runner.run_with_deadline``'s
+    own ``work()`` try/except, instead of carrying out whatever real,
+    possibly side-effecting call (a network request this test's scripted
+    backend never queued a reply for, a write into a temp directory the
+    test is about to remove) it was stuck in when the work budget expired.
+    These tests only need the thread to have EXISTED long enough to BE
+    abandoned -- the ledger row is already written and read by the time
+    release() is called -- never what it would go on to do afterward."""
+
+
+def _hang_point(safety_net_seconds=10.0):
+    """A controllable stand-in for the fixed ``time.sleep(2.0)`` this
+    module's worker-thread-abandonment tests used to simulate a call stuck
+    past the work budget (a slow disk, a contended lock, a pathological NFS
+    stall). Returns ``(wait, release)``: a test's own mock wrapper calls
+    ``wait()`` at the point it wants to hang instead of sleeping, and the
+    test itself calls ``release()`` (via ``_join_hung_worker`` below) once
+    its own ledger-row assertions are done.
+
+    H1 (hermeticity incident, 2026-10-02): a thread left running past its
+    own test resolves HOME / NEXUS_HOOK_STATE_DIR / a temp directory a
+    SECOND time once the test's tearDown has restored or removed them, and
+    can write into whichever real path that now is -- observed once as a
+    stray state file + lock under the developer's actual ``~/.nexus``. The
+    fix is not relying on an UN-releasable, fixed-duration sleep to
+    reproduce the shape and then simply outliving it; it is controlling
+    exactly when the stuck call unblocks and refusing to return before it
+    actually has (see ``_join_hung_worker``). The safety-net timeout here
+    (far past every work budget these tests shorten to well under 1s) is
+    insurance against a test failing before it reaches its own release()
+    call, not a normal path -- every real test releases explicitly."""
+    event = threading.Event()
+
+    def wait():
+        event.wait(safety_net_seconds)
+        raise _HungCallReleased
+
+    return wait, event.set
+
+
 class _WriteCase(unittest.TestCase):
     """A throwaway project + a scripted loopback backend, driving the hook
     through its real IngestClient -- nothing about _ingest_client itself is
@@ -606,6 +703,22 @@ class _WriteCase(unittest.TestCase):
 
     def _ext(self, slug):
         return f"{self.key}/{slug}"
+
+    def _join_hung_worker(self, release, timeout=5.0):
+        """Releases a thread parked in ``_hang_point``'s ``wait`` and
+        BLOCKS until it has actually finished, before returning -- so it
+        never outlives THIS test method into tearDown (H1): a thread still
+        running when tearDown restores HOME / NEXUS_HOOK_STATE_DIR or
+        removes ``self.tmp`` can resolve either one again, for real,
+        mid-write. Always call this from a ``finally``, so a failing
+        assertion still reaps the thread rather than leaving it to be
+        joined by nothing."""
+        release()
+        name = f"{_MOD.HOOK}-work"
+        for t in threading.enumerate():
+            if t.name == name and t is not threading.current_thread():
+                t.join(timeout)
+                self.assertFalse(t.is_alive(), f"{name} outlived its own test (H1)")
 
 
 class TestSingleFileSync(_WriteCase):
@@ -1861,16 +1974,18 @@ class TestK02RoundFactsSurviveTheRecord(_WriteCase):
         non-network call that blocks past the work budget, same shape as a
         pathological filesystem stall (NFS)."""
         self._write("f1")
-        real_list = _MOD._list_memory_files
+        wait, release = _hang_point()
 
         def slow_list(memory_dir):
-            time.sleep(2.0)
-            return real_list(memory_dir)
+            wait()
 
-        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
-                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
-                mock.patch.object(_MOD, "_list_memory_files", side_effect=slow_list):
-            self._run()
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "_list_memory_files", side_effect=slow_list):
+                self._run()
+        finally:
+            self._join_hung_worker(release)
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "timeout")
         self.assertIn("also_failed", entry)
@@ -2012,21 +2127,25 @@ class TestR2C07OrphanDeletionCountSurvivesAbandonment(_WriteCase):
         self.backend.reply(200, _page(row_a)).reply(204, None)  # a: deleted cleanly
 
         real_delete = _ingest_client.IngestClient.delete
+        wait, release = _hang_point()
 
         def hanging_delete(self_client, layer, external_id):
             if external_id == self._ext("b"):
-                time.sleep(2.0)  # exceeds the shortened work budget below
+                wait()
             return real_delete(self_client, layer, external_id)
 
         # _MIN_REMAINING_SECONDS (3.0s) must also shrink: otherwise the
         # per-item budget check trips on the very FIRST orphan (there is
         # no scenario where a work budget is both > 3.0s, so the check
         # passes, and < 2.0s, so the hang still exceeds it).
-        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.5), \
-                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
-                mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
-                mock.patch.object(_ingest_client.IngestClient, "delete", hanging_delete):
-            self._run()
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.5), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                    mock.patch.object(_ingest_client.IngestClient, "delete", hanging_delete):
+                self._run()
+        finally:
+            self._join_hung_worker(release)
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "timeout")
         self.assertEqual(entry.get("orphans_deleted"), 1, entry)
@@ -3607,16 +3726,18 @@ class TestR3T04FactsSurviveAbandonmentBeforeMerge(_WriteCase):
             os.path.join(self.tmp.name, "nonexistent-target.md"),
             os.path.join(self.memory_dir, "linked.md"),
         )
-        real_lock = _MOD._acquire_run_lock
+        wait, release = _hang_point()
 
         def slow_lock(path):
-            time.sleep(2.0)
-            return real_lock(path)
+            wait()
 
-        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
-                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
-                mock.patch.object(_MOD, "_acquire_run_lock", side_effect=slow_lock):
-            self._run()
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "_acquire_run_lock", side_effect=slow_lock):
+                self._run()
+        finally:
+            self._join_hung_worker(release)
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "timeout")
         self.assertIn("linked", entry.get("unresolved_files", []))
@@ -3633,17 +3754,21 @@ class TestR3T04FactsSurviveAbandonmentBeforeMerge(_WriteCase):
         self.backend.reply(200, _page(row_a)).reply(422, {"detail": "nope"})  # a: rejected, non-abort
 
         real_delete = _ingest_client.IngestClient.delete
+        wait, release = _hang_point()
 
         def hanging_delete(self_client, layer, external_id):
             if external_id == self._ext("b"):
-                time.sleep(2.0)  # exceeds the shortened work budget below
+                wait()
             return real_delete(self_client, layer, external_id)
 
-        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.5), \
-                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
-                mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
-                mock.patch.object(_ingest_client.IngestClient, "delete", hanging_delete):
-            self._run()
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.5), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                    mock.patch.object(_ingest_client.IngestClient, "delete", hanging_delete):
+                self._run()
+        finally:
+            self._join_hung_worker(release)
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "timeout")
         self.assertIn("rejected_422", entry.get("also_failed", []))
@@ -3723,6 +3848,35 @@ class TestR3T06FailedEntryAttribution(unittest.TestCase):
         self.assertEqual(failed[0]["reason"], "rejected_422")
         self.assertEqual(failed[0]["status"], 422)
 
+    def test_a_sole_dedup_merged_entry_does_not_carry_the_writes_own_status(self):
+        """R5-F4 (hygiene round before merge, 2026-10-02): dedup_merged
+        co-occurring with NO other failure -- the MOST COMMON dedup
+        shape: a duplicate pair merges and the subsequent write succeeds
+        normally -- is still reported in ``failed[]`` (R4-C4's own "of
+        course still reported" branch), but must not carry ``status``.
+        ``decided_status`` always names the WRITE call (here the PATCH's
+        own 200); ``dedup_merged``'s own call is the dedup DELETE (204),
+        which this field never tracks. A 200 next to ``reason:
+        "dedup_merged"`` is the exact cross-call splice R4-C4 removed for
+        the co-occurring-failure shape ({"reason": "dedup_merged",
+        "status": 422} reading as if 422 explained the dedup) -- it does
+        not stop being a splice just because the write happened to
+        succeed."""
+        outcome = _ingest_client.Outcome()
+        outcome.dedup_merged = 1
+        outcome.status = 204  # the dedup DELETE's own status
+        outcome.fail("dedup_merged")
+        outcome.status = 200  # the write call itself: PATCH -> 200, succeeds
+        outcome.write_status = 200
+        outcome.decided_status = 200  # the write call decided this outcome
+        outcome.action = "updated"
+        run = self._run_dict()
+        _MOD._tally_result(run, "dup", list(outcome.reasons), outcome)
+        failed = run["extra"]["failed"]
+        self.assertEqual(len(failed), 1, failed)
+        self.assertEqual(failed[0]["reason"], "dedup_merged")
+        self.assertNotIn("status", failed[0])
+
 
 class TestR3T02PersistentStateReadFailureSelfHealsEndToEnd(_WriteCase):
     """R3-T02 (post_implementation R3), integration-level confirmation of
@@ -3780,10 +3934,13 @@ class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
     (``dedup_merged``: two rows already merged into one, server-side) or
     an already-seen dirty-scan error vanished from the record for good,
     because the call that would have recorded it simply never got to run.
-    These three tests reproduce that shape directly: a hang is injected
-    into the SPECIFIC call known to block, the work budget is shortened so
-    the thread is genuinely abandoned (not merely slow), and the ledger
-    row is read immediately afterward -- the fact must already be there."""
+    These tests reproduce that shape directly: a hang is injected into
+    the SPECIFIC call known to block, the work budget is shortened so the
+    thread is genuinely abandoned (not merely slow), and the ledger row is
+    read immediately afterward -- the fact must already be there. Every
+    hang is released (and its thread joined) before the test returns, so
+    none of them outlives its own test into tearDown (H1) -- see
+    ``_hang_point`` / ``_WriteCase._join_hung_worker``."""
 
     def test_a_dedup_merged_fact_survives_a_hung_persist_right_after_it(self):
         """E3: "dup" just deduped (two rows -> one DELETE, dedup_merged=1)
@@ -3805,25 +3962,34 @@ class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
         self.backend.reply(200, dup_rows).reply(204, None).reply(*_updated("m1"))
 
         real_update = _hook_state.update_state_at
+        wait, release = _hang_point()
 
         def hanging_update(path, mutate):
             if "dup" in (mutate.__defaults__ or ()):
-                time.sleep(2.0)  # exceeds the shortened work budget below
+                wait()
             return real_update(path, mutate)
 
         # _MIN_REMAINING_SECONDS (3.0s) must also shrink: otherwise the
         # per-file budget check trips before "dup" is even attempted,
         # reporting budget_exhausted (a normal, non-abandoned return)
         # instead of ever reaching the hang (TestR2C07's own precedent).
-        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
-                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
-                mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
-                mock.patch.object(_hook_state, "update_state_at", side_effect=hanging_update):
-            self._run()
-        entry = self._last_entry()
-        self.assertEqual(entry["reason"], "timeout")
-        self.assertEqual(entry.get("dedup_merged"), 1, entry)
-        self.assertIn("dedup_merged", entry.get("also_failed", []))
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                    mock.patch.object(_hook_state, "update_state_at", side_effect=hanging_update):
+                self._run()
+            entry = self._last_entry()
+            self.assertEqual(entry["reason"], "timeout")
+            self.assertEqual(entry.get("dedup_merged"), 1, entry)
+            self.assertIn("dedup_merged", entry.get("also_failed", []))
+        finally:
+            self._join_hung_worker(release)
+        # R5-F5: joined above, strictly before this test's own tearDown
+        # (self.tmp.cleanup()) -- nothing should be able to write into, or
+        # recreate, the temp directory afterward.
+        self.tmp.cleanup()
+        self.assertFalse(os.path.exists(self.tmp.name))
 
     def test_a_dirty_scan_error_on_one_file_survives_a_later_files_hang(self):
         """E5: the dirty-scan loop hits a deterministic I/O error on "a"
@@ -3855,32 +4021,45 @@ class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
         with open(b_path, "a", encoding="utf-8") as fh:
             fh.write("\n\nmore")
         real_open = open
+        wait, release = _hang_point()
 
         def flaky_open(target, *a, **kw):
             if target == a_path:
                 raise OSError(5, "Input/output error")
             if target == b_path:
-                time.sleep(2.0)  # exceeds the shortened work budget below
+                wait()
             return real_open(target, *a, **kw)
 
-        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
-                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
-                mock.patch.object(_MOD, "open", create=True, side_effect=flaky_open):
-            self._run()
-        entry = self._last_entry()
-        self.assertEqual(entry["reason"], "timeout")
-        self.assertEqual(entry.get("dirty_scan_errors"), ["a"], entry)
-        self.assertIn("unknown", entry.get("also_failed", []))
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "open", create=True, side_effect=flaky_open):
+                self._run()
+            entry = self._last_entry()
+            self.assertEqual(entry["reason"], "timeout")
+            self.assertEqual(entry.get("dirty_scan_errors"), ["a"], entry)
+            self.assertIn("unknown", entry.get("also_failed", []))
+        finally:
+            self._join_hung_worker(release)
+        # R5-F5 (see the dedup_merged test above for the full rationale).
+        self.tmp.cleanup()
+        self.assertFalse(os.path.exists(self.tmp.name))
 
     def test_a_confirmed_deletion_survives_a_later_files_hung_state_drop(self):
         """Same shape, on the pending-delete side (R4-C1's own optional
         item 4): "gone-a" is confirmed deleted server-side AND its own
         state-drop persist completes normally; "gone-b" is ALSO confirmed
-        deleted server-side, but ITS OWN state-drop persist hangs. Before
-        this fix, `deleted_count` was a local counter in _collect, only
-        copied into run["extra"]["deleted"] once the WHOLE vanished-files
-        loop finished -- so "gone-a"'s already-confirmed deletion was lost
-        too, not just "gone-b"'s."""
+        deleted server-side, but ITS OWN state-drop persist hangs.
+
+        R5-F2 (hygiene round before merge, 2026-10-02): this used to pin
+        ``deleted == 1`` -- before that fix, ``_collect`` only counted a
+        slug once `_delete_file` ITSELF returned, which for "gone-b" is
+        AFTER its own hung persist, so "gone-b"'s own confirmed deletion
+        was lost (only "gone-a"'s, counted on an EARLIER, already-returned
+        iteration, survived). `_delete_file` now counts its own
+        confirmed deletion the instant `cleared` is known, strictly
+        before that same persist -- so BOTH survive, and the correct,
+        fixed count is 2."""
         kept_path = self._write("kept")
         a_path = self._write("gone-a")
         b_path = self._write("gone-b")
@@ -3902,20 +4081,95 @@ class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
         self.backend.reply(200, _page(_row(self._ext("gone-b")))).reply(204, None)
 
         real_update = _hook_state.update_state_at
+        wait, release = _hang_point()
 
         def hanging_update(path, mutate):
             if "gone-b" in (mutate.__defaults__ or ()):
-                time.sleep(2.0)  # exceeds the shortened work budget below
+                wait()
             return real_update(path, mutate)
 
-        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
-                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
-                mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
-                mock.patch.object(_hook_state, "update_state_at", side_effect=hanging_update):
-            self._run()
-        entry = self._last_entry()
-        self.assertEqual(entry["reason"], "timeout")
-        self.assertEqual(entry.get("deleted"), 1, entry)
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                    mock.patch.object(_hook_state, "update_state_at", side_effect=hanging_update):
+                self._run()
+            entry = self._last_entry()
+            self.assertEqual(entry["reason"], "timeout")
+            self.assertEqual(entry.get("deleted"), 2, entry)
+        finally:
+            self._join_hung_worker(release)
+        # R5-F5 (see the dedup_merged test above for the full rationale).
+        self.tmp.cleanup()
+        self.assertFalse(os.path.exists(self.tmp.name))
+
+    def test_a_dedup_merged_fact_excluded_by_r4c4_survives_its_own_hung_cursor_advance(self):
+        """R5-F3 (hygiene round before merge, 2026-10-02): "newdup" is a
+        BRAND NEW (cursor-walk) file with two pre-existing duplicate rows
+        server-side -- the dedup DELETEs the extra row (dedup_merged=1)
+        -- and the FOLLOWING PATCH is then rejected (422), a DIFFERENT
+        failure-class reason in the SAME outcome. R4-C4 (``_tally_
+        result``) correctly excludes ``dedup_merged`` from THIS file's
+        own ``failed[]`` entry when another failure co-occurs -- but the
+        422 means ``outcome.action`` is never set, so ``_sync_file``
+        falls to ``_advance_cursor_only``, whose own blocking persist
+        (the cursor advance) then hangs past the work budget. With
+        ``failed[]`` correctly naming "rejected_422" (never dedup_merged,
+        per R4-C4) and ``run["reasons"]`` never extended (the abandoned
+        ``_sync_file`` call never returns to do it), ``main()``'s own
+        ``extra.dedup_merged`` fallback is the ONLY remaining carrier for
+        this one-time fact -- no earlier test combines R4-C4's own
+        exclusion with the SAME file's own hang, so nothing previously
+        exercised that fallback as load-bearing (it could be deleted
+        outright and every OTHER existing test would still pass)."""
+        self._write("newdup")
+        dup_rows = _page(
+            _row(self._ext("newdup"), row_id="33333333-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000001Z"),
+            _row(self._ext("newdup"), row_id="44444444-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000002Z"),
+        )
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": {}}
+        )
+        self.backend.reply(200, dup_rows).reply(204, None).reply(422, {"detail": "nope"})
+
+        real_update = _hook_state.update_state_at
+        wait, release = _hang_point()
+
+        def hanging_update(path, mutate):
+            # The only update_state_at call this round makes (reconciled
+            # is already settled, there are no vanished files, and this
+            # is the one file in the round) -- see the class docstring's
+            # own precedent for keying a hang off `mutate.__defaults__`;
+            # here it is unconditional because there is nothing else to
+            # disambiguate from.
+            wait()
+            return real_update(path, mutate)  # unreachable: wait() always raises once released
+
+        try:
+            with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                    mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                    mock.patch.object(_hook_state, "update_state_at", side_effect=hanging_update):
+                self._run()
+            entry = self._last_entry()
+            self.assertEqual(entry["reason"], "timeout")
+            self.assertEqual(entry.get("dedup_merged"), 1, entry)
+            failed = entry.get("failed") or []
+            self.assertTrue(
+                any(f.get("slug") == "newdup" and f.get("reason") == "rejected_422" for f in failed),
+                entry,
+            )
+            self.assertNotIn(
+                "dedup_merged", [f.get("reason") for f in failed],
+                "R4-C4 must still exclude dedup_merged from failed[] here",
+            )
+            self.assertIn("dedup_merged", entry.get("also_failed", []))
+        finally:
+            self._join_hung_worker(release)
+        self.tmp.cleanup()
+        self.assertFalse(os.path.exists(self.tmp.name))
 
 
 class TestR4C1ProductionTailRealKill(unittest.TestCase):
@@ -4132,6 +4386,39 @@ class TestR4C3MidRoundStateRebuildIsVisible(_WriteCase):
             self._run()
         entry = self._last_entry()
         self.assertNotIn("state_rebuilt", entry)
+
+    def test_unknown_alongside_a_write_failure_is_not_counted_as_a_rebuild(self):
+        """R5-F1 (hygiene round before merge, 2026-10-02): ``state_rebuilt``
+        used to fire on bare ``"unknown"`` in ``persist_reasons`` alone --
+        but ``_update_state_file`` also returns ``"unknown"`` (paired with
+        ``"state_write_failed"``, never alone) for two shapes where
+        nothing NEW ever reached disk: a REFUSED write (R2-C06's own
+        ``safe_to_rebuild=False``, a transient, non-corruption read
+        failure such as EIO -- the write is never even attempted) and a
+        write that itself FAILED after a self-heal read (``_atomic_write``
+        raising, caught by ``_update_state_file``'s own outer ``except
+        OSError``). Both leave the exact same ``persist_reasons`` shape
+        (``["unknown", "state_write_failed"]``) -- this function cannot,
+        and need not, tell the two apart; it only needs to not call
+        EITHER one a rebuild, since neither one is (the file is left
+        exactly as it was either way)."""
+        run = {"extra": {}, "state_read_clean_at_start": True}
+        reasons = []
+        _MOD._fold_persist_reasons(reasons, ["unknown", "state_write_failed"], run)
+        self.assertNotIn("state_rebuilt", run["extra"])
+        self.assertIn("state_write_failed", reasons)
+
+    def test_a_genuine_self_heal_write_is_still_counted_as_a_rebuild(self):
+        """Regression guard for the fix above, same function: the
+        ALREADY-accepted shape (R3-T02 / R4-C3) -- a self-heal read whose
+        own write then actually lands -- comes back as bare
+        ``["unknown"]``, with no ``"state_write_failed"`` alongside it.
+        The fix narrows WHEN ``state_rebuilt`` fires; it must not stop
+        firing for the real thing."""
+        run = {"extra": {}, "state_read_clean_at_start": True}
+        reasons = []
+        _MOD._fold_persist_reasons(reasons, ["unknown"], run)
+        self.assertEqual(run["extra"].get("state_rebuilt"), 1)
 
 
 class TestR4C4DecidedStatusAttribution(_WriteCase):
