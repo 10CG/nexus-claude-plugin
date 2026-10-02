@@ -93,6 +93,29 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     variable only transferred at the very end -- so an exception partway
     through a round does not lose what already happened before it
     (post_implementation R1 finding K02, unchanged by R2).
+  - **Deviation registration (A9-7, orchestrator ruling O1, 2026-10-02):**
+    the paragraph above is a DELIBERATE departure from the literal
+    TASK-006 notes wording for A9-7 ("只在真失败时补一行 state_write_failed,
+    补写行带上主行 reason 与主行全部 also_failed") -- that sentence describes
+    TWO ledger rows per run: this round's own row, plus a SEPARATE
+    follow-up row appended only on a genuine persist failure, carrying the
+    main row's reason/also_failed forward. R2-C03/C05 above removed that
+    follow-up row entirely, along with the round-end persist it existed to
+    cover, and R2's own commit message did not list the removal in its
+    deviation registry even though it is one (gate finding, 2026-10-02,
+    post_implementation R2 self-audit: the engineering argument was sound
+    but the departure from a binding ruling's literal text was never
+    flagged for owner sign-off the way the team's own process requires).
+    The orchestrator ruling accepts R2's single-row shape for THIS hook
+    specifically: A9-7's actual purpose -- the round's own row is never
+    lost, a reason is never buried, a genuine persist failure is never
+    reported as a clean run -- is met MORE strongly by folding than by a
+    follow-up row, because nothing in this file is EVER persisted after
+    the row in the first place (everything moves inside ``_collect``,
+    strictly before ``_record`` runs -- see above). Do NOT restore a
+    two-row shape and do NOT move any persistence after the row without a
+    NEW owner ruling superseding O1; this paragraph is the pending
+    write-back to the parent repo's proposal.md as Amendment A10.**
   - **A9-20 (owner 2026-10-01): every ledger row carries
     ``extra["also_failed"]``** -- the other failure-class reasons this round
     produced besides the one ``worst_reason`` chose as the scalar

@@ -861,6 +861,39 @@ class TestBatchingAndCursor(_WriteCase):
         self.assertEqual(self._last_entry()["reason"], "http_error")
         self.assertEqual(sorted(self._state().get("files", {})), ["file0", "file1"])
 
+    def test_a_stalled_third_file_stops_the_round_via_a_real_socket_timeout(self):
+        """Same 3-of-5-files shape as the 403 / 429 / generic-599 siblings
+        above, but for ``reason == "timeout"`` specifically (gate finding,
+        2026-10-02: detailed-tasks.yaml's TASK-006 verification bullet 1
+        names all three round-abort reasons -- 403 / 429 / timeout -- for
+        this exact fixture shape, and only the first two had a literal
+        sibling; the two existing "timeout" tests, TestK02 and R2C07,
+        exercise whole-round WORKER-THREAD abandonment via a slow LOCAL
+        call, not a per-file network timeout mid-batch, and say in their
+        own docstrings why: every network call is itself deadline-aware,
+        so a slow SERVER can never produce a worker-thread-abandonment
+        timeout in production). This is a REAL per-call socket timeout
+        instead, using the exact client-timeout/server-delay pair already
+        proven in test_ingest_client.py (``test_a_stalled_reply_is_
+        timeout`` / ``test_a_dripping_body_is_cut_at_the_deadline``, both
+        ``timeout=0.2`` against roughly a one-second server stall) rather
+        than inventing new, untested timing constants here. file2's own
+        lookup GET is the request that stalls -- ``upsert`` never reaches
+        the POST once its own lookup has already failed (``_ingest_
+        client.py``'s ``rows is None: return outcome``), so no third
+        scripted reply is needed for it."""
+        self._write_n(5)
+        self.backend.reply(*_empty_lookup())  # reconciliation
+        self.backend.reply(*_empty_lookup()).reply(*_created("m0"))
+        self.backend.reply(*_empty_lookup()).reply(*_created("m1"))
+        self.backend.reply(200, _page(), delay=1.0)  # file2's lookup stalls past the 0.2s client timeout
+        with mock.patch.object(_MOD, "_HTTP_TIMEOUT_SECONDS", 0.2):
+            self._run()
+        self.assertEqual(self._last_entry()["reason"], "timeout")
+        state = self._state()
+        self.assertEqual(sorted(state.get("files", {})), ["file0", "file1"])
+        self.assertEqual(state.get("cursor"), 2)  # resumes AT file2 next time
+
     def test_the_cursor_resumes_at_the_failed_file_next_round(self):
         self._write_n(5)
         self.backend.reply(*_empty_lookup())
