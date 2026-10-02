@@ -173,6 +173,15 @@ class Outcome:
         self.redacted = 0
         self.dedup_merged = 0
         self.deleted = 0
+        # How many rows `delete()`'s own lookup found on its ONE page (set
+        # only by `delete()`; `upsert()` never touches it). Lets a caller
+        # (memory-sync's own pending-delete bookkeeping, K20) tell "every
+        # row this call could see is now gone" apart from "some rows were
+        # deleted" -- `deleted > 0` alone also covers a PARTIAL success (one
+        # row of several non-abort-rejected) and a FULL page (more
+        # duplicates than `LOOKUP_LIMIT` holds), neither of which this
+        # client itself retries beyond the next run's own lookup.
+        self.found = 0
         self.status = None  # last HTTP status seen
         self.retry_after = None
         self.detail = None  # last error body / message, for stderr
@@ -628,6 +637,7 @@ class IngestClient:
         rows = self._lookup(outcome, layer, external_id)
         if rows is None:
             return outcome
+        outcome.found = len(rows)
         if not rows:
             outcome.reasons.append("nothing_to_do")
             return outcome

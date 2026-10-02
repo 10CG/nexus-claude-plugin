@@ -63,25 +63,35 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     used everywhere; this one, like session_capture.py, uses a bare
     ``print(..., file=sys.stderr)`` everywhere ELSE, relying on
     ``guard_stderr()`` once it is installed).
-  - **A9-7 (owner 2026-10-01): persistence happens entirely INSIDE
-    ``_collect``, strictly before ``_record`` ever runs -- there is
-    deliberately no handoff_sync-style "persist something once, after the
-    ledger row, and append a follow-up row if that persist fails" step
-    here.** Every per-file state update (a file's own ``synced_at`` / hash /
-    fingerprint, a vanished file's entry being dropped once its DELETE
-    confirms) is written via its own ``_hook_state.update_state_at`` call as
-    soon as that file's outcome is known, and the round's cursor /
-    reconciled flag are written by ONE more such call at the very end of
-    ``_collect`` -- all of it before ``_collect`` returns its reason string,
-    hence all of it before ``main()`` ever calls ``_record``. A genuine
-    failure from any of those writes (``state_write_failed``) is therefore
-    always still available to be folded into THIS round's accumulated
-    reasons and reported via the ONE ledger row ``_record`` writes, with
-    ``also_failed`` (A9-20) carrying anything ``worst_reason`` did not pick
-    as the scalar -- there is no later point in the run where a persist
-    could fail AFTER the row was already on disk, so the two-row shape
-    handoff_sync needed (for its ``container_id`` persist, which runs
-    inside ``_record``, after ``record_run``) does not apply here.
+  - **A9-7 (owner 2026-10-01, REVISED post_implementation R1): per-file
+    state is still written INSIDE ``_collect``, immediately, but the
+    round's own cursor/reconciled advance follows the SAME converged
+    handoff_sync shape every other hook's end-of-run persist uses.** Every
+    per-file state update (a file's own ``synced_at`` / hash / fingerprint,
+    a vanished file's entry being dropped once its DELETE confirms) is
+    still written via its own ``_hook_state.update_state_at`` call as soon
+    as that file's outcome is known, strictly before ``_record`` ever runs
+    -- unchanged. The round's cursor/reconciled flag, however, is persisted
+    by ``_record`` itself, AFTER ``record_run`` (not inside ``_collect``):
+    an EARLIER revision of this paragraph argued the two-row shape
+    handoff_sync needs for its own end-of-run persist "does not apply
+    here", on the premise that persistence inside ``_collect`` always
+    finishes before ``_record`` ever runs -- true, but it missed that an
+    UNCONDITIONAL ``update_state_at`` call for a round that touched NO
+    files at all could still take a contended lock and burn the ENTIRE
+    work budget on a write that would not have changed a single byte,
+    turning an otherwise clean, zero-call round into a reported ``timeout``
+    (post_implementation R1 finding K02). Moving it into ``_record``'s own
+    SEPARATE, shorter ledger budget, skipped outright when nothing actually
+    changed, fixes that; a genuine failure there can no longer be folded
+    into the row ``_record`` already wrote (that row is on disk by then),
+    so it is reported the same way handoff_sync's own container_id persist
+    is -- a follow-up ``state_write_failed`` row carrying this round's
+    `reason` and `also_failed`. Every FACT this round produces (reasons,
+    ``calls``, ``orphans_deleted``) is still written straight into ``run``
+    as it happens, not accumulated in a local variable only transferred at
+    the very end -- so an exception partway through a round does not lose
+    what already happened before it (also R1, same finding).
   - **A9-20 (owner 2026-10-01): every ledger row carries
     ``extra["also_failed"]``** -- the other failure-class reasons this round
     produced besides the one ``worst_reason`` chose as the scalar
@@ -132,6 +142,7 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     silently accepted as settled.
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -244,6 +255,7 @@ except Exception as exc:
 
 import _hook_state  # noqa: E402 - guaranteed importable: _ingest_client already imports it
 import _redact  # noqa: E402 - guaranteed importable: _ingest_client already imports it
+import fcntl  # noqa: E402 - guaranteed importable: _hook_state already imports it (K09 run lock)
 
 HOOK = "memory-sync"  # names the ledger file; must stay in session_inject._EXPECTED_LEDGERS
 
@@ -308,6 +320,31 @@ _RECONCILE_PAGE_LIMIT = 100
 _RECONCILE_MAX_PAGES = 1000
 _RECONCILE_MAX_BODY_BYTES = 2 * 1024 * 1024
 
+# K25 (post_implementation R1, NOT applied -- see not_fixed): a project
+# literally named "memory-sync" normalizes (_identity.normalize_slug) to a
+# project-slug directory that COLLIDES with this constant's own value, so
+# session_inject's ledger scan can read this hook's own per-memory-dir-key
+# state files as that project's unreadable ledgers (reproduced; see the R1
+# report). The cluster's own fix -- a leading "." no project slug can ever
+# produce -- is NOT applied here: the owner ruling's own corollary (X1,
+# item 2) and the unchanged-items list (item 7) both give this exact path
+# literally, `${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.json`,
+# and "do not change behaviour a binding ruling covers, except as the
+# ruling says" leaves no room to rename it unilaterally. Left as `HOOK`
+# (below) on purpose, matching the ruling's literal text; the collision
+# risk is real but reported to the owner (see owner_questions), not solved
+# here. K09's new run-lock file lives in the SAME directory for the same
+# reason -- no new namespace to litigate.
+_STATE_SUBDIR = HOOK
+
+# K24: bumped whenever _split_memory_frontmatter / _cap_body / _cap_for_wire
+# / _build_memory_metadata's own content/metadata ASSEMBLY rules change in a
+# way that would change what an already-synced file's row looks like on the
+# wire -- same reasoning as _redact.py's own fingerprint (A8-2), folded into
+# the SAME fingerprint so a rule change amortises back over every
+# already-synced file exactly once, not only when _redact.py itself changes.
+_ASSEMBLY_VERSION = 2
+
 
 # ── on-disk memory directory ─────────────────────────────────────────────
 
@@ -320,43 +357,106 @@ def _memory_dir(key):
 
 
 def _list_memory_files(memory_dir):
-    """``{slug: path}`` for every resolvable ``*.md`` file directly in
-    ``memory_dir`` (non-recursive), excluding the index (``MEMORY.md``,
-    case-insensitive) and anything that is not a regular file.
+    """``(files, indeterminate, reason)``.
 
-    Comes back ``{}`` when the directory does not exist -- the common case
-    for any project with no Claude Code memory yet, or none for THIS
-    container's config dir -- and that is not an error. Any entry whose own
-    stat fails (gone since ``listdir``, an ordinary race; a permission
-    problem) is simply left out of this round's candidates, same as a
-    vanished handoff candidate in handoff_sync.py's own ``_candidates``: a
-    file that disappeared a moment ago is not this hook's problem to
-    diagnose, and one that cannot be stat'd cannot be read either.
+    ``files`` is ``{slug: path}`` for every resolvable ``*.md`` file
+    directly in ``memory_dir`` (non-recursive), excluding the index
+    (``MEMORY.md``, case-insensitive) and anything that is not a regular
+    file (following one level of symlink). ``indeterminate`` is the set of
+    slugs whose own listing entry could NOT be conclusively resolved --
+    something is there, it just was not safely stat-able -- and must be
+    treated as "still present" everywhere a vanished-file or orphan
+    decision is made, never as deleted. ``reason`` is ``None`` unless the
+    directory itself could not be listed for anything other than "it does
+    not exist" (``ENOENT`` -- the common, unremarkable case for a project
+    with no Claude Code memory yet).
+
+    K01 (post_implementation R1): the previous version of this function
+    collapsed EVERY ``OSError`` from ``os.listdir`` -- ``EACCES``, ``EIO``,
+    ``ESTALE``, ``ENOTDIR`` included -- to the exact same ``{}`` as "this
+    directory genuinely does not exist", and a per-entry ``stat`` failure
+    was simply dropped from the result with no trace. The caller (
+    ``_collect``) computed its pending-DELETE set as "a slug state
+    remembers that is not a key of this return value" -- so "I could not
+    tell whether this project's memory directory is even the right one"
+    became indistinguishable from "every file in it was deleted", and a
+    transient directory-resolution failure (a misconfigured
+    ``CLAUDE_CONFIG_DIR``, an ``NFS`` hiccup, a permissions change) drove a
+    real, server-side soft-delete of every row this project had ever
+    synced -- repeating, and completing, on the very next round. ``reason``
+    and ``indeterminate`` exist so the caller can refuse to treat either
+    shape as "confirmed gone" (see the pending-delete computation in
+    ``_collect``).
+
+    A dangling or otherwise unresolvable symlink is ``indeterminate``, not
+    skipped outright the way a genuinely vanished (``ENOENT`` on
+    ``lstat``) entry is: the NAME is still there (``os.listdir`` saw it),
+    only its TARGET could not be confirmed -- the same "judged, not
+    knowable" split the A9-11/A9-19 handoff-sync lineage already applies to
+    its own candidate scan.
     """
     try:
         names = os.listdir(memory_dir)
-    except OSError:
-        return {}
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return {}, set(), None
+        return {}, set(), "unknown"
     out = {}
+    indeterminate = set()
     for name in names:
         if not name.lower().endswith(".md") or name.upper() == _MEMORY_INDEX_NAME:
             continue
+        slug = name[:-3]  # slug = filename without ".md" (C row)
         path = os.path.join(memory_dir, name)
         try:
-            is_file = stat.S_ISREG(os.stat(path).st_mode)
-        except OSError:
+            entry_stat = os.lstat(path)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                continue  # the NAME itself is gone: an ordinary listdir race
+            indeterminate.add(slug)
             continue
-        if is_file:
-            out[name[:-3]] = path  # slug = filename without ".md" (C row)
-    return out
+        if stat.S_ISLNK(entry_stat.st_mode):
+            try:
+                entry_stat = os.stat(path)  # follow the link once
+            except OSError:
+                # Dangling target, a loop (ELOOP), or unreadable: something
+                # is still THERE (the link itself exists) -- not knowable as
+                # "resolves to a regular file", but just as surely not
+                # knowable as "deleted" either.
+                indeterminate.add(slug)
+                continue
+        if stat.S_ISREG(entry_stat.st_mode):
+            out[slug] = path
+    return out, indeterminate, None
 
 
 # ── frontmatter (flat or nested `metadata:`, two structures) ────────────
 
 def _unquote(value):
+    """Strip one layer of quoting from a frontmatter scalar value.
+
+    K23: a double-quoted value is first tried as a JSON string literal
+    (``json.loads``), which -- unlike the previous plain ``value[1:-1]`` --
+    actually decodes YAML's double-quote escapes (``\\"``, ``\\\\``, ...;
+    YAML's double-quoted scalar escaping is a superset of JSON's own, and
+    every escape this corpus's real files use is the JSON subset). Falls
+    back to the old strip-only behaviour for anything that is not valid
+    JSON once quoted (YAML escapes JSON does not have, or simply malformed
+    input) rather than raising. A single-quoted value uses YAML's own
+    escape instead (a doubled quote is a literal one), which JSON has no
+    equivalent for.
+    """
     value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, str):
+            return decoded
         return value[1:-1]
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
     return value
 
 
@@ -367,6 +467,16 @@ def _split_memory_frontmatter(text):
     well-formed ``---``-delimited block at its very first line (tolerating a
     UTF-8 BOM) has no frontmatter at all: ``{}`` and the whole text as
     ``body``.
+
+    A document that DOES open with a ``---`` line but never closes it is a
+    DIFFERENT case (K07): ``frontmatter`` comes back ``None`` (never
+    ``{}``, which means "no block at all, the whole text is the body") so
+    the caller can tell "this file genuinely has no frontmatter" apart from
+    "this file's frontmatter is broken" -- the latter is a local
+    deterministic error (``file_unparsable``, C row) the caller must skip
+    and report, never silently upload with the open fence's own
+    ``name:``/``description:`` lines shipped as plain content and no
+    ``aria.description`` at all.
 
     Deliberately flat -- one level of quote-stripping, no YAML block
     scalars (``|`` / ``>``), no multi-document nesting beyond the single
@@ -392,8 +502,8 @@ def _split_memory_frontmatter(text):
         if lines[i].rstrip("\r") == "---":
             end = i
             break
-    if end is None:  # unterminated block: not a parseable frontmatter
-        return {}, text
+    if end is None:  # unterminated block: not a parseable frontmatter (K07)
+        return None, text
     frontmatter = {}
     i = 1
     while i < end:
@@ -452,6 +562,51 @@ def _cap_body(body, limit):
     return cut.rstrip() + _TRUNCATION_MARKER, True
 
 
+def _cap_for_wire(body, limit):
+    """``(content, truncated)``: ``body`` capped at ``limit`` characters,
+    re-cutting as many times as needed so the REDACTED text -- what
+    ``_ingest_client`` actually puts on the wire -- also fits ``limit``
+    (K06, mirrors ``handoff_sync._cap_for_wire``).
+
+    ``_cap_body`` alone is redaction-OBLIVIOUS (deliberately -- see its own
+    docstring): it cuts the RAW body to ``limit`` characters, but a
+    redaction MARKER can be LONGER than the secret it replaces
+    (``[redacted:url-userinfo]`` is 23 characters against a 4-character
+    minimum password), so content that lands at EXACTLY ``_CONTENT_CAP`` --
+    honouring ``_cap_body``'s own invariant -- can still exceed the backend's
+    own ``content`` ``max_length=10000`` by the time redaction has run,
+    which the backend answers with a permanent per-file 422 (``rejected_422``)
+    that a whole-file-hash dirty check can never clear on its own, because
+    the bytes on disk never change again.
+
+    Re-running the SAME redaction pass here (rather than predicting its
+    growth analytically) is the simplest thing that stays correct;
+    ``_ingest_client`` redacts this same text again on the way out, which is
+    idempotent (a redaction marker itself matches no rule). Bounded: each
+    iteration's cut is by at least the previous iteration's overflow, so
+    this converges in one or two passes for any realistic document; capped
+    at ``limit`` iterations as a hard ceiling against a pathological future
+    redaction rule that never converges. ``limit`` for each re-cut is
+    derived from ``len(content)`` itself, not from the original ``limit``
+    (the same R3-c02 lesson ``handoff_sync._cap_for_wire`` already carries):
+    computing it from the original would sometimes yield a limit LARGER
+    than the current content, reading as "already short enough" while the
+    REDACTED form still overflows.
+    """
+    content, truncated = _cap_body(body, limit)
+    for _ in range(limit):
+        redacted, _hits = _redact.redact_text(content)
+        overflow = len(redacted) - limit
+        if overflow <= 0:
+            return content, truncated
+        new_limit = len(content) - overflow
+        if new_limit <= 0:
+            return content, truncated  # nothing left to safely cut
+        content, cut_again = _cap_body(content, new_limit)
+        truncated = truncated or cut_again
+    return content, truncated
+
+
 # ── metadata / identity ───────────────────────────────────────────────────
 
 def _mtime_iso(stat_result):
@@ -476,17 +631,30 @@ def _whole_file_hash(path):
 
 
 def _current_fingerprint():
-    """sha256 of ``_redact.py``'s own source (Amendment A8-2). A mismatch
-    against a file's stored fingerprint marks it dirty regardless of its
-    content hash -- the bytes on disk have not changed, the rule that will
-    be applied to them has, and memory_sync's steady state (zero calls)
-    would otherwise never re-send a file whose stored row needs rewriting
-    under the new rule."""
+    """sha256 of ``_redact.py``'s own source, folded with ``_ASSEMBLY_
+    VERSION`` (Amendment A8-2, widened by K24). A mismatch against a file's
+    stored fingerprint marks it dirty regardless of its content hash -- the
+    bytes on disk have not changed, the RULE that will be applied to them
+    has, and memory_sync's steady state (zero calls) would otherwise never
+    re-send a file whose stored row needs rewriting under the new rule.
+
+    K24: the same amortise-over-every-synced-file reasoning applies equally
+    to a change in how THIS file assembles a row (``_split_memory_
+    frontmatter``, ``_cap_body``/``_cap_for_wire``, ``_build_memory_
+    metadata``) -- a file's own bytes never change just because this
+    module's parsing/assembly rules did, so a fingerprint scoped to
+    ``_redact.py`` alone would never dirty it either. One fingerprint, not
+    two independent ones: the two numbers do not need to vary separately,
+    and a single stored value keeps the existing state schema and every
+    comparison site (``_dirty_check``) unchanged.
+    """
     try:
         with open(_redact.__file__, "rb") as fh:
-            return "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+            digest = hashlib.sha256(fh.read())
     except OSError:
         return "unknown"
+    digest.update(f"assembly:{_ASSEMBLY_VERSION}".encode("ascii"))
+    return "sha256:" + digest.hexdigest()
 
 
 def _build_memory_metadata(key, project_name, slug, frontmatter, modified):
@@ -518,22 +686,117 @@ def _memory_state_path(key):
     on-disk memory directory, so two working directories that happen to
     share a basename cannot read and write the same state file -- see
     ``_identity.memory_dir_key``'s own docstring for the mass-deletion
-    shape that keying-by-basename would otherwise reproduce."""
-    return _hook_state.state_path_at(os.path.join(HOOK, f"{key}.json"))
+    shape that keying-by-basename would otherwise reproduce. The directory
+    is ``_STATE_SUBDIR`` (``== HOOK``, i.e. the literal ``"memory-sync"``
+    the owner ruling's own corollary gives this path as) -- see that
+    constant's own docstring (K25) for a real, REPORTED-not-fixed
+    collision this literal name has with the ledger directory namespace
+    for a project whose own slug happens to be "memory-sync"."""
+    return _hook_state.state_path_at(os.path.join(_STATE_SUBDIR, f"{key}.json"))
+
+
+def _memory_run_lock_path(key):
+    """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.run.lock`` --
+    a per-memory-dir-key, whole-ROUND mutual-exclusion lock (K09): two
+    SessionEnd runs for the SAME memory directory (two sessions in the same
+    project ending within the same short window) each start from the same
+    unlocked state snapshot and would otherwise both select, and both POST,
+    the same brand-new file -- this client's own idempotency protocol only
+    de-duplicates on the FOLLOWING run's lookup, so the steady state
+    (zero-call once everything is synced, orphan reconciliation retired
+    after one state lifetime) never naturally re-visits the pair to merge
+    it. Deliberately a SEPARATE file from ``_memory_state_path``'s own
+    per-write ``.lock`` (``_hook_state._locked`` already takes that one for
+    each individual read-modify-write): this one is held for the WHOLE
+    network-making portion of one round, which ``_locked`` is not shaped
+    for and must not be repurposed to do."""
+    return _hook_state.state_path_at(os.path.join(_STATE_SUBDIR, f"{key}.run.lock"))
+
+
+_NO_RUN_LOCK = -1  # sentinel: the lock could not even be ATTEMPTED; proceed unlocked
+
+
+def _acquire_run_lock(path):
+    """Non-blocking per-round lock (K09). Returns an fd to release later,
+    ``None`` when a PEER run already holds it (the caller must do no
+    network work this round), or ``_NO_RUN_LOCK`` when the lock could not
+    even be attempted (the state directory is not writable, the filesystem
+    does not support ``flock``) -- degrading to "proceed WITHOUT a lock"
+    rather than refusing to ever work again, because that failure mode is
+    not the one this lock exists to guard against and treating it as
+    "contended" would silently stop every future round."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return _NO_RUN_LOCK
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_run_lock(fd):
+    if fd is None or fd == _NO_RUN_LOCK:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _coerce_files_map(value):
+    """K05: ``state["files"]`` as a dict, whatever it actually holds on
+    disk. A hand-edited or pre-X1-migration state file can carry a list, a
+    string, or entries that are themselves not dicts; ``dict(value or {})``
+    (the previous shape here) either raises (``dict(["a-string"])``) or
+    silently invents nonsense keys (``dict(["ab"])`` -> ``{"a": "b"}``) --
+    either way corrupting the NEXT merge/drop instead of self-healing it.
+    Anything not already a dict is treated as absent, which lets the
+    upcoming write replace it with a well-formed one."""
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _merge_file_entry(state, slug, entry):
     new = dict(state)
-    files = dict(new.get("files") or {})
-    files[slug] = entry
-    new["files"] = files
+    new["files"] = {**_coerce_files_map(new.get("files")), slug: entry}
     return new
 
 
 def _drop_file_entry(state, slug):
     new = dict(state)
-    files = dict(new.get("files") or {})
+    files = _coerce_files_map(new.get("files"))
     files.pop(slug, None)
+    new["files"] = files
+    return new
+
+
+def _register_placeholder_entries(state, to_register):
+    """K22: used only by orphan reconciliation, for a slug this round's
+    listing just confirmed exists BOTH locally and on the server but which
+    has no state entry yet (the common case right after a lost/rebuilt
+    state file, before every local file has been individually re-synced).
+    Registering it now -- with no ``file_hash`` of its own -- moves it out
+    of "not in state, handled by the cursor walk eventually" and into the
+    dirty set starting the VERY NEXT round (the fast path in
+    ``_dirty_check`` cannot match ``None`` against a real mtime/size, so it
+    recomputes and finds nothing actually changed -> ``unchanged``). Without
+    this, a file deleted in the window between a state loss and this same
+    file's own turn on the cursor would never be seen as "vanished" (it was
+    never IN ``state["files"]`` to begin with) and its server row would be
+    orphaned forever -- reconciliation itself only runs once per state
+    lifetime.
+    """
+    new = dict(state)
+    files = _coerce_files_map(new.get("files"))
+    for slug, entry in to_register.items():
+        files.setdefault(slug, entry)
     new["files"] = files
     return new
 
@@ -544,18 +807,30 @@ def _dirty_check(path, stored, fingerprint):
     """``(dirty, file_hash)`` for an already-synced file (``stored`` is its
     existing state entry, never ``None``).
 
-    mtime+size fast path (C row): the whole-file hash is only recomputed
-    when either changed since the file's last successful sync -- an
-    untouched file costs one ``stat()``, nothing else. A content rewrite
-    that happens to preserve mtime (e.g. a script using ``os.utime`` to roll
-    it back) is still caught, because such a rewrite essentially always
-    changes the file's SIZE too, which alone is enough to fail the fast
-    path and force a hash recompute. A fingerprint mismatch (A8-2) dirties
-    the file regardless of mtime/size -- the bytes on disk have not
-    changed, the redaction rule that will be applied to them has.
+    mtime+size+ctime fast path (C row, widened by K21): the whole-file hash
+    is only recomputed when one of the three changed since the file's last
+    successful sync -- an untouched file costs one ``stat()``, nothing
+    else. mtime+size ALONE missed a same-length content rewrite whose
+    script also rolls mtime back with ``os.utime`` (the earlier docstring
+    here assumed that was "essentially always" paired with a size change,
+    which is false for e.g. a single fixed-width character edited in
+    place) -- ``st_ctime`` is bumped by the kernel on ANY inode metadata or
+    content change and cannot itself be set back by ``os.utime`` (POSIX has
+    no syscall for that), so it closes exactly that gap. A fingerprint
+    mismatch (A8-2 / K24) dirties the file regardless of mtime/size/ctime --
+    the bytes on disk have not changed, the rule that will be applied to
+    them has. A false-positive "dirty" from the ctime check alone (e.g. a
+    chmod with no content change) costs one extra hash recompute, which
+    then compares equal and is simply ``unchanged`` -- never an extra wire
+    call.
     """
     st = os.stat(path)
-    if st.st_mtime == stored.get("mtime") and st.st_size == stored.get("size"):
+    same_stat = (
+        st.st_mtime == stored.get("mtime")
+        and st.st_size == stored.get("size")
+        and getattr(st, "st_ctime_ns", None) == stored.get("ctime")
+    )
+    if same_stat:
         file_hash = stored.get("file_hash")
         content_changed = False
     else:
@@ -567,9 +842,88 @@ def _dirty_check(path, stored, fingerprint):
 
 # ── one file: read, build, upsert, persist on success ────────────────────
 
-def _sync_file(client, key, project_name, slug, path, fingerprint):
+def _fold_persist_reasons(reasons, persist_reasons):
+    """Append only a GENUINE write failure from ``update_state_at``'s own
+    returned reasons into ``reasons`` (mutated in place). Per the owner
+    ruling on A9-7 (post_implementation R1, item 4): ``lock_unavailable`` (a
+    degraded-but-unlocked write that still completed) and ``unknown`` (a
+    corrupt state file ``update_state_at``'s own read side just repaired,
+    whose write then still landed) are NOT failures of this call -- only
+    ``state_write_failed`` means the write itself did not happen. The
+    previous code folded ALL of ``persist_reasons`` in unconditionally,
+    which reported a purely-local, successfully-self-healed lock hiccup as
+    a round failure the ledger's ``ok`` field and ``worst_reason`` both then
+    acted on."""
+    if "state_write_failed" in persist_reasons:
+        reasons.append("state_write_failed")
+
+
+def _upsert_retrying_404(client, layer, external_id, content, metadata, *, local_updated_at, updated_key):
+    """``client.upsert`` with ONE retry when the PATCH target vanished
+    between this call's own lookup and its write (K27): the row a
+    ``upsert`` just found by lookup can be deleted server-side (another
+    concurrent run's dedup/orphan cleanup, a console/MCP delete) in the
+    narrow window before the PATCH reaches it, which the backend answers
+    404 -- classified ``http_error`` (a round-abort reason) by
+    ``_ingest_client``, same as any other non-2xx it does not special-case.
+    Per the owner ruling (post_implementation R1, item covering K27): a 404
+    on a PATCH this client itself just looked up (``outcome.memory_id`` is
+    set -- never a 404 from the LOOKUP call itself, which would leave
+    ``memory_id`` unset and is a configuration problem, not a race) clears
+    the stale mapping and re-queries ONCE rather than aborting the whole
+    round and parking every file behind this one for a full round. A
+    second 404 (or any other failure) on the retry is reported normally --
+    this is a single race-closing retry, not a loop."""
+    outcome = client.upsert(
+        layer, external_id, content, metadata,
+        local_updated_at=local_updated_at, updated_key=updated_key,
+    )
+    if outcome.aborts_round and outcome.status == 404 and outcome.memory_id:
+        retry = client.upsert(
+            layer, external_id, content, metadata,
+            local_updated_at=local_updated_at, updated_key=updated_key,
+        )
+        retry.calls += outcome.calls
+        return retry
+    return outcome
+
+
+def _tally_result(run, slug, reasons, outcome):
+    """K08: fold one file's result into this round's ledger-visible
+    bookkeeping -- ``run["extra"]["redacted"]`` / ``["dedup_merged"]``
+    (summed across every file this round touched, not just the one that
+    happens to win the scalar ``reason``) and a bounded ``["failed"]`` list
+    naming which file hit a failure-class reason, so a round that fails on
+    file 47 of 100 does not leave a reader to guess which one. ``outcome``
+    is ``None`` for the local, pre-``upsert``/``delete`` failures (a read
+    error, an unparsable frontmatter) that never got as far as making a
+    client call."""
+    if outcome is not None:
+        if outcome.redacted:
+            run["extra"]["redacted"] = run["extra"].get("redacted", 0) + outcome.redacted
+        if outcome.dedup_merged:
+            run["extra"]["dedup_merged"] = run["extra"].get("dedup_merged", 0) + outcome.dedup_merged
+    failure = next(
+        (r for r in reasons if r != "state_write_failed" and _hook_state.is_failure_reason(r)), None,
+    )
+    if failure is None:
+        return
+    failed = run["extra"].setdefault("failed", [])
+    if len(failed) >= 5:  # bounded: a reader needs examples, not every row of a bad batch
+        return
+    entry = {"slug": slug, "reason": failure}
+    if outcome is not None:
+        if outcome.status is not None:
+            entry["status"] = outcome.status
+        if outcome.detail:
+            entry["detail"] = str(outcome.detail)[:200]
+    failed.append(entry)
+
+
+def _sync_file(client, key, project_name, slug, path, fingerprint, run):
     """Attempt to sync one memory file as a ``layer=fact`` row. Returns
-    ``(reasons, aborts, calls)``.
+    ``(reasons, aborts, calls)``. Tallies into ``run["extra"]`` as it goes
+    (K08) -- see ``_tally_result``.
 
     On a non-aborting, COMPLETED write (created / updated / unchanged /
     stale_local) this ALSO persists the file's own state entry immediately
@@ -581,64 +935,111 @@ def _sync_file(client, key, project_name, slug, path, fingerprint):
 
     A genuine failure to persist that entry (``state_write_failed``) is
     folded into the REASONS this function returns, exactly like the
-    round-end cursor/reconciled persist at the bottom of ``_collect`` does
-    -- not discarded. This call always runs strictly before ``_record``
-    (A9-7), so there is no already-written ledger row for the failure to
-    arrive too late for; it is simply one more reason this round produced.
+    round-end cursor/reconciled persist does -- not discarded. This call
+    always runs strictly before ``_record`` (A9-7), so there is no
+    already-written ledger row for the failure to arrive too late for; it
+    is simply one more reason this round produced.
+
+    K19: the file is read exactly ONCE (one ``open`` + one ``fstat`` off
+    the SAME descriptor), and the whole-file hash is computed from those
+    SAME bytes -- the previous version opened the file a second time purely
+    to stat it and hash it again, which left a window for a concurrent
+    rewrite (another session, or Claude Code's own background memory
+    writer) to land BETWEEN the two opens: ``state`` would then remember
+    the SECOND version's mtime/size/hash while the row actually sent to the
+    server was built from the FIRST version's bytes, and the discrepancy is
+    permanent (the fast path in ``_dirty_check`` and the local hash both
+    agree with the recorded, wrong, state from then on). ``synced_at`` is
+    likewise stamped at READ time, not after the round-trip to the server,
+    for the same "what state records must describe the bytes actually
+    sent" reason.
     """
     try:
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read(_MAX_DOCUMENT_CHARS)
-    except UnicodeDecodeError:
-        return ["file_unparsable"], False, 0
+        with open(path, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            raw = fh.read(_MAX_DOCUMENT_CHARS + 1)
+    except FileNotFoundError:
+        # Listed (or dirty-checked) a moment ago, gone now: an ordinary
+        # race, not one of the C row's own named reasons -- nothing to
+        # report, the next round's listing simply will not see it either.
+        return [], False, 0
     except OSError:
-        # Listed (or dirty-checked) a moment ago, gone or unreadable now: an
-        # ordinary race, not one of the C row's own named reasons.
+        _tally_result(run, slug, ["unknown"], None)
         return ["unknown"], False, 0
+    if not stat.S_ISREG(st.st_mode):
+        _tally_result(run, slug, ["unknown"], None)
+        return ["unknown"], False, 0
+    synced_at = _now_iso()  # K19: the instant the bytes below were read
+    file_hash = "sha256:" + hashlib.sha256(raw[: _MAX_DOCUMENT_CHARS + 1]).hexdigest()
     try:
-        st = os.stat(path)
-        file_hash = _whole_file_hash(path)
-    except OSError:
-        return ["unknown"], False, 0
+        text = raw[:_MAX_DOCUMENT_CHARS].decode("utf-8")
+    except UnicodeDecodeError:
+        _tally_result(run, slug, ["file_unparsable"], None)
+        return ["file_unparsable"], False, 0
 
     frontmatter, body = _split_memory_frontmatter(text)
-    content, truncated = _cap_body(body, _CONTENT_CAP)
+    if frontmatter is None:  # K07: an opened but never-closed frontmatter block
+        _tally_result(run, slug, ["file_unparsable"], None)
+        return ["file_unparsable"], False, 0
+    content, truncated = _cap_for_wire(body, _CONTENT_CAP)  # K06: capped post-redaction
     modified = frontmatter.get("modified") or _mtime_iso(st)
     metadata = _build_memory_metadata(key, project_name, slug, frontmatter, modified)
     metadata["aria.truncated"] = truncated  # Amendment A8: always explicit
 
-    outcome = client.upsert(
-        "fact", f"{key}/{slug}", content, metadata,
+    outcome = _upsert_retrying_404(
+        client, "fact", f"{key}/{slug}", content, metadata,
         local_updated_at=modified, updated_key="aria.modified",
     )
     if outcome.aborts_round:
+        _tally_result(run, slug, outcome.reasons, outcome)
         return list(outcome.reasons), True, outcome.calls
     reasons = list(outcome.reasons)
     if outcome.action in ("created", "updated", "unchanged") or "stale_local" in outcome.reasons:
         entry = {
             "mtime": st.st_mtime,
             "size": st.st_size,
+            "ctime": getattr(st, "st_ctime_ns", None),  # K21
             "file_hash": file_hash,
-            "synced_at": _now_iso(),
+            "synced_at": synced_at,
             "redaction_fingerprint": fingerprint,
         }
         _, persist_reasons = _hook_state.update_state_at(
             _memory_state_path(key),
             lambda s, slug=slug, entry=entry: _merge_file_entry(s, slug, entry),
         )
-        reasons.extend(persist_reasons)
+        _fold_persist_reasons(reasons, persist_reasons)
+    _tally_result(run, slug, reasons, outcome)
     return reasons, False, outcome.calls
 
 
-def _delete_file(client, key, slug):
+def _delete_file(client, key, slug, run):
     """Attempt to delete the server-side row(s) for a locally-vanished
-    file. Returns ``(reasons, aborts, calls)``.
+    file. Returns ``(reasons, aborts, calls, cleared)``. Tallies into
+    ``run["extra"]`` as it goes (K08) -- see ``_tally_result``.
 
     On confirmed deletion (or an honest "nothing_to_do" -- the row was
     already gone) this ALSO clears the file's local state entry; on any
     OTHER outcome it does not, so a failed delete is retried on the next
     round, before anything else in the batch, exactly as the C row
-    requires.
+    requires. ``cleared`` tells the caller whether that happened, so a
+    round's ledger can report how many pending deletes actually finished
+    (K01, point 4) without re-deriving it from ``reasons``.
+
+    K20: the mapping is cleared ONLY when every row the lookup found this
+    call was confirmed deleted AND that lookup page was not itself full
+    (``outcome.found < LOOKUP_LIMIT``) -- not merely ``outcome.deleted >
+    0``, which the previous version accepted. ``IngestClient.delete`` only
+    ever looks at ONE page of up to ``LOOKUP_LIMIT`` rows and stops at the
+    FIRST row it fails to delete (a non-abort rejection such as ``422`` or
+    ``filter_suspect`` is not a round-abort reason, so the loop does not
+    raise or set ``aborts_round`` -- it simply returns with ``deleted`` shy
+    of ``found``): a file with more duplicate rows than fit on one page, or
+    one whose later row was rejected after earlier ones already succeeded,
+    both left ``outcome.deleted > 0`` while rows for this ``external_id``
+    still existed server-side -- and clearing the mapping right there
+    means this hook never looks at that slug again (orphan reconciliation
+    only runs once per state lifetime, and a cleared slug is not even a
+    candidate for it).
 
     A genuine failure to persist that clear (``state_write_failed``) is
     folded into the returned reasons, same as ``_sync_file`` above and for
@@ -647,14 +1048,20 @@ def _delete_file(client, key, slug):
     """
     outcome = client.delete("fact", f"{key}/{slug}")
     if outcome.aborts_round:
-        return list(outcome.reasons), True, outcome.calls
+        _tally_result(run, slug, outcome.reasons, outcome)
+        return list(outcome.reasons), True, outcome.calls, False
     reasons = [r for r in outcome.reasons if r != "nothing_to_do"]
-    if outcome.deleted > 0 or "nothing_to_do" in outcome.reasons:
+    page_full = outcome.found >= _ingest_client.LOOKUP_LIMIT
+    cleared = "nothing_to_do" in outcome.reasons or (
+        outcome.found > 0 and outcome.deleted == outcome.found and not page_full
+    )
+    if cleared:
         _, persist_reasons = _hook_state.update_state_at(
             _memory_state_path(key), lambda s, slug=slug: _drop_file_entry(s, slug)
         )
-        reasons.extend(persist_reasons)
-    return reasons, False, outcome.calls
+        _fold_persist_reasons(reasons, persist_reasons)
+    _tally_result(run, slug, reasons, outcome)
+    return reasons, False, outcome.calls, cleared
 
 
 def _now_iso():
@@ -700,20 +1107,31 @@ def _list_fact_page(base_url, token, user_id, container_id, deadline, before_cre
         headers["X-API-Key"] = token
     req = urllib.request.Request(url, headers=headers)
     timeout = min(_HTTP_TIMEOUT_SECONDS, remaining) if remaining is not None else _HTTP_TIMEOUT_SECONDS
+    # K26: read the body in deadline-bound chunks (``_ingest_client.
+    # _read_body``), not a single ``resp.read(N)``/``exc.read(N)`` -- urllib's
+    # own ``timeout`` bounds a single socket OPERATION, not the whole read,
+    # so a server that drips a few bytes per tick could keep this call (and
+    # the worker thread running it) alive well past ``deadline``, past the
+    # hook's own work budget, and into the thread being abandoned entirely
+    # (``timeout`` reported with NOTHING this round recorded, including
+    # whatever the earlier pages / pending-delete phase already did -- the
+    # exact failure mode the per-request ``_call`` deadline in
+    # ``_ingest_client`` exists to prevent for every OTHER request this hook
+    # makes).
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(_RECONCILE_MAX_BODY_BYTES + 1)
+            raw = _ingest_client._read_body(resp, deadline, _RECONCILE_MAX_BODY_BYTES, timeout)
             status = resp.status
     except urllib.error.HTTPError as exc:
         status = exc.code
         try:
-            raw = exc.read(_RECONCILE_MAX_BODY_BYTES + 1)
+            raw = _ingest_client._read_body(exc, deadline, _RECONCILE_MAX_BODY_BYTES, timeout)
         except Exception:  # noqa: BLE001 - the error body is optional
             raw = b""
+    except _ingest_client._Oversize:
+        return None, "http_error", 1
     except Exception as exc:  # noqa: BLE001 - every transport failure has a reason
         return None, _hook_state.reason_for_exception(exc), 1
-    if len(raw) > _RECONCILE_MAX_BODY_BYTES:
-        return None, "http_error", 1
     if not (200 <= status < 300):
         return None, ("rate_limited" if status == 429 else "http_error"), 1
     try:
@@ -759,13 +1177,17 @@ def _collect_fact_rows(base_url, token, user_id, container_id, deadline):
 def _reconcile_orphans(client, key, local_slugs, base_url, token, deadline):
     """One-time (per state lifetime) cleanup: soft-delete this container's
     ``layer=fact`` rows under this project's X1 prefix that no longer have
-    a local file. Returns ``(reason, done, deleted, calls)``.
+    a local file. Returns ``(reasons, done, deleted, calls, matched_slugs)``.
 
     ``done`` is True only when reconciliation reached a SAFE conclusion
     (nothing to delete, or everything found WAS deleted) -- the caller must
     not mark state "reconciled" on anything else, so a guard trip or a
     mid-cleanup abort is retried on a LATER run rather than silently
-    accepted as settled.
+    accepted as settled. ``matched_slugs`` (K22) is every local slug a
+    VERIFIED row confirms the server already has -- the caller registers
+    these into state right away (see ``_register_placeholder_entries``) so
+    a file deleted in the window before its own turn on the cursor is not
+    permanently orphaned (reconciliation itself never runs a second time).
 
     The guard (C row): local file count 0, or more orphans than
     ``max(5, 20% of this project's synced row count)`` -- delete nothing,
@@ -775,42 +1197,99 @@ def _reconcile_orphans(client, key, local_slugs, base_url, token, deadline):
     strongest signal that something about directory resolution (an
     unexpected ``cwd``, a ``CLAUDE_CONFIG_DIR`` mismatch) is wrong, not that
     every file was genuinely deleted at once -- a project with zero local
-    files AND zero server rows still reaches a clean ``(None, True)``, since
+    files AND zero server rows still reaches a clean ``([], True)``, since
     there is nothing to guard against in the first place.
+
+    K04 (post_implementation R1): a row is only ever treated as "ours" once
+    its ``external_id`` prefix, ``metadata.layer == "fact"`` AND
+    ``metadata.container_id`` (both filter keys this call's own listing
+    query sends) have ALL been individually verified -- contract §6.2's
+    "a caller must verify every filter key it sent, and treat a non-empty
+    page where none of them verified as the filter having silently failed"
+    applies here exactly as it already does to ``_ingest_client``'s own
+    per-document lookup. The previous version verified the ``external_id``
+    prefix alone and nothing else, so a page returned under a filter the
+    backend silently ignored (a renamed query key) could seat another
+    container's or another layer's rows as this project's own candidates --
+    protected from an actual wrong DELETE by ``_ingest_client``'s own
+    ``_is_ours`` on the write path, but the resulting ``filter_suspect``
+    signal (this function had none) never reached the ledger, so the whole
+    page was silently skipped as "zero orphans" instead of reported.
+
+    K03 (post_implementation R1): every non-``nothing_to_do`` reason this
+    function's own delete loop produces for an orphan it could NOT delete
+    -- a round-abort (stops the loop outright) or a per-row rejection
+    (``rejected_422``, ``filter_suspect``, ``unknown`` -- none of them
+    round-abort reasons, so OTHER orphans in the same batch still get their
+    own turn) -- is returned in ``reasons`` rather than silently dropped by
+    an ``elif`` that only ever kept ONE of "some rows got deleted" or "one
+    reason why a row did not". The caller folds these into the round's own
+    accumulated reasons and decides whether to stop the REST of the round
+    (``_ingest_client.ROUND_ABORT_REASONS`` plus ``budget_exhausted``).
     """
-    rows, reason, calls = _collect_fact_rows(
+    rows, list_reason, calls = _collect_fact_rows(
         base_url, token, client.user_id, client.container_id, deadline
     )
-    if reason is not None:
-        return reason, False, 0, calls
+    if list_reason is not None:
+        return [list_reason], False, 0, calls, set()
     prefix = key + "/"
     synced_count = 0
     orphans = []
+    matched_slugs = set()
+    prefixed_seen = False
+    verified_seen = False
     for row in rows:
         meta = row.get("metadata")
         external_id = meta.get("external_id") if isinstance(meta, dict) else None
         if not isinstance(external_id, str) or not external_id.startswith(prefix):
             continue  # X1: never another project's rows, whatever they are
+        prefixed_seen = True
+        if not (
+            isinstance(meta.get("layer"), str) and meta["layer"] == "fact"
+            and isinstance(meta.get("container_id"), str) and meta["container_id"] == client.container_id
+        ):
+            continue  # §6.2: a filter key we sent did not verify on this row
+        verified_seen = True
         synced_count += 1
-        if external_id[len(prefix):] not in local_slugs:
+        slug = external_id[len(prefix):]
+        if slug in local_slugs:
+            matched_slugs.add(slug)
+        else:
             orphans.append(external_id)
+    if prefixed_seen and not verified_seen:
+        # Every row sharing our prefix failed EITHER verification -- the
+        # same "non-empty page, nothing verified" shape _ingest_client's own
+        # _lookup treats as filter_suspect, not as "we simply have none".
+        return ["filter_suspect"], False, 0, calls, matched_slugs
     if not local_slugs:
-        return ("orphan_guard" if orphans else None), (not orphans), 0, calls
+        return (["orphan_guard"] if orphans else []), (not orphans), 0, calls, matched_slugs
     if not orphans:
-        return None, True, 0, calls
+        return [], True, 0, calls, matched_slugs
     if len(orphans) > max(5, synced_count * 0.2):
-        return "orphan_guard", False, 0, calls
+        return ["orphan_guard"], False, 0, calls, matched_slugs
     deleted = 0
+    reasons = []
     for external_id in orphans:
         remaining = (deadline - time.monotonic()) if deadline is not None else None
         if remaining is not None and remaining < _MIN_REMAINING_SECONDS:
-            return "budget_exhausted", False, deleted, calls
+            reasons.append("budget_exhausted")
+            break
         outcome = client.delete("fact", external_id)
         calls += outcome.calls
         if outcome.aborts_round:
-            return outcome.reason, False, deleted, calls
-        deleted += outcome.deleted
-    return None, True, deleted, calls
+            reasons.append(outcome.reason)
+            break  # a round-abort condition: do not attempt more orphans this round
+        if outcome.deleted > 0 or "nothing_to_do" in outcome.reasons:
+            deleted += 1
+        else:
+            # A per-row rejection that is NOT a round-abort reason (422,
+            # filter_suspect, an unsendable id): record it and keep trying
+            # the REST of this batch's orphans -- one bad row must not block
+            # every other one (K04).
+            non_abort = [r for r in outcome.reasons if r and r != "nothing_to_do"]
+            reasons.extend(non_abort or ["unknown"])
+    done = not reasons and deleted == len(orphans)
+    return reasons, done, deleted, calls, matched_slugs
 
 
 # ── the work ─────────────────────────────────────────────────────────────
@@ -823,7 +1302,25 @@ def _collect(run):
     """Do the work. Returns the reason string; raises only for a stdin
     payload that is not a JSON object (the runner maps it via
     ``_hook_state.reason_for_exception``, which resolves unrecognised
-    exceptions to ``unknown``)."""
+    exceptions to ``unknown``).
+
+    K02 (post_implementation R1): every fact this round produces is written
+    straight into ``run`` AS IT HAPPENS -- ``run["reasons"]`` (this
+    function's own working list; the SAME object, not a copy), ``run
+    ["calls"]``, ``run["extra"]`` -- rather than accumulated in local
+    variables and only transferred to ``run`` in one block at the very end.
+    An exception this function does not itself catch still reaches
+    ``run_with_deadline``'s own blanket handler and ends the round WITHOUT
+    ever reaching that transfer; writing straight into ``run`` means
+    whatever already happened (an orphan actually deleted server-side, a
+    file actually PATCHed) survives into the ledger row even when
+    something LATER in the same round goes wrong. The round's own
+    cursor/reconciled advance is the one exception: it is recorded here
+    into ``run["new_cursor"]`` / ``run["new_reconciled"]`` but the actual
+    disk WRITE for it happens in ``_record``, AFTER the ledger row -- see
+    that function's own docstring for why (the converged handoff_sync
+    shape the owner ruling requires).
+    """
     raw = sys.stdin.read()
     event = json.loads(raw) if raw.strip() else {}
     if not isinstance(event, dict):
@@ -837,141 +1334,253 @@ def _collect(run):
         return "not_configured"  # the default for a fresh install; do nothing else
 
     key, degraded = _identity.memory_dir_key(cwd)
+    run["key"] = key
     run["extra"]["memory_dir"] = key
     toplevel, _ = _identity.project_root(cwd)
     project_name = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
 
-    local_files = _list_memory_files(_memory_dir(key))
+    local_files, indeterminate, list_reason = _list_memory_files(_memory_dir(key))
     run["extra"]["local_files"] = len(local_files)
 
     state_path = _memory_state_path(key)
     state, reasons = _hook_state.read_state_at(state_path)
-    files_state = dict(state.get("files") or {})
-    reconciled = bool(state.get("reconciled"))
+    run["reasons"] = reasons  # K02: the SAME list, mutated as this round goes
+
+    files_state_raw = state.get("files")
+    if isinstance(files_state_raw, dict):
+        files_state = {s: e for s, e in files_state_raw.items() if isinstance(e, dict)}
+        shape_bad = len(files_state) != len(files_state_raw)
+    else:
+        files_state = {}
+        shape_bad = files_state_raw is not None
+    reconciled_raw = state.get("reconciled")
+    reconciled = reconciled_raw is True
+    shape_bad = shape_bad or (reconciled_raw is not None and not isinstance(reconciled_raw, bool))
+    if shape_bad:
+        # K05: a well-formed JSON object whose own VALUES are the wrong
+        # shape (``files`` not a dict, an entry not a dict, ``reconciled``
+        # not a bool -- a hand edit, a pre-X1 migration, a partial write a
+        # crash interrupted) is reported once, like any other corrupt
+        # state, and simply treated as if those parts were absent: the next
+        # per-file write heals the shape for good (``_coerce_files_map``).
+        reasons.append("unknown")
+
     sorted_slugs = sorted(local_files)
     n = len(sorted_slugs)
     cursor = state.get("cursor")
     if not isinstance(cursor, int) or cursor < 0 or cursor >= n:
         cursor = 0
+    run["old_cursor"], run["new_cursor"] = cursor, cursor
+    run["old_reconciled"], run["new_reconciled"] = reconciled, reconciled
 
-    token = os.environ.get("NEXUS_API_TOKEN", "")
-    client = _ingest_client.IngestClient(
-        base_url, token, _identity.user_id(cwd), _identity.container_id(), SOURCE_NAME,
-        timeout=_HTTP_TIMEOUT_SECONDS, bulk=True, deadline=run["deadline"],
-        identity_degraded=degraded,
-    )
+    if list_reason is not None:
+        # K01: the directory listing itself failed for a reason OTHER than
+        # "it does not exist" -- EACCES / EIO / ESTALE / ENOTDIR all read,
+        # to a caller that only checks "is this slug a key of the result",
+        # exactly like "every file in it was deleted". Treating that as
+        # license to soft-delete every row this project has ever synced is
+        # the single most destructive mistake this hook can make; refuse
+        # every destructive phase this round and report it instead.
+        reasons.append(list_reason)
+        run["calls"] = 0
+        return _hook_state.worst_reason(reasons)
 
-    fingerprint = _current_fingerprint()
-    budget = _BATCH_SIZE
-    aborted = False
-    calls = 0
-    orphans_deleted = 0
+    lock_fd = _acquire_run_lock(_memory_run_lock_path(key))
+    if lock_fd is None:
+        # K09: a concurrent SessionEnd run for this SAME memory directory
+        # already holds the round lock -- both runs would otherwise start
+        # from the same unlocked snapshot and race to POST the same new
+        # file twice (this client's own idempotency protocol only
+        # de-duplicates on a LATER run's lookup, and the steady state here
+        # is zero calls, so the pair is never naturally revisited to merge
+        # it). Doing no network work this round is always safe: the peer
+        # run is doing it instead.
+        run["extra"]["peer_running"] = True
+        reasons.append("nothing_to_do")
+        run["calls"] = 0
+        return _hook_state.worst_reason(reasons)
+    try:
+        token = os.environ.get("NEXUS_API_TOKEN", "")
+        client = _ingest_client.IngestClient(
+            base_url, token, _identity.user_id(cwd), _identity.container_id(), SOURCE_NAME,
+            timeout=_HTTP_TIMEOUT_SECONDS, bulk=True, deadline=run["deadline"],
+            identity_degraded=degraded,
+        )
 
-    # -- pending deletes (vanished local files), retried first every round --
-    vanished = sorted(slug for slug in files_state if slug not in local_files)
-    for slug in vanished:
-        if aborted or budget <= 0:
-            break
-        if _remaining(run) < _MIN_REMAINING_SECONDS:
-            reasons.append("budget_exhausted")
-            aborted = True
-            break
-        r, ab, c = _delete_file(client, key, slug)
-        reasons.extend(r)
-        calls += c
-        budget -= 1
-        if ab:
-            aborted = True
+        fingerprint = _current_fingerprint()
+        budget = _BATCH_SIZE
+        aborted = False
+        deleted_count = 0
 
-    # -- orphan reconciliation: independent of the batch above/below (a
-    # failure here does not stop the sync batch, and vice versa), but still
-    # gated by the SAME budget check as every other network-making phase,
-    # and refused outright under a guessed identity (mirrors IngestClient's
-    # own identity_degraded guard on upsert/delete -- this listing is not a
-    # method of that class (see _list_fact_page's own docstring) so it does
-    # not inherit that guard for free, and a bulk-delete decision is exactly
-    # the kind of call a guessed user_id/key must never be allowed to drive) --
-    if not reconciled:
-        if degraded:
-            reasons.append("identity_unresolved")
-        elif _remaining(run) < _MIN_REMAINING_SECONDS:
-            reasons.append("budget_exhausted")
-            aborted = True
-        else:
-            recon_reason, recon_done, recon_deleted, recon_calls = _reconcile_orphans(
-                client, key, set(local_files), base_url, token, run["deadline"],
-            )
-            calls += recon_calls
-            if recon_deleted:
-                orphans_deleted = recon_deleted
-                reasons.append("orphans_deleted")
-            elif recon_reason:
-                reasons.append(recon_reason)
-            if recon_done:
-                reconciled = True
-
-    # -- dirty set: already-synced files whose content or redaction rule
-    # changed since their last sync (checked first, ahead of the cursor) --
-    dirty = []
-    if not aborted:
-        for slug in sorted_slugs:
-            stored = files_state.get(slug)
-            if stored is None:
-                continue  # "new" -- handled by the cursor walk below
-            is_dirty, _ = _dirty_check(local_files[slug], stored, fingerprint)
-            if is_dirty:
-                dirty.append(slug)
-
-    for slug in dirty:
-        if aborted or budget <= 0:
-            break
-        if _remaining(run) < _MIN_REMAINING_SECONDS:
-            reasons.append("budget_exhausted")
-            aborted = True
-            break
-        r, ab, c = _sync_file(client, key, project_name, slug, local_files[slug], fingerprint)
-        reasons.extend(r)
-        calls += c
-        budget -= 1
-        if ab:
-            aborted = True
-
-    # -- cursor walk: not-yet-synced files, resuming where the last round
-    # stopped (an abort or a budget exhaustion), wrapping at the list's end --
-    if not aborted and n and budget > 0:
-        i = cursor
-        examined = 0
-        while examined < n and budget > 0:
-            slug = sorted_slugs[i]
-            i = (i + 1) % n
-            examined += 1
-            if slug in files_state:
-                continue  # already synced & clean (or just handled above) -- free skip
+        # -- pending deletes (vanished local files), retried first every round.
+        # K01: a slug this round's listing could not conclusively resolve
+        # (``indeterminate``) is never treated as "vanished" -- something is
+        # still there, it just was not safely stat-able. Zero local files
+        # while state still remembers synced entries is the SAME
+        # unexpected-directory-resolution signal _reconcile_orphans already
+        # guards against; it must stop THIS phase too, not only orphan
+        # reconciliation, which is independent and may not even run this
+        # round (already reconciled). --
+        vanished = sorted(slug for slug in files_state if slug not in local_files and slug not in indeterminate)
+        if not local_files and vanished:
+            reasons.append("orphan_guard")
+            vanished = []
+        for slug in vanished:
+            if aborted or budget <= 0:
+                break
             if _remaining(run) < _MIN_REMAINING_SECONDS:
                 reasons.append("budget_exhausted")
-                cursor = (i - 1) % n  # resume AT this same file next time
                 aborted = True
                 break
-            r, ab, c = _sync_file(client, key, project_name, slug, local_files[slug], fingerprint)
+            r, ab, c, cleared = _delete_file(client, key, slug, run)
             reasons.extend(r)
-            calls += c
+            run["calls"] += c
             budget -= 1
+            if cleared:
+                deleted_count += 1
             if ab:
-                cursor = (i - 1) % n  # resume AT the failing file next time
+                aborted = True
+        if deleted_count:
+            run["extra"]["deleted"] = deleted_count
+
+        # -- orphan reconciliation: independent of the batch above/below (a
+        # failure here does not stop the sync batch, and vice versa) UNLESS
+        # a prior phase has already aborted the round (K03: reconciliation
+        # must not start fresh network work once this round is already
+        # stopping), still gated by the SAME budget check as every other
+        # network-making phase, and refused outright under a guessed
+        # identity (mirrors IngestClient's own identity_degraded guard on
+        # upsert/delete -- this listing is not a method of that class (see
+        # _list_fact_page's own docstring) so it does not inherit that
+        # guard for free, and a bulk-delete decision is exactly the kind of
+        # call a guessed user_id/key must never be allowed to drive) --
+        if not reconciled and not aborted:
+            if degraded:
+                reasons.append("identity_unresolved")
+            elif _remaining(run) < _MIN_REMAINING_SECONDS:
+                reasons.append("budget_exhausted")
+                aborted = True
+            else:
+                recon_reasons, recon_done, recon_deleted, recon_calls, matched_slugs = _reconcile_orphans(
+                    client, key, set(local_files), base_url, token, run["deadline"],
+                )
+                run["calls"] += recon_calls
+                if recon_deleted:
+                    run["extra"]["orphans_deleted"] = recon_deleted  # K02: recorded the instant it is known
+                for r in recon_reasons:
+                    reasons.append(r)
+                    if r in _ingest_client.ROUND_ABORT_REASONS or r == "budget_exhausted":
+                        aborted = True  # K03: a reconciliation abort stops the REST of this round too
+                if recon_deleted:
+                    # Appended AFTER recon_reasons on purpose: worst_reason ties
+                    # on first-seen order for two non-priority-table reasons,
+                    # and a same-round failure (why the round stopped) is the
+                    # more actionable scalar than this one-time destructive
+                    # fact -- which still reaches the ledger either way, via
+                    # also_failed when it does not win the scalar slot.
+                    reasons.append("orphans_deleted")
+                if recon_done:
+                    reconciled = True
+                    run["new_reconciled"] = True
+                if matched_slugs:
+                    # K22: a row reconciliation just confirmed exists BOTH
+                    # locally and on the server is registered right away,
+                    # without a file_hash of its own -- see
+                    # _register_placeholder_entries's docstring.
+                    to_register = {s: {} for s in matched_slugs if s not in files_state}
+                    if to_register:
+                        _, persist_reasons = _hook_state.update_state_at(
+                            state_path,
+                            lambda s, to_register=to_register: _register_placeholder_entries(s, to_register),
+                        )
+                        _fold_persist_reasons(reasons, persist_reasons)
+                        files_state.update(to_register)
+
+        # -- dirty set: already-synced files whose content or redaction rule
+        # changed since their last sync (checked first, ahead of the
+        # cursor). K05: a per-file stat/hash failure here must not abort the
+        # whole round -- FileNotFoundError is an ordinary race (the next
+        # round's listing settles it), anything else is reported once and
+        # that one file is simply left out of this round. K18: a file whose
+        # CONTENT actually changed is tried before one that is dirty only
+        # because the redaction-rule fingerprint changed (A8-2) -- a real
+        # edit must not queue behind a backlog of fingerprint-only churn. --
+        dirty = []
+        content_changed_of = {}
+        dirty_scan_errors = []
+        if not aborted:
+            for slug in sorted_slugs:
+                stored = files_state.get(slug)
+                if stored is None:
+                    continue  # "new" -- handled by the cursor walk below
+                try:
+                    is_dirty, file_hash = _dirty_check(local_files[slug], stored, fingerprint)
+                except FileNotFoundError:
+                    continue  # vanished mid-scan: an ordinary race
+                except OSError:
+                    dirty_scan_errors.append(slug)
+                    continue
+                if is_dirty:
+                    dirty.append(slug)
+                    content_changed_of[slug] = file_hash != stored.get("file_hash")
+            dirty.sort(key=lambda s: (not content_changed_of.get(s, True), s))
+        if dirty_scan_errors:
+            reasons.append("unknown")
+            run["extra"]["dirty_scan_errors"] = sorted(dirty_scan_errors)[:5]
+
+        # K18: reserve at least one of this round's N slots for the cursor
+        # walk (brand-new files) when the dirty set alone would otherwise
+        # consume the whole batch and at least one new file is waiting --
+        # otherwise a run of persistently-failing dirty files occupies
+        # every slot, every round, and a new file never gets its first try.
+        has_new_files = any(slug not in files_state for slug in sorted_slugs)
+        dirty_cap = budget - 1 if (has_new_files and len(dirty) >= budget and budget > 1) else budget
+        dirty_attempts = 0
+        for slug in dirty:
+            if aborted or budget <= 0 or dirty_attempts >= dirty_cap:
+                break
+            if _remaining(run) < _MIN_REMAINING_SECONDS:
+                reasons.append("budget_exhausted")
                 aborted = True
                 break
-        else:
-            cursor = i  # ran out of budget, or completed a full lap with none new
+            r, ab, c = _sync_file(client, key, project_name, slug, local_files[slug], fingerprint, run)
+            reasons.extend(r)
+            run["calls"] += c
+            budget -= 1
+            dirty_attempts += 1
+            if ab:
+                aborted = True
 
-    _, persist_reasons = _hook_state.update_state_at(
-        state_path,
-        lambda s, cursor=cursor, reconciled=reconciled: {**s, "cursor": cursor, "reconciled": reconciled},
-    )
-    reasons.extend(persist_reasons)
+        # -- cursor walk: not-yet-synced files, resuming where the last round
+        # stopped (an abort or a budget exhaustion), wrapping at the list's end --
+        if not aborted and n and budget > 0:
+            i = cursor
+            examined = 0
+            while examined < n and budget > 0:
+                slug = sorted_slugs[i]
+                i = (i + 1) % n
+                examined += 1
+                if slug in files_state:
+                    continue  # already synced & clean (or just handled above) -- free skip
+                if _remaining(run) < _MIN_REMAINING_SECONDS:
+                    reasons.append("budget_exhausted")
+                    cursor = (i - 1) % n  # resume AT this same file next time
+                    aborted = True
+                    break
+                r, ab, c = _sync_file(client, key, project_name, slug, local_files[slug], fingerprint, run)
+                reasons.extend(r)
+                run["calls"] += c
+                budget -= 1
+                if ab:
+                    cursor = (i - 1) % n  # resume AT the failing file next time
+                    aborted = True
+                    break
+            else:
+                cursor = i  # ran out of budget, or completed a full lap with none new
+        run["new_cursor"] = cursor
+    finally:
+        _release_run_lock(lock_fd)
 
-    run["calls"] = calls
-    if orphans_deleted:
-        run["extra"]["orphans_deleted"] = orphans_deleted
     final_reason = _hook_state.worst_reason(reasons)
     also = _hook_state.also_failed(reasons, final_reason)
     if also:
@@ -982,13 +1591,35 @@ def _collect(run):
 def _record(reason, started, run, work_left_behind):
     """Append this run to the ledger, within a budget. Never raises.
 
-    Nothing is persisted here beyond the ledger row itself -- see the
-    module docstring's A9-7 paragraph for why that is a deliberate
-    departure from handoff_sync.py's own ``_record`` (which persists
-    ``container_id`` AFTER ``record_run``, inside this same budgeted write,
-    and appends a follow-up row on a genuine failure to do so): every state
-    update this hook makes already happened inside ``_collect``, strictly
-    before this function is ever called.
+    K02 (post_implementation R1, ruling item 4): follows the SAME converged
+    ordering handoff_sync.py's own ``_record`` uses for anything persisted
+    at the end of a run -- ``record_run`` happens FIRST, and only AFTER
+    that does this same budgeted write attempt the round's cursor/
+    reconciled advance (``run["new_cursor"]`` / ``run["new_reconciled"]``,
+    set by ``_collect``), skipped entirely when nothing actually changed or
+    when the work thread was abandoned (``work_left_behind`` -- a thread
+    stuck mid-round never reached the line that set those, so trusting them
+    would persist a guess). The earlier revision did this persist
+    UNCONDITIONALLY inside ``_collect``, before the ledger row -- which
+    meant a steady-state round that touched NO files could still turn into
+    a reported ``timeout`` for the WHOLE round, because that one
+    unconditional ``update_state_at`` call took a blocking ``flock`` that
+    happened to be contended, consuming this round's entire 20s work
+    budget for a write that, had it even run, would not have changed a
+    single byte on disk. Per-file state (a file's own ``synced_at`` /
+    hash / fingerprint, a vanished file's entry clearing) is UNCHANGED by
+    this: those still happen inside ``_collect``, immediately, same as
+    always (C row: "先处理后推进").
+
+    A genuine failure to persist (``state_write_failed``) can no longer be
+    folded into the row already written -- it is reported as a SEPARATE
+    follow-up row, carrying the main row's own ``reason`` and
+    ``also_failed`` so a reader does not have to reconstruct what it would
+    otherwise bury (same shape as handoff_sync.py's own container_id
+    persist failure). A degraded lock (``lock_unavailable``) or a
+    corrupt-state read this very call just repaired, whose write still
+    landed, is NOT a failure (ruling item 4's last sentence) -- no
+    follow-up row either way.
     """
     elapsed_ms = int((time.monotonic() - started) * 1000)
     # A work thread abandoned mid-call never reaches the line that assigns
@@ -997,6 +1628,10 @@ def _record(reason, started, run, work_left_behind):
     calls = None if work_left_behind else run["calls"]
     cwd = run["cwd"]
     extra = dict(run["extra"]) or None
+    persist_cursor = not work_left_behind and (
+        run.get("new_cursor") != run.get("old_cursor")
+        or run.get("new_reconciled") != run.get("old_reconciled")
+    )
 
     def write():
         try:
@@ -1006,6 +1641,30 @@ def _record(reason, started, run, work_left_behind):
             )
         except Exception as exc:  # record_run does not raise by contract; the net under it
             print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
+        if not persist_cursor:
+            return
+        key = run.get("key")
+        if not key:  # defensive: persist_cursor can only be True once `key` is set
+            return
+        new_cursor = run.get("new_cursor", 0)
+        new_reconciled = bool(run.get("new_reconciled", False))
+
+        def _mutate(s, cursor=new_cursor, reconciled=new_reconciled):
+            return {**s, "cursor": cursor, "reconciled": reconciled}
+
+        _, persist_reasons = _hook_state.update_state_at(_memory_state_path(key), _mutate)
+        if "state_write_failed" not in persist_reasons:
+            return
+        try:
+            _hook_state.record_run(
+                HOOK, ok=False, reason="state_write_failed", elapsed_ms=0, calls=None, cwd=cwd,
+                extra={
+                    "detail": f"cursor/reconciled persist failed after this run ({reason})",
+                    "also_failed": list((extra or {}).get("also_failed") or []),
+                },
+            )
+        except Exception as exc:  # record_run does not raise by contract; the net under it
+            print(f"[{HOOK}] could not record state_write_failed: {exc!r}", file=sys.stderr)
 
     left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
     if left_behind:
@@ -1043,15 +1702,33 @@ def main():
 
     reason = "unknown"
     diagnostic = None
+    abnormal = False
     if left_behind:
         reason = "timeout"
         diagnostic = f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind"
+        abnormal = True
     elif "result" not in outcome:
         exc = outcome.get("error", RuntimeError("the worker ended without a result"))
         reason = _hook_state.reason_for_exception(exc)
         diagnostic = f"[{HOOK}] {reason}: {exc!r}"
+        abnormal = True
     else:
         reason = outcome["result"]
+
+    if abnormal:
+        # K02 (ruling item 3): _collect's OWN also_failed computation never
+        # ran (a timeout abandons the thread before its `return`; an
+        # uncaught exception skips straight past it) -- but run["reasons"]
+        # may already hold real failures from whatever this round DID
+        # finish before the timeout/exception (K02's whole point: those are
+        # written into `run` as they happen, not accumulated locally).
+        # Recomputed here from a SNAPSHOT of that list plus the scalar
+        # `reason` itself, mirroring session_inject._record's own snapshot
+        # precedent for the same "abandoned worker, finish the bookkeeping
+        # from the main thread instead" situation. Always set (even `[]`),
+        # per the ruling's own "空时也写" -- this row's `also_failed`
+        # presence says "this WAS computed", not "nothing else failed".
+        run["extra"]["also_failed"] = _hook_state.also_failed(list(run.get("reasons") or []) + [reason], reason)
 
     # _record (the ledger row for THIS run) runs BEFORE the diagnostic
     # print, not after (mirrors handoff_sync.py's R2-c05 / TASK-012's
