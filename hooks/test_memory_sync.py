@@ -24,8 +24,11 @@ Layers, matching how the hook itself is layered:
 Hermetic per the plugin's project lessons: the whole module runs under a
 throwaway HOME + NEXUS_HOOK_STATE_DIR (setUpModule), proxy env vars are
 scrubbed so loopback requests never go near a developer machine's
-cross-border proxy, and the module asserts the fake HOME is still empty on
-the way out.
+cross-border proxy, and on the way out the module asserts the fake HOME is
+still empty, the real ~/.nexus (if any) is structurally unchanged (names,
+sizes, mtimes -- not file content), and no `_hook_runner`-named worker
+thread is still alive (see setUpModule's own module cleanups, in the order
+they actually run, for why that order is itself load-bearing).
 """
 
 import glob
@@ -67,16 +70,39 @@ _REAL_NEXUS_DIR = os.path.join(_REAL_HOME, ".nexus")
 
 def _snapshot_real_nexus_dir():
     """``None`` when the real ``~/.nexus`` does not exist (the common case
-    on a throwaway box); otherwise its full recursive listing, as paths
-    relative to it, sorted. Read-only: this must never CREATE the
-    directory just to check it, or the check would produce the exact
-    leak it exists to catch."""
+    on a throwaway box); otherwise a sorted structural fingerprint of its
+    full recursive contents: every directory, as ``("dir", relative path)``,
+    and every file, as ``("file", relative path, size, mtime_ns)`` -- not
+    just a list of file names (F1, targeted review of the hygiene round,
+    2026-10-02): a bare name list misses a pre-existing file silently
+    REWRITTEN in place, and the ``_dirs`` this function used to walk past
+    without recording meant a new, still-empty directory was invisible
+    too. Still not a content hash -- two files that happen to collide on
+    (size, mtime_ns) would not be told apart -- but every shape this
+    module's own tests could plausibly produce (a brand new state file, a
+    rewritten one, a new ``.lock``, a new ``memory-sync/`` directory) now
+    changes the fingerprint. Read-only: this must never CREATE the
+    directory just to check it, or the check would produce the exact leak
+    it exists to catch."""
     if not os.path.isdir(_REAL_NEXUS_DIR):
         return None
     found = []
-    for base, _dirs, files in os.walk(_REAL_NEXUS_DIR):
+    for base, dirs, files in os.walk(_REAL_NEXUS_DIR):
+        for name in dirs:
+            found.append(("dir", os.path.relpath(os.path.join(base, name), _REAL_NEXUS_DIR)))
         for name in files:
-            found.append(os.path.relpath(os.path.join(base, name), _REAL_NEXUS_DIR))
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, _REAL_NEXUS_DIR)
+            try:
+                st = os.stat(full)
+                found.append(("file", rel, st.st_size, st.st_mtime_ns))
+            except OSError:
+                # Raced with something else touching the same file between
+                # os.walk listing it and this stat -- record the miss
+                # itself rather than let it crash setUpModule/cleanup; it
+                # still changes the fingerprint relative to a run where
+                # this never happened at all.
+                found.append(("file", rel, None, None))
     return sorted(found)
 
 
@@ -84,19 +110,40 @@ def _assert_real_nexus_dir_untouched(before):
     """H1: every hook test in this module runs under a throwaway HOME (see
     setUpModule) specifically so none of them ever needs to touch the
     developer's real ``~/.nexus`` -- but a worker thread abandoned past its
-    own test's work budget (timeout) keeps running, unobserved, after
-    tearDown restores the real HOME / NEXUS_HOOK_STATE_DIR (or deletes the
-    fake one): if that thread is still resolving `_hook_state.state_root()`
-    when it finally gets to the write it was stuck in, it resolves into
-    whatever those now point at, for real. Observed once in exactly this
-    form: a state file AND its `.lock` landed in the developer's real
-    `~/.nexus/hooks/memory-sync/`, created by a test whose OWN memory
-    directory lived under `/tmp`. The actual fix is making sure no thread
-    outlives its own test (see `_hang_point` / `_join_hung_worker` below);
-    this is the backstop that would have caught it regardless -- a STRICT
-    equality check, not merely "still empty", because the real ~/.nexus may
-    legitimately pre-exist on a developer's machine and this module must
-    leave it exactly as found, whichever way that cuts."""
+    own test's work budget (timeout) keeps running, unobserved, after this
+    module's own cleanups restore the real HOME / NEXUS_HOOK_STATE_DIR (or
+    delete the fake one): if that thread is still resolving
+    `_hook_state.state_root()` when it finally gets to the write it was
+    stuck in, it resolves into whatever those now point at, for real.
+    Observed once in exactly this form: a state file AND its `.lock`
+    landed in the developer's real `~/.nexus/hooks/memory-sync/`, created
+    by a test whose OWN memory directory lived under `/tmp`.
+
+    F1 (targeted review of the hygiene round, 2026-10-02) withdraws two
+    claims this docstring used to make. First, "this is the backstop that
+    would have caught it regardless": it could not have -- `setUpModule`
+    used to register this cleanup BEFORE `patcher.stop`, so by LIFO it
+    ran WHILE HOME / NEXUS_HOOK_STATE_DIR were still the fake, per-module
+    ones; any thread abandoned by a test in THIS module would still
+    resolve into the fake directory at the exact moment this check ran,
+    no matter how real its eventual write, so `after` could never differ
+    from `before` for that reason -- reproduced directly (a probe thread
+    named like a real abandoned worker, writing on a delay, against a
+    sandboxed HOME): the run reported OK and the write still landed.
+    `setUpModule` now registers this cleanup BEFORE `patcher.stop` is
+    registered, so it EXECUTES after (LIFO again) -- the real paths are
+    restored by the time this runs, which is the minimum required for it
+    to observe anything at all. Second, "a STRICT equality check": true
+    of what is compared, not of what it catches -- `_snapshot_real_nexus_dir`
+    fingerprints structure (names, sizes, mtimes), not content, and a
+    thread still asleep at this exact instant (the reordering narrows the
+    race, it does not close it) writes after this check has already run.
+    Neither claim is needed for this function to still be worth having:
+    it is a second, narrower net under the structural one -- see
+    `_assert_worker_threads_finished` below, which joins the named
+    threads directly and is what this module's own
+    `TestModuleCleanupOrdering` now pins as the one registered to run
+    first."""
     after = _snapshot_real_nexus_dir()
     if after != before:
         raise AssertionError(
@@ -128,6 +175,46 @@ def _assert_stderr_not_left_wrapped():
         )
 
 
+_LINGER_JOIN_SECONDS = 2.0  # comfortably above every _WORK_BUDGET_SECONDS this suite mocks (<=0.5s)
+
+
+def _assert_worker_threads_finished(context=""):
+    """H1 structural backstop (F1, targeted review of the hygiene round,
+    2026-10-02), independent of `_hang_point` / `_WriteCase._join_hung_worker`
+    below: those exist for tests that DELIBERATELY abandon a worker past
+    its own budget and know to reap it themselves, in a `finally`, before
+    their own assertions ever run. This is the net under that net -- for
+    a FUTURE test that starts one of `_hook_runner`'s named daemon
+    threads (`run_with_deadline` -> ``f"{HOOK}-work"``, `write_with_budget`
+    -> ``f"{HOOK}-ledger"``) and simply forgets to join it, which would
+    otherwise run on, unobserved, straight into whatever this module's
+    own cleanups do next -- the exact H1 incident shape
+    `_assert_real_nexus_dir_untouched` above describes, and the one this
+    function actually catches: a short join is long enough to confirm a
+    thread that has no business still running has, in fact, already
+    finished, but short enough that a genuine leak fails FAST rather than
+    stalling the run.
+
+    Registered twice: once as the LAST `addCleanup` in `_WriteCase.setUp`
+    (so it is the FIRST of that one test's own cleanups to run --
+    attributable to that specific test, and before its temp directory is
+    removed out from under a thread that might still be reading or
+    writing inside it), and once as a module cleanup, to catch anything
+    outside `_WriteCase` entirely. `context` names which registration is
+    reporting, so a failure says which test (or "the module") saw it."""
+    names = (f"{_MOD.HOOK}-work", f"{_MOD.HOOK}-ledger")
+    lingering = []
+    for name in names:
+        for t in threading.enumerate():
+            if t.name != name or t is threading.current_thread():
+                continue
+            t.join(_LINGER_JOIN_SECONDS)
+            if t.is_alive() and name not in lingering:
+                lingering.append(name)
+    if lingering:
+        raise AssertionError(f"worker thread(s) outlived their own test{context}: {lingering}")
+
+
 def setUpModule():
     real_nexus_before = _snapshot_real_nexus_dir()  # H1: before any patch touches HOME
     root = tempfile.mkdtemp(prefix="nexus-hooktest-")
@@ -139,19 +226,32 @@ def setUpModule():
     env.update(_NO_PROXY)
     patcher = mock.patch.dict(os.environ, env, clear=True)
     patcher.start()
+    # F1 (targeted review of the hygiene round, 2026-10-02): registered
+    # BEFORE `patcher.stop` -- not after, as this used to read -- so that
+    # by LIFO it EXECUTES after `patcher.stop` restores the real HOME /
+    # NEXUS_HOOK_STATE_DIR. Registering it after `patcher.stop` (the
+    # previous order) made it run WHILE those were still the fake,
+    # per-module ones, so it compared two snapshots of a directory no
+    # test-abandoned thread could have reached yet by construction -- see
+    # `_assert_real_nexus_dir_untouched`'s own docstring for the withdrawn
+    # claims that ordering bug invalidated.
+    unittest.addModuleCleanup(_assert_real_nexus_dir_untouched, real_nexus_before)
     unittest.addModuleCleanup(patcher.stop)
-    # Registration order matters (LIFO, see test_handoff_sync.py's own
-    # TestModuleCleanupOrdering for the mechanism): the stderr check is
-    # registered BEFORE the home check, so the home-leak report -- the more
-    # actionable of the two -- is the one that survives if both ever fail on
-    # the same run.
+    # Registration order matters from here down (LIFO, see
+    # test_handoff_sync.py's own TestModuleCleanupOrdering for the
+    # mechanism, and this file's own copy below): the stderr check is
+    # registered BEFORE the home check, so the home-leak report -- the
+    # more actionable of the two -- is the one that survives if both ever
+    # fail on the same run.
     unittest.addModuleCleanup(_assert_stderr_not_left_wrapped)
     unittest.addModuleCleanup(_assert_home_untouched, home)  # LIFO: this runs second
-    # H1: registered LAST, so it runs FIRST of all three and is the one that
-    # survives if more than one cleanup fails on the same run -- writing
-    # into the developer's REAL home is the most severe of the three shapes
-    # this module guards against.
-    unittest.addModuleCleanup(_assert_real_nexus_dir_untouched, real_nexus_before)
+    # F1: registered LAST of all four, so it runs FIRST and is the one
+    # that survives if more than one cleanup fails on the same run -- a
+    # worker thread still alive is the most direct, most actionable
+    # signal of the four (it is also the mechanism by which the other
+    # three would ever fire at all), and unlike the three above it does
+    # not depend on `patcher.stop` having run yet either way.
+    unittest.addModuleCleanup(_assert_worker_threads_finished)
 
 
 def _load_module(path, name):
@@ -673,6 +773,16 @@ class _WriteCase(unittest.TestCase):
         self.addCleanup(self.backend.close)
         self._patch(mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": self.state_dir}))
         self._patch(mock.patch.object(_identity, "container_id", return_value=CONTAINER))
+        # F1 (targeted review of the hygiene round, 2026-10-02): the LAST
+        # cleanup registered here, so LIFO makes it the FIRST to run --
+        # before every patch above is undone and before self.tmp is
+        # removed, so a lingering thread is caught attributed to THIS
+        # test, not laundered into whatever runs next. See
+        # `_assert_worker_threads_finished`'s own docstring; this is its
+        # per-test registration -- `_join_hung_worker` below is unrelated
+        # (that one is for a test that deliberately abandons a thread and
+        # already knows to reap it before its own assertions run).
+        self.addCleanup(_assert_worker_threads_finished, f" ({self.id()})")
 
     def _patch(self, patcher):
         patcher.start()
@@ -4498,8 +4608,12 @@ class TestModuleCleanupOrdering(unittest.TestCase):
     """Mirrors test_handoff_sync.py's / test_session_capture.py's own class
     of the same name: unittest.case.doModuleCleanups runs every registered
     module cleanup LIFO but re-raises only the FIRST exception it collects,
-    silently dropping the rest -- so this file's own setUpModule must
-    register _assert_stderr_not_left_wrapped BEFORE _assert_home_untouched."""
+    silently dropping the rest -- so this file's own setUpModule must get
+    all four of its module cleanups' relative order right, not just make
+    sure each one is present. F1 (targeted review of the hygiene round,
+    2026-10-02) added the second and third checks below after a real-nexus
+    reproduction found the previous order let `_assert_real_nexus_dir_untouched`
+    run BEFORE `patcher.stop`, so it could never see a real leak."""
 
     def test_the_home_leak_check_is_registered_after_the_stderr_check(self):
         import inspect
@@ -4507,6 +4621,35 @@ class TestModuleCleanupOrdering(unittest.TestCase):
         stderr_pos = source.index("_assert_stderr_not_left_wrapped")
         home_pos = source.index("_assert_home_untouched, home")
         self.assertLess(stderr_pos, home_pos)
+
+    def test_the_real_nexus_dir_check_is_registered_before_patcher_stop(self):
+        """F1: so it EXECUTES after `patcher.stop` (LIFO) and can actually
+        observe the real HOME / NEXUS_HOOK_STATE_DIR it is named for --
+        the exact ordering bug the targeted review found, reproduced
+        against a sandboxed HOME: with the previous order, a thread
+        deliberately left unreaped still wrote its state file + `.lock`
+        into the (sandboxed) real `~/.nexus/hooks/memory-sync/`, and the
+        whole run still reported OK."""
+        import inspect
+        source = inspect.getsource(setUpModule)
+        real_nexus_pos = source.index("_assert_real_nexus_dir_untouched, real_nexus_before")
+        patcher_stop_pos = source.index("addModuleCleanup(patcher.stop)")
+        self.assertLess(real_nexus_pos, patcher_stop_pos)
+
+    def test_the_worker_thread_check_is_registered_last(self):
+        """F1: registered after all three other module cleanups, so it
+        EXECUTES first (LIFO) and is the one `doModuleCleanups` re-raises
+        if more than one fails on the same run -- the most direct,
+        structural signal of the four, and the one this module's own
+        reproduction turns red for a thread the other three cannot catch
+        at all (a leak that resolves its write while still inside the
+        fake, per-module HOME -- harmless to the real one, but a bug all
+        the same)."""
+        import inspect
+        source = inspect.getsource(setUpModule)
+        home_pos = source.index("_assert_home_untouched, home")
+        worker_pos = source.index("addModuleCleanup(_assert_worker_threads_finished)")
+        self.assertLess(home_pos, worker_pos)
 
 
 if __name__ == "__main__":
