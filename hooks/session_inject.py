@@ -239,7 +239,7 @@ _USER_AGENT = "nexus-sessionstart-hook/0.3"
 # invisible in every other way, and a hook not named here could stop for good
 # without anyone noticing. New SessionEnd hooks add themselves; a test walks
 # hooks.json to make sure they do.
-_EXPECTED_LEDGERS = ("session-capture", "handoff-sync")
+_EXPECTED_LEDGERS = ("session-capture", "handoff-sync", "memory-sync")
 # State key (ruling 4, TASK-005 R1 fix round, R1-c21): which of
 # _EXPECTED_LEDGERS this project has already been told about. A plugin
 # upgrade that adds a new SessionEnd hook here (handoff-sync was the first)

@@ -1662,15 +1662,21 @@ class _ReportCase(_LedgerCase):
     """A project whose session-inject ledger already holds one clean run, so
     this is not the very first session start (a missing capture ledger is only
     news after a SessionEnd has had the chance to fire). handoff-sync (change
-    2 TASK-005, the second _EXPECTED_LEDGERS member) is seeded clean too, so
-    existing tests that assert quiet stay quiet by default; a test that wants
-    to exercise handoff-sync's own reporting overwrites this with its own
-    _write_ledger("handoff-sync", ...) call."""
+    2 TASK-005, the second _EXPECTED_LEDGERS member) and memory-sync (change 2
+    TASK-006, the third) are each seeded clean too, so existing tests that
+    assert quiet stay quiet by default; a test that wants to exercise one of
+    them reporting overwrites this with its own _write_ledger(...) call.
+    Without this, every test here that calls _system_message() more than
+    once would start seeing "memory-sync has never recorded a run" from the
+    SECOND call onward: the grace period (A9-9) only silences a newly
+    _EXPECTED_LEDGERS member for the one SessionStart before it is first
+    persisted into seen_expected_ledgers, not forever."""
 
     def setUp(self):
         super().setUp()
         self._write_ledger("session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")])
         self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
+        self._write_ledger("memory-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="memory-sync")])
 
     def _write_ledger(self, hook, entries):
         path = _hook_state.ledger_path(hook, self.cwd)
