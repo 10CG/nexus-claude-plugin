@@ -437,15 +437,39 @@ def state_path(name, cwd):
     return os.path.join(project_dir(cwd), f"{name}.state.json")
 
 
-def read_state(name, cwd):
-    """Return ``(state, reasons)``.
+def state_path_at(relative):
+    """A state file path given relative to ``state_root()`` directly,
+    bypassing the ``(name, cwd)`` -> ``project_dir(cwd)`` keying every OTHER
+    state path in this module goes through.
+
+    X1 corollary (owner 2026-10-01): memory-sync's own state file is keyed
+    by the Claude Code memory-directory key (``_identity.memory_dir_key``),
+    not by ``project_dir``'s basename-derived project slug -- two working
+    directories that happen to share a basename (two clones or worktrees
+    both named ``nexus``) would otherwise read and write the exact SAME
+    state file through the normal keying, each treating the other's
+    synced/cursor bookkeeping as its own, and -- worse -- each reading the
+    OTHER's vanished-locally files as its OWN vanished files and deleting
+    them server-side. ``relative`` is joined under ``state_root()`` exactly
+    as given (still obeying ``NEXUS_HOOK_STATE_DIR``), including any
+    subdirectory the caller wants, e.g. ``"memory-sync/<memory dir key>.json"``.
+    """
+    return os.path.join(state_root(), relative)
+
+
+def _read_state_file(path):
+    """``read_state``, for a path already resolved. Shared by the
+    ``(name, cwd)``-keyed ``read_state`` and the explicit-path
+    ``read_state_at`` (X1 corollary) so the two keying schemes cannot drift
+    into different corruption-handling behaviour -- the same split
+    ``read_ledger`` / ``_read_ledger_file`` already uses, one level up.
 
     A missing file is a first run, not a problem. A corrupt one rebuilds from
     empty and reports ``unknown``, because the hook is about to behave as
     though it had never synced anything.
     """
     try:
-        with open(state_path(name, cwd), encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return {}, []
@@ -456,54 +480,71 @@ def read_state(name, cwd):
     return data, []
 
 
+def read_state(name, cwd):
+    """Return ``(state, reasons)``. See ``_read_state_file`` for the shape."""
+    return _read_state_file(state_path(name, cwd))
+
+
+def read_state_at(path):
+    """``read_state``, for an explicit path (``state_path_at``) instead of
+    ``(name, cwd)`` keying -- see ``state_path_at``'s own docstring."""
+    return _read_state_file(path)
+
+
 def state_exists(name, cwd):
     """Whether state has ever been written — see ``identity_drift``."""
     return os.path.exists(state_path(name, cwd))
 
 
-def write_state(name, data, cwd):
-    """Atomically write state under an exclusive lock. Returns reasons.
+def _write_state_file(path, data):
+    """``write_state``, for a path already resolved. Shared with
+    ``write_state_at`` for the same reason ``_read_state_file`` is.
 
     Returns rather than raises on I/O failure (``state_write_failed``): see the
     module docstring for why propagating is the quietest of the options here.
     """
     reasons = []
-    path = state_path(name, cwd)
     if not isinstance(data, dict):
-        print(f"[{name}] refusing to write {type(data).__name__} as state", file=sys.stderr)
+        print(f"[{path}] refusing to write {type(data).__name__} as state", file=sys.stderr)
         return ["state_write_failed"]
     try:
         with _locked(path, reasons):
             _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
     except OSError as exc:
-        print(f"[{name}] could not write state: {exc}", file=sys.stderr)
+        print(f"[{path}] could not write state: {exc}", file=sys.stderr)
         reasons.append("state_write_failed")
     return reasons
 
 
-def update_state(name, cwd, mutate):
-    """Read-modify-write under one lock. Returns ``(new_state, reasons)``.
+def write_state(name, data, cwd):
+    """Atomically write state under an exclusive lock. Returns reasons."""
+    return _write_state_file(state_path(name, cwd), data)
 
-    The primitive every hook actually needs: ``read_state`` then ``write_state``
-    leaves the gap between them unprotected, and two runs racing there lose one
-    another's updates while each individual write looks perfectly atomic.
+
+def write_state_at(path, data):
+    """``write_state``, for an explicit path (``state_path_at``)."""
+    return _write_state_file(path, data)
+
+
+def _update_state_file(path, mutate):
+    """``update_state``, for a path already resolved. Shared with
+    ``update_state_at`` for the same reason ``_read_state_file`` is.
 
     ``mutate`` receives the current state dict and returns the new one.
     """
     reasons = []
-    path = state_path(name, cwd)
     current = {}
     new = {}
     try:
         with _locked(path, reasons):
-            current, read_reasons = read_state(name, cwd)
+            current, read_reasons = _read_state_file(path)
             reasons.extend(read_reasons)
             try:
                 new = mutate(dict(current))
             except Exception as exc:  # noqa: BLE001 - caller bug, not ours
                 # Propagating would reach the hooks' blanket handler and delete
                 # the run, which is the failure C3 was about.
-                print(f"[{name}] state mutation raised: {exc!r}", file=sys.stderr)
+                print(f"[{path}] state mutation raised: {exc!r}", file=sys.stderr)
                 return current, reasons + ["unknown"]
             if not isinstance(new, dict):
                 # `lambda s: s.update(...)` returns None. Writing it would put
@@ -512,18 +553,33 @@ def update_state(name, cwd, mutate):
                 # clean and the damage surfaced as an unattributable `unknown`
                 # on the NEXT run.
                 print(
-                    f"[{name}] state mutation returned {type(new).__name__}, "
+                    f"[{path}] state mutation returned {type(new).__name__}, "
                     f"expected dict; state left unchanged",
                     file=sys.stderr,
                 )
                 return current, reasons + ["state_write_failed"]
             _atomic_write(path, json.dumps(new, ensure_ascii=False, indent=2))
     except OSError as exc:
-        print(f"[{name}] could not update state: {exc}", file=sys.stderr)
+        print(f"[{path}] could not update state: {exc}", file=sys.stderr)
         reasons.append("state_write_failed")
         # The caller gets what is actually on disk, not the update it wanted.
         return current, reasons
     return new, reasons
+
+
+def update_state(name, cwd, mutate):
+    """Read-modify-write under one lock. Returns ``(new_state, reasons)``.
+
+    The primitive every hook actually needs: ``read_state`` then ``write_state``
+    leaves the gap between them unprotected, and two runs racing there lose one
+    another's updates while each individual write looks perfectly atomic.
+    """
+    return _update_state_file(state_path(name, cwd), mutate)
+
+
+def update_state_at(path, mutate):
+    """``update_state``, for an explicit path (``state_path_at``)."""
+    return _update_state_file(path, mutate)
 
 
 def identity_drift(previous, current, state_existed):

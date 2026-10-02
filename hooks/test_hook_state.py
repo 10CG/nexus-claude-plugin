@@ -582,6 +582,70 @@ class TestUpdateState(_TempStateDir):
         self.assertEqual(data, {"cursor": 3}, "caller must see what is on disk")
 
 
+class TestExplicitPathState(_TempStateDir):
+    """X1 corollary (owner 2026-10-01): memory-sync's state file is keyed by
+    the memory-dir key, not by project_dir(cwd)'s basename-derived slug --
+    the *_at functions below bypass that keying entirely. Behaviour must be
+    identical to the (name, cwd)-keyed functions; only the path source
+    differs (shared bodies, _read_state_file / _write_state_file /
+    _update_state_file)."""
+
+    def _path(self, *parts):
+        return _hook_state.state_path_at(os.path.join(*parts))
+
+    def test_state_path_at_is_rooted_under_the_overridable_state_root(self):
+        path = _hook_state.state_path_at("memory-sync/-home-dev-nexus.json")
+        self.assertEqual(path, os.path.join(self.root, "memory-sync/-home-dev-nexus.json"))
+
+    def test_round_trips_like_the_name_cwd_api(self):
+        path = self._path("memory-sync", "-x-y.json")
+        self.assertEqual(_hook_state.read_state_at(path), ({}, []))
+        reasons = _hook_state.write_state_at(path, {"cursor": 1})
+        self.assertEqual(reasons, [])
+        self.assertEqual(_hook_state.read_state_at(path), ({"cursor": 1}, []))
+
+    def test_update_state_at_locks_the_read_modify_write(self):
+        path = self._path("memory-sync", "-x-y.json")
+        new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 7})
+        self.assertEqual((new, reasons), ({"cursor": 7}, []))
+        new, _ = _hook_state.update_state_at(path, lambda s: {**s, "n": s.get("cursor", 0) + 1})
+        self.assertEqual(new, {"cursor": 7, "n": 8})
+
+    def test_a_corrupt_file_rebuilds_from_empty_and_reports_unknown(self):
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(_hook_state.read_state_at(path), ({}, ["unknown"]))
+
+    def test_two_cwds_sharing_a_basename_get_distinct_paths(self):
+        """The exact X1 corollary failure shape: two worktrees both named
+        "nexus" must not resolve to the same state file the way
+        state_path(name, cwd) -- keyed by project_dir's basename slug --
+        would."""
+        key_a = "-home-dev-nexus"
+        key_b = "-home-dev-worktrees-nexus"
+        path_a = _hook_state.state_path_at(f"memory-sync/{key_a}.json")
+        path_b = _hook_state.state_path_at(f"memory-sync/{key_b}.json")
+        self.assertNotEqual(path_a, path_b)
+        _hook_state.write_state_at(path_a, {"files": {"f1": 1}})
+        _hook_state.write_state_at(path_b, {"files": {"f1": 2}})
+        self.assertEqual(_hook_state.read_state_at(path_a)[0], {"files": {"f1": 1}})
+        self.assertEqual(_hook_state.read_state_at(path_b)[0], {"files": {"f1": 2}})
+
+    def test_write_failure_returns_state_write_failed(self):
+        path = self._path("memory-sync", "-x-y.json")
+        with mock.patch.object(_hook_state, "_atomic_write", side_effect=OSError("read-only fs")):
+            reasons = _hook_state.write_state_at(path, {"cursor": 1})
+        self.assertEqual(reasons, ["state_write_failed"])
+
+    def test_refuses_a_non_dict(self):
+        path = self._path("memory-sync", "-x-y.json")
+        with mock.patch("sys.stderr"):
+            reasons = _hook_state.write_state_at(path, ["not", "a", "dict"])
+        self.assertEqual(reasons, ["state_write_failed"])
+
+
 class TestStateWriteFailure(_TempStateDir):
     def test_write_state_returns_a_reason_instead_of_raising(self):
         """Propagating here is the quietest option, not the loudest.
