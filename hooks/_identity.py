@@ -184,6 +184,53 @@ def project_root(cwd):
     return _resolved_root(cwd)
 
 
+_NON_ALNUM_ASCII_RE = re.compile(r"[^A-Za-z0-9]")
+
+
+def memory_dir_key(cwd):
+    """``(key, degraded)``: the Claude Code project-directory key for ``cwd``'s
+    git toplevel, and whether it is a guess.
+
+    Claude Code itself derives this key from a project's absolute path when
+    it names that project's directory under ``<config dir>/projects/``:
+    every character that is not an ASCII letter or digit becomes ``-``
+    (observed: ``/home/dev/nexus`` -> ``-home-dev-nexus``). X1 (owner
+    2026-10-01) reuses this SAME key for three things that must never drift
+    apart from each other or from the directory Claude Code itself created:
+    the on-disk memory directory a hook reads ``*.md`` files from
+    (``<config dir>/projects/<key>/memory/``), the ``external_id`` prefix
+    those files are written to the server under (``<key>/<slug>``, so a
+    hook's own orphan reconciliation can tell its rows apart from every
+    other project's), and the local state file name that tracks what has
+    been synced. If any of the three were derived differently, a project's
+    own rows would silently stop lining up with its own files -- the same
+    mass-deletion shape ``project_identity``'s own docstring warns about,
+    one level up.
+
+    Derived from ``project_root(cwd)`` (the git toplevel's absolute path, via
+    the same single memoised git call ``project_identity`` and
+    ``project_root`` already share -- Amendment A6-4), never from ``cwd``
+    directly: running the hook from a subdirectory must resolve the same key
+    as running it from the repository root. Falls back to ``cwd`` itself
+    when git could not answer (same fallback shape as ``project_root``);
+    ``degraded`` is True in that case and a writer must treat it the same
+    way ``project_identity``'s own ``degraded`` is treated -- refuse to
+    write under a guessed key, never guess.
+
+    Deliberately NOT ``normalize_slug``: that function lowercases and strips
+    leading/trailing ``-``, the right shape for a short human-facing slug
+    but the wrong one here -- Claude Code's own directory name preserves
+    case, and a leading ``-`` is exactly what a path starting with ``/``
+    produces (``/home/dev/nexus`` has one). Reusing ``normalize_slug`` would
+    compute a key that does not match the directory Claude Code actually
+    created on disk, and the whole point of this function is to match it.
+    """
+    toplevel, degraded = _resolved_root(cwd)
+    path = toplevel if toplevel else cwd
+    key = _NON_ALNUM_ASCII_RE.sub("-", os.path.abspath(path))
+    return key, degraded
+
+
 def project_slug(cwd):
     """Derive the project slug: git toplevel basename, else cwd basename.
 

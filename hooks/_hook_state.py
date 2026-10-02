@@ -215,6 +215,49 @@ def worst_reason(reasons):
     return reasons[0]
 
 
+def also_failed(reasons, chosen):
+    """Other FAILURE-class reasons this round produced besides ``chosen``
+    (the scalar ``worst_reason(reasons)`` already picked for the ledger
+    entry's own ``reason`` field), deduplicated, in first-seen order.
+
+    Amendment A9-20 (owner 2026-10-01): a ledger entry holds one scalar, so
+    when a round produces more than one failure -- ``dedup_merged`` next to
+    an ``http_error`` hit on a LATER file, say -- ``worst_reason``'s
+    priority table picks one of them and the rest simply vanish from the
+    record. That is tolerable for a transient condition the NEXT run will
+    reproduce on its own (another ``http_error`` is still an ``http_error``
+    next time); it is not tolerable for ``dedup_merged`` / ``orphans_deleted``,
+    each a ONE-TIME, DESTRUCTIVE fact about this exact run -- the duplicate
+    or orphaned rows this hook just soft-deleted will not be there to
+    merge or delete again, so losing either to a same-run priority
+    collision means it is never reported at all, not even late. Recording
+    the full set alongside the scalar is what lets a reporter read a row
+    whose own ``reason`` is something else entirely and still surface it
+    (memory-sync's own first use is its ``orphans_deleted``; session_inject
+    and handoff_sync adopt the same field for their own buried reasons --
+    ``identity_changed``, ``dedup_merged`` -- in a later task; this
+    function is generic so both can share it rather than each growing its
+    own).
+
+    Only FAILURE-class reasons qualify: a skip (``unchanged``, ``not_owner``,
+    ...) sitting next to a real failure is already correctly silent on its
+    own, and listing it here would turn ``also_failed`` into a second,
+    uncurated reason dump nobody asked for. ``chosen`` itself is excluded
+    even where it also appears in ``reasons`` (it is already the entry's own
+    ``reason``; repeating it here says nothing new). A bare string for
+    ``reasons`` is accepted the same way ``worst_reason`` accepts one, for
+    the same reason: iterating a string character by character is the one
+    failure mode a type check here is cheap to rule out.
+    """
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    seen = []
+    for reason in reasons or []:
+        if reason and reason != chosen and is_failure_reason(reason) and reason not in seen:
+            seen.append(reason)
+    return seen
+
+
 def state_root():
     """Base directory for ledgers and state, overridable for tests."""
     return os.path.expanduser(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR)

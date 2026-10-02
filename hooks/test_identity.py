@@ -392,6 +392,101 @@ class TestProjectRoot(unittest.TestCase):
             self.assertEqual(_identity.project_identity(plain), ("notarepo", False))
 
 
+class TestMemoryDirKey(unittest.TestCase):
+    """X1 (owner 2026-10-01): the Claude Code project-directory key, shared
+    by memory_sync's external_id prefix, its state file name, and the
+    on-disk memory directory it reads from."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_sanitizes_every_non_alnum_ascii_character(self):
+        """The two worked examples from the owner ruling: a plain path, and
+        one that already contains dashes of its own (so the sanitizer must
+        not try to collapse or dedupe them -- Claude Code's own directory
+        names do not)."""
+        with mock.patch.object(_identity, "_resolved_root", return_value=("/home/dev/nexus", False)):
+            self.assertEqual(_identity.memory_dir_key("/irrelevant"), ("-home-dev-nexus", False))
+        with mock.patch.object(
+            _identity, "_resolved_root",
+            return_value=("/tmp/claude-1000/-home-dev-Aether-x", False),
+        ):
+            self.assertEqual(
+                _identity.memory_dir_key("/irrelevant"),
+                ("-tmp-claude-1000--home-dev-Aether-x", False),
+            )
+
+    def test_case_is_preserved_unlike_normalize_slug(self):
+        """Claude Code's own directory name is not lowercased; reusing
+        normalize_slug here would compute a key that does not match the
+        directory Claude Code actually created on disk."""
+        with mock.patch.object(_identity, "_resolved_root", return_value=("/home/dev/MyRepo", False)):
+            key, _ = _identity.memory_dir_key("/irrelevant")
+        self.assertEqual(key, "-home-dev-MyRepo")
+
+    def test_a_subdirectory_resolves_the_same_key_as_the_toplevel(self):
+        """The guard behind the orphan reconciliation: a hook started from a
+        subdirectory must key its external_id prefix and its on-disk memory
+        directory exactly like one started from the repository root."""
+        repo = os.path.join(self.tmp.name, "therepo")
+        sub = os.path.join(repo, "deep", "nested")
+        os.makedirs(sub)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True):
+            from_sub = _identity.memory_dir_key(sub)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True):
+            from_root = _identity.memory_dir_key(repo)
+        self.assertEqual(from_sub, from_root)
+        self.assertTrue(from_sub[0].endswith("-therepo"), from_sub)
+
+    def test_falls_back_to_cwd_and_reports_degraded(self):
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
+            key, degraded = _identity.memory_dir_key(plain)
+        self.assertTrue(degraded)
+        self.assertEqual(key, _identity._NON_ALNUM_ASCII_RE.sub("-", plain))
+
+    def test_not_a_repo_falls_back_to_cwd_not_degraded(self):
+        plain = os.path.join(self.tmp.name, "NotARepo")
+        os.makedirs(plain)
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True):
+            key, degraded = _identity.memory_dir_key(plain)
+        self.assertFalse(degraded)
+        self.assertEqual(key, _identity._NON_ALNUM_ASCII_RE.sub("-", plain))
+
+    def test_shares_the_one_git_call_with_project_root(self):
+        """Calling this for a cwd already asked about by project_root (or
+        project_identity) must cost zero extra subprocesses -- same cache,
+        same Amendment A6-4 guarantee."""
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
+                mock.patch("subprocess.run", return_value=done) as run:
+            _identity.project_root("/x/therepo/a")
+            self.assertEqual(run.call_count, 1)
+            key, degraded = _identity.memory_dir_key("/x/therepo/a")
+            self.assertEqual(run.call_count, 1)
+        self.assertEqual((key, degraded), ("-x-therepo", False))
+
+    def test_two_keys_where_one_is_a_string_prefix_of_the_other_stay_distinct(self):
+        """The exact machine-observed collision shape X1 exists to prevent
+        (-home-dev-nexus / -home-dev-nexus-packages-nexus-claude-plugin):
+        this function itself does not dedupe anything, so the two keys
+        below are never equal and neither is a prefix match without the
+        caller also checking the trailing '/' X1 requires."""
+        with mock.patch.object(_identity, "_resolved_root", return_value=("/home/dev/nexus", False)):
+            outer, _ = _identity.memory_dir_key("/irrelevant")
+        with mock.patch.object(
+            _identity, "_resolved_root",
+            return_value=("/home/dev/nexus/packages/nexus-claude-plugin", False),
+        ):
+            inner, _ = _identity.memory_dir_key("/irrelevant")
+        self.assertNotEqual(outer, inner)
+        self.assertTrue(inner.startswith(outer))  # the dangerous property X1's '/' guards against
+
+
 class TestCurrentBranch(unittest.TestCase):
     """TASK-005: session_capture.py and session_inject.py each carried a
     byte-identical copy of this derivation until it moved here."""

@@ -723,6 +723,48 @@ class TestWorstReason(_TempStateDir):
         )
 
 
+class TestAlsoFailed(unittest.TestCase):
+    """A9-20's new shared helper (memory-sync, TASK-006, is its first
+    caller): what worst_reason's single-scalar collapse would otherwise
+    bury, recovered for a ledger entry's own extra['also_failed']."""
+
+    def test_the_reason_worst_reason_buried_comes_back(self):
+        reasons = ["dedup_merged", "http_error"]
+        chosen = _hook_state.worst_reason(reasons)
+        self.assertEqual(chosen, "http_error")  # priority table beats dedup_merged
+        self.assertEqual(_hook_state.also_failed(reasons, chosen), ["dedup_merged"])
+
+    def test_the_chosen_reason_is_never_repeated_even_if_it_recurs(self):
+        reasons = ["http_error", "dedup_merged", "http_error"]
+        self.assertEqual(_hook_state.also_failed(reasons, "http_error"), ["dedup_merged"])
+
+    def test_skip_reasons_are_never_included(self):
+        """A skip sitting next to a real failure is already correctly
+        silent; also_failed must not turn into a second, uncurated dump of
+        everything that happened this round."""
+        reasons = ["unchanged", "not_owner", "http_error"]
+        self.assertEqual(_hook_state.also_failed(reasons, "http_error"), [])
+
+    def test_duplicates_are_deduplicated_in_first_seen_order(self):
+        reasons = ["orphan_guard", "rejected_422", "orphan_guard", "timeout"]
+        chosen = _hook_state.worst_reason(reasons)
+        self.assertEqual(chosen, "timeout")
+        self.assertEqual(
+            _hook_state.also_failed(reasons, chosen), ["orphan_guard", "rejected_422"]
+        )
+
+    def test_a_single_reason_run_has_nothing_also_failed(self):
+        self.assertEqual(_hook_state.also_failed(["unchanged"], "unchanged"), [])
+        self.assertEqual(_hook_state.also_failed(["http_error"], "http_error"), [])
+
+    def test_empty_and_none_are_empty(self):
+        self.assertEqual(_hook_state.also_failed([], "unknown"), [])
+        self.assertEqual(_hook_state.also_failed(None, "unknown"), [])
+
+    def test_a_bare_string_is_not_iterated_per_character(self):
+        self.assertEqual(_hook_state.also_failed("timeout", "unknown"), ["timeout"])
+
+
 def _http_error(code):
     return urllib.error.HTTPError("https://nexus.example/v1/x", code, "msg", {}, None)
 
