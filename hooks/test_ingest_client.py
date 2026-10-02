@@ -833,6 +833,72 @@ class TestDeleteWriteStatus(_ClientCase):
         self.assertEqual(out.reason, "timeout")
 
 
+class TestDecidedStatus(_ClientCase):
+    """R4-C4 (memory_sync post_implementation R4): a LOOKUP-phase failure
+    (``_refused`` on the lookup itself, "2xx but not a memory list",
+    ``filter_suspect``) never reaches ``upsert``'s/``delete``'s own write
+    call at all, so ``write_status`` -- deliberately scoped to "the write
+    call's own response" (R2-C04/R3-T06, and ``_upsert_retrying_404``'s
+    own 404-retry judgment in memory_sync.py depends on exactly that
+    narrow meaning) -- stays ``None`` forever for this whole class of
+    failure. ``decided_status`` is the status of whichever call actually
+    decided the outcome, lookup included; ``_lookup`` sets it explicitly
+    right before each of its own three failure returns, never as a
+    fallback computed from ``status`` at read time (that was R2-C04's own
+    lesson one field over: ``status`` is the last call SEEN on an
+    outcome, which a dedup DELETE or the lookup's own GET can leave stale
+    once the real decider gets no response at all)."""
+
+    def test_a_refused_lookup_sets_decided_status_but_not_write_status(self):
+        self.backend.reply(500, {"detail": "boom"})
+        out = self.client().upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "http_error")
+        self.assertEqual(out.decided_status, 500)
+        self.assertIsNone(out.write_status)
+
+    def test_a_2xx_non_memory_list_lookup_sets_decided_status(self):
+        self.backend.reply(200, {"not": "a memory list"})
+        out = self.client().upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "http_error")
+        self.assertEqual(out.decided_status, 200)
+        self.assertIsNone(out.write_status)
+
+    def test_a_filter_suspect_lookup_sets_decided_status(self):
+        self.backend.reply(200, _page(_row("someone-elses", content_hash="x")))
+        out = self.client().delete("fact", "s")
+        self.assertEqual(out.reason, "filter_suspect")
+        self.assertEqual(out.decided_status, 200)
+        self.assertIsNone(out.write_status)
+
+    def test_a_transport_failure_on_the_lookup_itself_leaves_decided_status_none(self):
+        """No response at all (never reaches `_refused` et al.): nothing
+        decided this outcome with a real status to report."""
+
+        def flaky_opener(req, timeout=None):
+            raise TimeoutError("the lookup call itself timed out")
+
+        client = _ingest_client.IngestClient(self.backend.url, "", USER, CONTAINER, HOOK, opener=flaky_opener)
+        out = client.upsert("fact", "s", "c", {})
+        self.assertEqual(out.reason, "timeout")
+        self.assertIsNone(out.decided_status)
+
+    def test_a_write_failure_still_mirrors_into_decided_status(self):
+        """The write call deciding the outcome is unaffected -- write_status
+        and decided_status agree, same as before this field existed."""
+        self.backend.reply(200, _page()).reply(422, {"detail": "nope"})
+        out = self.client().upsert("fact", "s", "c", {})
+        self.assertEqual(out.write_status, 422)
+        self.assertEqual(out.decided_status, 422)
+
+    def test_a_delete_row_failure_still_mirrors_into_decided_status(self):
+        a = _row("s", content_hash="x", row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        b = _row("s", content_hash="x", row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(a, b)).reply(204, None).reply(422, {"detail": "nope"})
+        out = self.client().delete("fact", "s")
+        self.assertEqual(out.write_status, 422)
+        self.assertEqual(out.decided_status, 422)
+
+
 class TestContract(unittest.TestCase):
     def test_every_reason_this_module_emits_is_in_the_tables(self):
         import re

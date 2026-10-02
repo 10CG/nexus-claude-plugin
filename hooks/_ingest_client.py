@@ -199,6 +199,23 @@ class Outcome:
         # `None` when the write call never got a response at all (a
         # transport failure/timeout), distinct from a real 404.
         self.write_status = None
+        # R4-C4 (memory_sync post_implementation R4): the status of
+        # whichever call actually DECIDED this outcome -- a LOOKUP's own
+        # GET when the lookup itself is what failed (`_refused`, "2xx but
+        # not a memory list", `filter_suspect` -- none of which ever reach
+        # a write call at all), or the SAME value as `write_status` when a
+        # write (`upsert`'s own POST/PATCH) or `_delete_row` is what
+        # decided it. `write_status` itself keeps its own narrower,
+        # unchanged meaning ("the write call's own response") --
+        # `_upsert_retrying_404` depends on exactly that narrow meaning for
+        # its own 404-retry judgment, so it reads `write_status`, never
+        # this field. Set explicitly at each site that KNOWS it is the
+        # deciding call, never computed as a fallback from `status` at read
+        # time (that was R2-C04's own bug one field over: `status` is the
+        # last call SEEN on this outcome, which a dedup DELETE or the
+        # lookup's own GET can leave stale once the real decider gets no
+        # response at all).
+        self.decided_status = None
         self.retry_after = None
         self.detail = None  # last error body / message, for stderr
 
@@ -439,7 +456,14 @@ class IngestClient:
     def _lookup(self, outcome, layer, external_id):
         """The page of rows for ``(layer, container_id, external_id)``, or
         ``None`` after a failure. Rows come back verified: a page that had rows
-        and none of them was ours is ``filter_suspect``."""
+        and none of them was ours is ``filter_suspect``.
+
+        R4-C4: each of this method's three failure returns sets
+        ``outcome.decided_status`` to THIS call's own response status before
+        returning -- this is, by construction, the call that decided the
+        outcome in each of those three cases (a transport failure with no
+        response at all, caught before any of them, leaves it at its
+        default ``None`` instead: there is no status to attribute)."""
         response = self._call(
             outcome,
             "GET",
@@ -452,17 +476,22 @@ class IngestClient:
                 "limit": LOOKUP_LIMIT,
             },
         )
-        if response is None or self._refused(outcome, response, "lookup"):
+        if response is None:
+            return None
+        if self._refused(outcome, response, "lookup"):
+            outcome.decided_status = response.status
             return None
         body = response.json()
         rows = body.get("memories") if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             outcome.fail("http_error", "lookup: 2xx but not a memory list")
+            outcome.decided_status = response.status
             return None
         outcome.page_rows = len(rows)  # R2-C11: the RAW count, before verification
         verified = [r for r in rows if self._is_ours(r, layer, external_id)]
         if rows and not verified:
             outcome.fail("filter_suspect", f"lookup returned {len(rows)} row(s), none with our keys")
+            outcome.decided_status = response.status
             return None
         if len(rows) >= LOOKUP_LIMIT:
             # More duplicates than one page holds: dedup keeps the earliest
@@ -521,6 +550,7 @@ class IngestClient:
         """
         response = self._call(outcome, "DELETE", "/memories/" + urllib.parse.quote(memory_id, safe=""))
         outcome.write_status = response.status if response is not None else None
+        outcome.decided_status = outcome.write_status  # R4-C4: this write/delete call decided it
         if response is None:
             return False
         if response.status in (204, 404):
@@ -609,6 +639,7 @@ class IngestClient:
                 body={"user_id": self.user_id, "content": content, "memory_type": "semantic", "metadata": meta},
             )
             outcome.write_status = response.status if response is not None else None
+            outcome.decided_status = outcome.write_status  # R4-C4: this write/delete call decided it
             if response is None or self._refused(outcome, response, "create"):
                 return outcome
             body = response.json()
@@ -650,6 +681,7 @@ class IngestClient:
             body=patch,
         )
         outcome.write_status = response.status if response is not None else None
+        outcome.decided_status = outcome.write_status  # R4-C4: this write/delete call decided it
         if response is None or self._refused(outcome, response, "update"):
             return outcome
         body = response.json()

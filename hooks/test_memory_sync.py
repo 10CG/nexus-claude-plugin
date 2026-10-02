@@ -694,11 +694,26 @@ class TestSingleFileSync(_WriteCase):
         self.assertNotEqual(self._last_entry()["reason"], "unchanged")
 
     def test_a_server_422_is_a_skip_not_an_abort_and_advances(self):
-        """R3-T03: the acceptance item this is named for is "a deterministic
-        error skips that file and still advances the cursor" -- 3+ files
-        so a mid-batch skip leaves something distinguishable to resume AT
-        (2 files always wraps back to 0 regardless of whether the cursor
-        moved at all)."""
+        """R3-T03: a deterministic per-file error (422) does not abort the
+        round -- every file in the batch is still attempted, and only the
+        rejected one is left out of state.
+
+        R4-C5 (fix round 4, test_gap, corrects the R3 commit's own
+        characterization of this test): this test does NOT also pin "the
+        cursor advances past the 422" -- the docstring and the trailing
+        ``cursor == 0`` assertion that used to claim it here were vacuous.
+        With exactly 3 files that are ALL examined in the same round, the
+        cursor wraps to 0 regardless of whether "bad"'s own advance-cursor-
+        only write (inside ``_advance_cursor_only``) ever actually ran:
+        verified by mutation on a scratch copy (gutting
+        ``_advance_cursor_only`` into a true no-op still passed the old
+        assertion here). That acceptance item is pinned for real by
+        ``TestR3T03CursorAdvanceAndPlaceholderPersistAreCovered`` below
+        (whose own tests DO fail under the same mutation), via the shape
+        that actually discriminates: a 422 file in the MIDDLE of a batch
+        that then ABORTS on a later file, so the on-disk cursor has
+        nowhere else it could be except where the 422 file's own advance
+        left it."""
         self._write("bad")
         self._write("zzz-good")
         self._write("zzz-last")
@@ -716,7 +731,6 @@ class TestSingleFileSync(_WriteCase):
         self.assertNotIn("bad", state.get("files", {}))
         self.assertIn("zzz-good", state.get("files", {}))
         self.assertIn("zzz-last", state.get("files", {}))
-        self.assertEqual(state.get("cursor"), 0, "every file was examined this round; the cursor wraps")
 
     def test_a_locally_unparsable_file_is_skipped_and_the_next_one_still_runs(self):
         bad_path = self._write("bad")
@@ -3643,9 +3657,19 @@ class TestR3T06FailedEntryAttribution(unittest.TestCase):
     ``upsert()``, so it is always first whenever both occur, silently
     replacing the real abort reason in ``run["extra"]["failed"]``. The
     status recorded must likewise be the FAILING call's own status
-    (``write_status``), never ``outcome.status`` (clobbered by an
-    EARLIER call -- a dedup DELETE, or the lookup GET -- whenever the
-    write call itself got no response at all)."""
+    (R4-C4: ``decided_status``, generalised from ``write_status`` so a
+    LOOKUP-phase failure also gets to name its own status -- see
+    ``TestR4C4DecidedStatusAttribution`` below), never ``outcome.status``
+    (clobbered by an EARLIER call -- a dedup DELETE, or the lookup GET --
+    whenever the call that actually decided the outcome got no response
+    at all). These three tests build ``Outcome`` objects by hand rather
+    than through a real round, so each one also sets ``decided_status``
+    itself, exactly as ``_ingest_client.py``'s own write/delete call sites
+    do right alongside ``write_status`` (``upsert``'s POST/PATCH,
+    ``_delete_row``) -- a real lookup-phase failure sets ONLY
+    ``decided_status`` (``write_status`` stays ``None``), which the second
+    test below already exercises without needing to say so, since both
+    fields are ``None`` there regardless."""
 
     @staticmethod
     def _run_dict():
@@ -3658,6 +3682,7 @@ class TestR3T06FailedEntryAttribution(unittest.TestCase):
         outcome.fail("dedup_merged")
         outcome.status = 500  # the write call itself: PATCH -> 500
         outcome.write_status = 500
+        outcome.decided_status = 500  # R4-C4: the write call decided this outcome
         outcome.fail("http_error")
         run = self._run_dict()
         _MOD._tally_result(run, "f1", list(outcome.reasons), outcome)
@@ -3672,6 +3697,10 @@ class TestR3T06FailedEntryAttribution(unittest.TestCase):
         outcome.status = 404  # the dedup DELETE's own 404 (treated as success)
         outcome.fail("dedup_merged")
         outcome.write_status = None  # the write call itself got no response at all
+        # decided_status stays None too: nothing decided this outcome with
+        # an actual status to report (the real _ingest_client.py code sets
+        # it to `None` here for the exact same reason it leaves
+        # write_status at `None`).
         outcome.fail("timeout")
         run = self._run_dict()
         _MOD._tally_result(run, "f1", list(outcome.reasons), outcome)
@@ -3685,6 +3714,7 @@ class TestR3T06FailedEntryAttribution(unittest.TestCase):
         involved at all): the write's own status must still surface."""
         outcome = _ingest_client.Outcome()
         outcome.write_status = 422
+        outcome.decided_status = 422  # R4-C4: the write call decided this outcome
         outcome.status = 422
         outcome.fail("rejected_422")
         run = self._run_dict()
@@ -3737,6 +3767,444 @@ class TestR3T02PersistentStateReadFailureSelfHealsEndToEnd(_WriteCase):
             self._run()  # round 2: healed -- the cursor must have actually advanced
         posted = [r["json"]["metadata"]["external_id"] for r in self.requests if r["method"] == "POST"]
         self.assertEqual(posted, [self._ext("f5"), self._ext("f6")])
+
+
+class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
+    """R4-C1 (fix round 4): ``_tally_result`` (dedup_merged / the per-file
+    failed[] tally) and the dirty-scan loop's own OSError handler used to
+    write into ``run["extra"]`` only AFTER that same file's own blocking
+    per-file persist (``_hook_state.update_state_at``) returned. A worker
+    thread abandoned while stuck inside THAT call -- a slow disk, a
+    contended lock -- lost the fact entirely: the round's own ledger row
+    already says ``timeout``, but a ONE-TIME, DESTRUCTIVE fact
+    (``dedup_merged``: two rows already merged into one, server-side) or
+    an already-seen dirty-scan error vanished from the record for good,
+    because the call that would have recorded it simply never got to run.
+    These three tests reproduce that shape directly: a hang is injected
+    into the SPECIFIC call known to block, the work budget is shortened so
+    the thread is genuinely abandoned (not merely slow), and the ledger
+    row is read immediately afterward -- the fact must already be there."""
+
+    def test_a_dedup_merged_fact_survives_a_hung_persist_right_after_it(self):
+        """E3: "dup" just deduped (two rows -> one DELETE, dedup_merged=1)
+        and its own write (PATCH) completed -- but persisting ITS OWN
+        state entry hangs past the work budget. Before this fix,
+        dedup_merged never reached run["extra"] at all (the call that
+        writes it ran AFTER the now-hung persist), and it never reached
+        also_failed either (that needs run["reasons"], only extended once
+        _sync_file itself returns -- which an abandoned thread never
+        does)."""
+        self._write("dup")
+        dup_rows = _page(
+            _row(self._ext("dup"), row_id="11111111-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000001Z"),
+            _row(self._ext("dup"), row_id="22222222-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000002Z"),
+        )
+        self.backend.reply(*_empty_lookup())  # reconciliation: nothing to see
+        self.backend.reply(200, dup_rows).reply(204, None).reply(*_updated("m1"))
+
+        real_update = _hook_state.update_state_at
+
+        def hanging_update(path, mutate):
+            if "dup" in (mutate.__defaults__ or ()):
+                time.sleep(2.0)  # exceeds the shortened work budget below
+            return real_update(path, mutate)
+
+        # _MIN_REMAINING_SECONDS (3.0s) must also shrink: otherwise the
+        # per-file budget check trips before "dup" is even attempted,
+        # reporting budget_exhausted (a normal, non-abandoned return)
+        # instead of ever reaching the hang (TestR2C07's own precedent).
+        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                mock.patch.object(_hook_state, "update_state_at", side_effect=hanging_update):
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertEqual(entry.get("dedup_merged"), 1, entry)
+        self.assertIn("dedup_merged", entry.get("also_failed", []))
+
+    def test_a_dirty_scan_error_on_one_file_survives_a_later_files_hang(self):
+        """E5: the dirty-scan loop hits a deterministic I/O error on "a"
+        (recorded as a dirty_scan_errors entry) and then HANGS while
+        hashing "b" -- past the work budget, the thread is abandoned.
+        Before this fix, dirty_scan_errors was a local list only written
+        into run["extra"] (and folded into the "unknown" scalar reason)
+        once the WHOLE scan loop finished -- so the fact already known
+        about "a" never reached the ledger row at all."""
+        a_path = self._write("a", body="original a")
+        b_path = self._write("b", body="original b")
+        fingerprint = _MOD._current_fingerprint()
+        state = {"cursor": 0, "reconciled": True, "files": {}}
+        for slug, path in (("a", a_path), ("b", b_path)):
+            st = os.stat(path)
+            state["files"][slug] = {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path),
+                "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": fingerprint,
+            }
+        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        # Touch both files so the mtime+size fast path misses and
+        # _dirty_check recomputes the whole-file hash for each -- "a"'s
+        # own recompute hits a transient I/O error, "b"'s hangs.
+        with open(a_path, "a", encoding="utf-8") as fh:
+            fh.write("\n\nmore")
+        with open(b_path, "a", encoding="utf-8") as fh:
+            fh.write("\n\nmore")
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == a_path:
+                raise OSError(5, "Input/output error")
+            if target == b_path:
+                time.sleep(2.0)  # exceeds the shortened work budget below
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                mock.patch.object(_MOD, "open", create=True, side_effect=flaky_open):
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertEqual(entry.get("dirty_scan_errors"), ["a"], entry)
+        self.assertIn("unknown", entry.get("also_failed", []))
+
+    def test_a_confirmed_deletion_survives_a_later_files_hung_state_drop(self):
+        """Same shape, on the pending-delete side (R4-C1's own optional
+        item 4): "gone-a" is confirmed deleted server-side AND its own
+        state-drop persist completes normally; "gone-b" is ALSO confirmed
+        deleted server-side, but ITS OWN state-drop persist hangs. Before
+        this fix, `deleted_count` was a local counter in _collect, only
+        copied into run["extra"]["deleted"] once the WHOLE vanished-files
+        loop finished -- so "gone-a"'s already-confirmed deletion was lost
+        too, not just "gone-b"'s."""
+        kept_path = self._write("kept")
+        a_path = self._write("gone-a")
+        b_path = self._write("gone-b")
+        fingerprint = _MOD._current_fingerprint()
+        state = {"cursor": 0, "reconciled": True, "files": {}}
+        for slug, path in (("kept", kept_path), ("gone-a", a_path), ("gone-b", b_path)):
+            st = os.stat(path)
+            state["files"][slug] = {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path),
+                "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": fingerprint,
+            }
+        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        os.remove(a_path)
+        os.remove(b_path)
+        self.backend.reply(200, _page(_row(self._ext("gone-a")))).reply(204, None)
+        self.backend.reply(200, _page(_row(self._ext("gone-b")))).reply(204, None)
+
+        real_update = _hook_state.update_state_at
+
+        def hanging_update(path, mutate):
+            if "gone-b" in (mutate.__defaults__ or ()):
+                time.sleep(2.0)  # exceeds the shortened work budget below
+            return real_update(path, mutate)
+
+        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.3), \
+                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                mock.patch.object(_hook_state, "update_state_at", side_effect=hanging_update):
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertEqual(entry.get("deleted"), 1, entry)
+
+
+class TestR4C1ProductionTailRealKill(unittest.TestCase):
+    """R4-C1's own required subprocess coverage: an in-process test cannot
+    show that an abandoned worker thread is actually KILLED -- the daemon
+    thread in TestR4C1OneTimeFactsSurviveAnAbandonedPersist's own tests
+    keeps running, unobserved, until the whole TEST PROCESS eventually
+    exits, which overstates how long a late write could plausibly still be
+    "in flight" in production. A real subprocess, ended by
+    ``_hook_runner.finish``'s ``os._exit(0)``, shows the real bound: the
+    process (hung thread included) is gone well before the 2-second hang
+    this test injects could ever complete."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.path.join(self.tmp.name, "proj")
+        os.makedirs(self.cwd)
+        self.state_dir = os.path.join(self.tmp.name, "state")
+        self.config_dir = os.path.join(self.tmp.name, "claude-config")
+        self.key, _degraded = _identity.memory_dir_key(self.cwd)
+        self.memory_dir = os.path.join(self.config_dir, "projects", self.key, "memory")
+        os.makedirs(self.memory_dir)
+        self.backend = _Backend()
+        self.addCleanup(self.backend.close)
+
+    def _build_hanging_copy(self):
+        """A throwaway copy of every hook sibling, with ``memory_sync.py``'s
+        own work budget shortened by TEXT substitution (there is no live
+        process to ``mock.patch`` across) and a tiny, env-var-gated hang
+        appended to the COPIED ``_hook_state.py`` -- never the real one --
+        so ``update_state_at`` sleeps for the one call whose ``mutate``
+        closes over the slug named by ``MEMORY_SYNC_TEST_HANG_SLUG``,
+        exactly the same ``mutate.__defaults__`` technique the in-process
+        tests above use via ``mock.patch``."""
+        target = os.path.join(self.tmp.name, "slow-copy")
+        os.makedirs(target)
+        names = (
+            "memory_sync.py", "_identity.py", "_hook_runner.py",
+            "_ingest_client.py", "_hook_state.py", "_redact.py",
+        )
+        for name in names:
+            shutil.copy(os.path.join(_HOOKS_DIR, name), os.path.join(target, name))
+
+        script_path = os.path.join(target, "memory_sync.py")
+        with open(script_path, encoding="utf-8") as fh:
+            source = fh.read()
+        new_source = (
+            source
+            .replace("_WORK_BUDGET_SECONDS = 20.0", "_WORK_BUDGET_SECONDS = 0.5")
+            .replace("_DEADLINE_SLACK_SECONDS = 1.0", "_DEADLINE_SLACK_SECONDS = 0.0")
+            # Otherwise the per-file budget check trips before "dup" is
+            # even attempted (TestR2C07's own precedent, same reasoning as
+            # the in-process hang tests above).
+            .replace("_MIN_REMAINING_SECONDS = 3.0", "_MIN_REMAINING_SECONDS = 0.05")
+        )
+        assert new_source != source, "the budget constants were not found to shorten"
+        with open(script_path, "w", encoding="utf-8") as fh:
+            fh.write(new_source)
+
+        hook_state_path = os.path.join(target, "_hook_state.py")
+        with open(hook_state_path, "a", encoding="utf-8") as fh:
+            fh.write(
+                "\n\n"
+                "# TEST-ONLY HANG INJECTION -- appended to a throwaway copy by\n"
+                "# test_memory_sync.py's own TestR4C1ProductionTailRealKill; never\n"
+                "# present in the real hooks/_hook_state.py. Activated only when\n"
+                "# MEMORY_SYNC_TEST_HANG_SLUG is set, so this file otherwise behaves\n"
+                "# exactly like the real one.\n"
+                "import os as _test_hang_os\n"
+                "\n"
+                '_TEST_HANG_SLUG = _test_hang_os.environ.get("MEMORY_SYNC_TEST_HANG_SLUG")\n'
+                "if _TEST_HANG_SLUG:\n"
+                "    import time as _test_hang_time\n"
+                "\n"
+                "    _real_update_state_at_for_test = update_state_at\n"
+                "\n"
+                "    def update_state_at(path, mutate):  # noqa: F811 - test-only override\n"
+                "        if _TEST_HANG_SLUG in (mutate.__defaults__ or ()):\n"
+                "            _test_hang_time.sleep(2.0)\n"
+                "        return _real_update_state_at_for_test(path, mutate)\n"
+            )
+        return script_path
+
+    def test_a_dedup_merged_fact_survives_a_real_kill_of_the_hung_persist(self):
+        _write_memory_file(self.memory_dir, "dup")
+        dup_rows = _page(
+            _row(f"{self.key}/dup", row_id="11111111-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000001Z"),
+            _row(f"{self.key}/dup", row_id="22222222-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000002Z"),
+        )
+        self.backend.reply(*_empty_lookup())  # reconciliation
+        self.backend.reply(200, dup_rows).reply(204, None).reply(*_updated("m1"))
+
+        script = self._build_hanging_copy()
+        run_env = _scrub_subprocess_env({
+            "NEXUS_API_URL": self.backend.url,
+            "NEXUS_HOOK_STATE_DIR": self.state_dir,
+            "NEXUS_DEFAULT_USER_ID": USER,
+            "NEXUS_CONTAINER_ID": CONTAINER,  # else the real hostname -- mismatches the scripted rows' metadata
+            "CLAUDE_CONFIG_DIR": self.config_dir,
+            "MEMORY_SYNC_TEST_HANG_SLUG": "dup",
+        })
+        started = time.monotonic()
+        result = subprocess.run(
+            [sys.executable, script],
+            input=json.dumps({"cwd": self.cwd}).encode(),
+            capture_output=True,
+            timeout=20,
+            env=run_env,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual((result.stdout, result.returncode), (b"", 0))
+        # The injected hang is 2.0s; a real kill via os._exit(0) must end
+        # the process well before that -- an in-process test cannot show
+        # this at all (the thread survives until the whole TEST process
+        # exits, not this one hook run).
+        self.assertLess(elapsed, 1.5, "the process waited for the hung thread instead of being killed")
+
+        ledgers = glob.glob(os.path.join(self.state_dir, "*", "memory-sync.json"))
+        self.assertEqual(len(ledgers), 1, ledgers)
+        with open(ledgers[0], encoding="utf-8") as fh:
+            entry = json.load(fh)[-1]
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertEqual(entry.get("dedup_merged"), 1, entry)
+        self.assertIn("dedup_merged", entry.get("also_failed", []))
+
+
+class TestR4C3MidRoundStateRebuildIsVisible(_WriteCase):
+    """R4-C3 (fix round 4): R3-T02 made a persistently-unreadable state
+    file self-heal when the round's OWN opening read already finds
+    EACCES/EPERM -- correct, and still covered by
+    TestR3T02PersistentStateReadFailureSelfHealsEndToEnd above. But the
+    SAME rebuild-from-``{}`` branch also fires when the file is perfectly
+    healthy at the START of a round and only becomes unreadable to a
+    LATER per-file write within the SAME round (a lock/ownership race) --
+    there, R3-T02's own premise ("this uid will never read it again")
+    does not hold, and the rebuild silently drops ``reconciled``, every
+    OTHER file's own entry, and any pending-delete bookkeeping, while the
+    round's own ledger row reads completely clean (correctly, per owner
+    ruling item 4 -- a repaired file whose write still landed is not
+    itself a failure; this fix is pure visibility, not a reversal of
+    that)."""
+
+    def test_a_mid_round_permission_flip_is_counted_not_silently_absorbed(self):
+        f1_path = self._write("f1")
+        f2_path = self._write("f2")
+        fingerprint = _MOD._current_fingerprint()
+        state = {"cursor": 0, "reconciled": True, "files": {}}
+        for slug, path in (("f1", f1_path), ("f2", f2_path)):
+            st = os.stat(path)
+            state["files"][slug] = {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path),
+                "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": fingerprint,
+            }
+        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        # f1 is edited so it is this round's one dirty candidate; f2 stays
+        # untouched (clean, and never revisited this round).
+        self._write("f1", body="edited body")
+        self.backend.reply(
+            200, _page(_row(self._ext("f1"), content_hash="sha256:" + "1" * 64)),
+        ).reply(*_updated("m1"))
+
+        state_path = _MOD._memory_state_path(self.key)
+        real_open = open
+        read_count = {"n": 0}
+
+        def flaky_open(target, *a, **kw):
+            if target == state_path:
+                read_count["n"] += 1
+                if read_count["n"] > 1:  # 1 = this round's own opening read (clean)
+                    raise PermissionError(13, "Permission denied")
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open):
+            self._run()
+        entry = self._last_entry()
+        # The round's own ok/reason stay clean -- R3-T02's self-heal is
+        # correct behaviour, not something this fix reverses.
+        self.assertEqual(entry["reason"], "none")
+        self.assertTrue(entry["ok"])
+        self.assertEqual(entry.get("state_rebuilt"), 1, entry)
+        # The rebuild genuinely happened (same as before this fix) -- f2's
+        # own entry and `reconciled` are gone; this test only pins that
+        # the fact is now VISIBLE, not that the rebuild itself is undone
+        # (a separate, owner-flagged question outside this cluster).
+        self.assertNotIn("f2", self._state().get("files", {}))
+
+    def test_an_initially_corrupt_state_file_does_not_count_as_a_mid_round_rebuild(self):
+        """The ALREADY-accepted R3-T02 shape (the round's own opening read
+        is what finds the trouble) must NOT also increment
+        ``state_rebuilt`` -- that counter is specifically for a flip
+        AFTER a clean start, not for the self-heal continuing to resolve
+        brokenness the round already knew about from its very first
+        read."""
+        self._write("f1")
+        state_path = _MOD._memory_state_path(self.key)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == state_path:
+                raise PermissionError(13, "Permission denied")
+            return real_open(target, *a, **kw)
+
+        self.backend.reply(*_empty_lookup()).reply(*_empty_lookup()).reply(*_created("m1"))
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open):
+            self._run()
+        entry = self._last_entry()
+        self.assertNotIn("state_rebuilt", entry)
+
+
+class TestR4C4DecidedStatusAttribution(_WriteCase):
+    """R4-C4 (fix round 4): a LOOKUP-phase failure (never reaches
+    upsert's/delete's own write call at all -- ``_refused`` on the lookup
+    itself, "2xx but not a memory list", ``filter_suspect``) left
+    ``write_status`` at ``None`` forever, so ``_tally_result``'s old
+    ``if outcome.write_status is not None`` guard never set ``status`` on
+    that file's own ``failed[]`` entry -- a regression from 87a54df, which
+    read the plain (and differently-scoped) ``status`` field and got this
+    particular case right by accident. ``decided_status``
+    (``_ingest_client.py``) fixes the attribution; these are its
+    end-to-end confirmations, plus the companion fix (``dedup_merged``
+    must not win a file's own ``reason`` slot over a genuine write
+    rejection it has no status in common with)."""
+
+    def test_a_new_files_lookup_failure_still_names_its_own_status(self):
+        self._write("f1")
+        self.backend.reply(*_empty_lookup())  # reconciliation
+        self.backend.reply(500, {"detail": "boom"})  # f1's own lookup itself fails
+        self._run()
+        entry = self._last_entry()
+        failed = entry.get("failed") or []
+        self.assertTrue(
+            any(f.get("slug") == "f1" and f.get("status") == 500 for f in failed), entry
+        )
+
+    def test_a_pending_deletes_lookup_failure_also_names_its_own_status(self):
+        kept_path = self._write("kept")  # avoids the K01 zero-local-files guard
+        fingerprint = _MOD._current_fingerprint()
+        kst = os.stat(kept_path)
+        state = {
+            "cursor": 0, "reconciled": True,
+            "files": {
+                "kept": {"mtime": kst.st_mtime, "size": kst.st_size,
+                         "ctime": getattr(kst, "st_ctime_ns", None),
+                         "file_hash": _MOD._whole_file_hash(kept_path),
+                         "synced_at": "2026-01-01T00:00:00Z", "redaction_fingerprint": fingerprint},
+                "gone": {"mtime": 1.0, "size": 1, "ctime": None,
+                         "file_hash": "sha256:" + "0" * 64,
+                         "synced_at": "2026-01-01T00:00:00Z", "redaction_fingerprint": fingerprint},
+            },
+        }
+        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        self.backend.reply(401, {"detail": "nope"})  # "gone"'s own delete-lookup fails
+        self._run()
+        entry = self._last_entry()
+        failed = entry.get("failed") or []
+        self.assertTrue(
+            any(f.get("slug") == "gone" and f.get("status") == 401 for f in failed), entry
+        )
+
+    def test_a_dedup_then_a_422_write_reports_the_rejection_not_the_dedup(self):
+        self._write("dup")
+        dup_rows = _page(
+            _row(self._ext("dup"), row_id="11111111-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000001Z"),
+            _row(self._ext("dup"), row_id="22222222-1111-4111-8111-111111111111",
+                 created_at="2026-10-01T10:00:00.000002Z"),
+        )
+        self.backend.reply(*_empty_lookup())  # reconciliation
+        self.backend.reply(200, dup_rows).reply(204, None).reply(422, {"detail": "nope"})
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry.get("dedup_merged"), 1, entry)  # the fact is still counted
+        failed = entry.get("failed") or []
+        self.assertTrue(
+            any(
+                f.get("slug") == "dup" and f.get("reason") == "rejected_422" and f.get("status") == 422
+                for f in failed
+            ),
+            entry,
+        )
 
 
 class TestModuleCleanupOrdering(unittest.TestCase):

@@ -116,30 +116,45 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     NOT move any persistence after the row without a NEW owner ruling
     superseding O1; this paragraph is the pending write-back to the
     parent repo's proposal.md as Amendment A10.
-  - **Correction (R3-T05, post_implementation R3, 2026-10-02):** the
+  - **Correction (R3-T05, post_implementation R3, 2026-10-02; further
+    narrowed by R4-C1, post_implementation R4, 2026-10-02):** the
     paragraph above is a claim about CODE STRUCTURE, not an absolute
     temporal guarantee -- it does not hold when the worker thread itself
     is abandoned (``timeout``). ``run_with_deadline`` (``_hook_runner.py``)
     only ABANDONS a slow thread; it cannot kill it, so the thread keeps
     running, unobserved, after ``main()`` has already moved on to call
-    ``_record``. Any per-file persist this module makes (``_sync_file`` /
-    ``_delete_file`` / ``_advance_cursor_only`` / the two reconciliation
-    writes in ``_collect``) that the abandoned thread happens to still be
-    in the middle of, or about to start, can therefore land on disk AFTER
-    the ledger row for THIS run was already written -- clock-time "after
-    the row" even though it is, by construction, the exact same code path
-    that normally runs BEFORE it. A genuine failure in one of those late
-    writes has no row left to fold into (``_record`` already ran) and is
-    simply never reported -- not even late, the way a follow-up row
-    would. This is a narrow, low-consequence window: the row it is
-    missing from already says ``timeout``, so no reader is misled into
-    thinking the round was clean, and whatever a late write touches
-    (cursor, a file's own state entry, ``reconciled``) is read again, and
-    corrected if wrong, by the very next round regardless. Still open
-    whether this is worth a guard (narrowing, never eliminating, the
-    window -- see ``_record``'s own docstring); tracked for the owner
-    alongside the rest of this paragraph's A10 write-back, not decided
-    here.**
+    ``_record``. **R4-C1 moved every ONE-TIME fact this round can already
+    know (``dedup_merged``, a dirty-scan error, a confirmed deletion) to
+    be written into ``run`` strictly BEFORE the one blocking per-file
+    persist call that is the reason a thread would be abandoned in the
+    first place (``_tally_result``'s own docstring) -- so none of those
+    facts are at risk from this window any more.** What remains is
+    narrower: the ONE per-file persist the thread happens to be stuck
+    inside -- or, for a deterministic local skip, about to start
+    (``_advance_cursor_only``, or one of the two reconciliation writes in
+    ``_collect``) -- can still land on disk, or fail, AFTER the ledger row
+    for THIS run was already written -- clock-time "after the row" even
+    though it is, by construction, the exact same code path that normally
+    runs BEFORE it. In a REAL process this window is bounded, not
+    open-ended: ``_hook_runner.finish``'s ``os._exit(0)`` genuinely
+    terminates the whole process -- the stuck thread included -- within,
+    at most, ``_LEDGER_BUDGET_SECONDS`` of the ledger write starting (an
+    IN-PROCESS test cannot observe this kill: the thread keeps running,
+    unkilled, until the whole TEST process eventually exits, which is why
+    this module's own test file also exercises a real subprocess for this
+    shape). A genuine failure in that one remaining write still has no row
+    left to fold into (``_record`` already ran) and is simply never
+    reported -- not even late, the way a follow-up row would -- but it is
+    now only a LOCAL bookkeeping detail for a single file (cursor, that
+    file's own state entry, ``reconciled``), never a one-time fact, and
+    whatever it touches is read again, and corrected if wrong, by the very
+    next round regardless. Still open whether this last, narrower window
+    is worth a guard; tracked for the owner (Amendment A10) -- the
+    orchestrator's own O1 ruling ("nothing in this file is persisted after
+    the row") describes this file's CODE STRUCTURE correctly, not what an
+    ABANDONED thread can still do after that structure's own last line
+    runs, and the A10 write-back must not restate O1 as if it covered the
+    abandoned path too.**
   - **A9-20 (owner 2026-10-01): every ledger row carries
     ``extra["also_failed"]``** -- the other failure-class reasons this round
     produced besides the one ``worst_reason`` chose as the scalar
@@ -904,7 +919,7 @@ def _dirty_check(path, stored, fingerprint):
 
 # ── one file: read, build, upsert, persist on success ────────────────────
 
-def _fold_persist_reasons(reasons, persist_reasons):
+def _fold_persist_reasons(reasons, persist_reasons, run=None):
     """Append only a GENUINE write failure from ``update_state_at``'s own
     returned reasons into ``reasons`` (mutated in place). Per the owner
     ruling on A9-7 (post_implementation R1, item 4): ``lock_unavailable`` (a
@@ -923,9 +938,31 @@ def _fold_persist_reasons(reasons, persist_reasons):
     rebuild=False``) -- the write genuinely did not happen in that case
     either, so it belongs in this same bucket; only a repaired CORRUPT
     file (``unknown``, a true self-heal whose write still landed) stays
-    excluded."""
+    excluded.
+
+    R4-C3 (post_implementation R4): ``run``, when given, lets this function
+    ALSO count a DIFFERENT shape than the one R3-T02 made self-healing on
+    purpose. R3-T02's premise is that a state file unreadable at THIS
+    round's own OPENING read (``EACCES``/``EPERM``) will stay unreadable --
+    this uid is never getting back in, so rebuilding from ``{}`` is the
+    only useful thing to do. That premise does not hold when the round
+    OPENED with a healthy read and only a LATER per-file write finds the
+    file suddenly unreadable (a lock/ownership race, mid-round) --
+    ``_update_state_file`` cannot tell the two shapes apart itself (both
+    return the exact same ``["unknown"]``), but THIS caller can, because it
+    is the one place that saw the round's own opening read succeed. Only
+    then -- ``run["state_read_clean_at_start"]``, set once at the top of
+    ``_collect`` -- is an ``"unknown"`` here counted into
+    ``run["extra"]["state_rebuilt"]``: a MID-round rebuild silently drops
+    ``reconciled``, every OTHER file's own state entry, and any
+    pending-delete bookkeeping, while (correctly, per owner ruling item 4 --
+    a repaired file whose write still landed is not a failure) this
+    round's own ``reason``/``ok`` stay clean. This is visibility only: it
+    does not become a failure reason, and it does not undo the rebuild."""
     if "state_write_failed" in persist_reasons:
         reasons.append("state_write_failed")
+    if run is not None and run.get("state_read_clean_at_start") and "unknown" in persist_reasons:
+        run["extra"]["state_rebuilt"] = run["extra"].get("state_rebuilt", 0) + 1
 
 
 def _upsert_retrying_404(client, layer, external_id, content, metadata, *, local_updated_at, updated_key):
@@ -995,6 +1032,20 @@ def _tally_result(run, slug, reasons, outcome):
     error, an unparsable frontmatter) that never got as far as making a
     client call.
 
+    R4-C1 (post_implementation R4): every caller of this function runs it
+    BEFORE that same file's own blocking per-file state persist, never
+    after -- see ``_sync_file`` / ``_delete_file``'s own call sites. A
+    worker thread abandoned while stuck inside that persist (a slow disk, a
+    contended lock) used to lose EVERYTHING this function writes -- most
+    importantly ``dedup_merged``, a ONE-TIME, DESTRUCTIVE fact (A9-20) that
+    will not be there to re-discover next round -- because the call simply
+    never ran. ``main()``'s own patch-up folds ``run["extra"]
+    ["dedup_merged"]`` into ``also_failed`` for the exact same reason it
+    already does for ``unresolved_files``: this function being called
+    earlier does not, by itself, get the fact into ``run["reasons"]`` too
+    (that still happens only once the caller's own ``reasons.extend(...)``
+    runs, which an abandoned thread also never reaches).
+
     R3-T06 (post_implementation R3): the file's OWN ``reason`` here is
     picked by ``_hook_state.worst_reason`` -- the SAME rule the round's
     own scalar ``reason`` uses -- never "the first failure-class reason in
@@ -1013,17 +1064,31 @@ def _tally_result(run, slug, reasons, outcome):
     wants (the round's own scalar reason / ``also_failed`` already carry
     it).
 
-    The status recorded is ``outcome.write_status`` -- the status of the
-    call that actually decided this outcome (set on every attempt by both
-    ``upsert``'s own POST/PATCH and, as of this same fix, ``_delete_row``)
-    -- never ``outcome.status`` (the last status ANY call on this outcome
-    received). A dedup DELETE that happens to 404, or a lookup GET's own
-    200, both go through ``_call`` and set ``status``; if the WRITE call
-    itself then gets NO response at all (a timeout, a connection reset),
-    ``status`` is left stale at that EARLIER call's value while
-    ``write_status`` correctly reads ``None`` -- the previous code read
-    ``status`` and reported the earlier call's unrelated code as if it
-    were the write's own.
+    R4-C4 (post_implementation R4): ``dedup_merged`` is ALSO excluded from
+    ``candidates`` whenever another failure-class reason is present in the
+    SAME outcome -- it is not in ``_REASON_PRIORITY`` (neither is
+    ``rejected_422``/``filter_suspect``/``unknown``), so "first in order
+    wins" could still pick it over one of THOSE even after the fix above,
+    producing an entry like ``{"reason": "dedup_merged", "status": 422}``
+    whose two halves describe two different calls -- the write's own 422
+    read back as if it were the lookup-phase dedup. Dropping it here when a
+    genuine alternative exists costs nothing: it already has its own
+    dedicated accounting (``extra["dedup_merged"]``, folded into
+    ``also_failed`` by ``main()``), so this file's own ``failed[]`` entry
+    is free to name whichever OTHER reason the status it is about to
+    attach actually belongs to. If ``dedup_merged`` is the ONLY
+    failure-class reason in this outcome, it is of course still reported.
+
+    The status recorded is ``outcome.decided_status`` (R4-C4; was
+    ``outcome.write_status`` before this fix) -- the status of whichever
+    call actually decided this outcome, lookup-phase failures included
+    (``_refused`` / "2xx but not a memory list" / ``filter_suspect``, none
+    of which ever reach a write call at all, and so left ``write_status``
+    permanently ``None`` for this whole class of per-file failure) --
+    never ``outcome.status`` (the last status ANY call on this outcome
+    received, which a dedup DELETE or an unrelated lookup GET can leave
+    stale once the call that actually decided the outcome gets no response
+    at all; see ``_ingest_client.Outcome.decided_status``'s own docstring).
     """
     if outcome is not None:
         if outcome.redacted:
@@ -1031,6 +1096,8 @@ def _tally_result(run, slug, reasons, outcome):
         if outcome.dedup_merged:
             run["extra"]["dedup_merged"] = run["extra"].get("dedup_merged", 0) + outcome.dedup_merged
     candidates = [r for r in reasons if r != "state_write_failed" and _hook_state.is_failure_reason(r)]
+    if len(candidates) > 1 and "dedup_merged" in candidates:
+        candidates = [r for r in candidates if r != "dedup_merged"]
     if not candidates:
         return
     failure = _hook_state.worst_reason(candidates)
@@ -1039,8 +1106,8 @@ def _tally_result(run, slug, reasons, outcome):
         return
     entry = {"slug": slug, "reason": failure}
     if outcome is not None:
-        if outcome.write_status is not None:
-            entry["status"] = outcome.write_status
+        if outcome.decided_status is not None:
+            entry["status"] = outcome.decided_status
         if outcome.detail:
             entry["detail"] = str(outcome.detail)[:200]
     failed.append(entry)
@@ -1130,17 +1197,17 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, *, next_
         # Still a non-aborting outcome, so the cursor walk still advances
         # past it (R2-C03).
         reasons = []
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor))
+        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
         return reasons, False, 0
     except OSError:
         _tally_result(run, slug, ["unknown"], None)
         reasons = ["unknown"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor))
+        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
         return reasons, False, 0
     if not stat.S_ISREG(st.st_mode):
         _tally_result(run, slug, ["unknown"], None)
         reasons = ["unknown"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor))
+        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
         return reasons, False, 0
     synced_at = _now_iso()  # K19: the instant the bytes below were read
     file_hash = "sha256:" + hashlib.sha256(raw[: _MAX_DOCUMENT_CHARS + 1]).hexdigest()
@@ -1149,14 +1216,14 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, *, next_
     except UnicodeDecodeError:
         _tally_result(run, slug, ["file_unparsable"], None)
         reasons = ["file_unparsable"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor))
+        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
         return reasons, False, 0
 
     frontmatter, body = _split_memory_frontmatter(text)
     if frontmatter is None:  # K07: an opened but never-closed frontmatter block
         _tally_result(run, slug, ["file_unparsable"], None)
         reasons = ["file_unparsable"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor))
+        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
         return reasons, False, 0
     content, truncated = _cap_for_wire(body, _CONTENT_CAP)  # K06: capped post-redaction
     modified = frontmatter.get("modified") or _mtime_iso(st)
@@ -1171,6 +1238,19 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, *, next_
         _tally_result(run, slug, outcome.reasons, outcome)
         return list(outcome.reasons), True, outcome.calls
     reasons = list(outcome.reasons)
+    # R4-C1 (post_implementation R4): tallied HERE, before either branch
+    # below makes its own blocking per-file persist call -- not after, as
+    # the previous version of this function did. A worker thread abandoned
+    # while stuck inside that persist (a slow disk, a contended lock) used
+    # to lose this entirely, ``dedup_merged`` (a one-time, destructive
+    # fact, A9-20) included, because the call that records it simply never
+    # ran. `reasons` at this point is exactly `list(outcome.reasons)` --
+    # the state-persist call below can only ever ADD `state_write_failed`
+    # to it via `_fold_persist_reasons`, which `_tally_result`'s own
+    # `candidates` filter already excludes, so moving this call earlier
+    # changes nothing about what a COMPLETED round reports (see this
+    # module's own docstring, A9-7, and `_tally_result`'s own docstring).
+    _tally_result(run, slug, reasons, outcome)
     if outcome.action in ("created", "updated", "unchanged") or "stale_local" in outcome.reasons:
         entry = {
             "mtime": st.st_mtime,
@@ -1188,13 +1268,12 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, *, next_
             return new
 
         _, persist_reasons = _hook_state.update_state_at(state_path, _mutate)
-        _fold_persist_reasons(reasons, persist_reasons)
+        _fold_persist_reasons(reasons, persist_reasons, run)
     else:
         # A deterministic, non-aborting outcome with no entry of its own
         # to merge the advance into (e.g. rejected_422) -- the cursor
         # still advances past it (C row: skip and advance), on its own.
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor))
-    _tally_result(run, slug, reasons, outcome)
+        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
     return reasons, False, outcome.calls
 
 
@@ -1242,6 +1321,11 @@ def _delete_file(client, key, slug, run):
     folded into the returned reasons, same as ``_sync_file`` above and for
     the same reason: this call, too, always runs strictly before
     ``_record``.
+
+    R4-C1 (post_implementation R4): tallied before the ``cleared`` branch's
+    own blocking persist call, not after -- the same reordering
+    ``_sync_file`` makes and for the same reason (an abandoned thread stuck
+    in that persist must not lose this file's own failure tally).
     """
     outcome = client.delete("fact", f"{key}/{slug}")
     if outcome.aborts_round:
@@ -1252,12 +1336,12 @@ def _delete_file(client, key, slug, run):
     cleared = "nothing_to_do" in outcome.reasons or (
         outcome.found > 0 and outcome.deleted == outcome.found and not page_full
     )
+    _tally_result(run, slug, reasons, outcome)
     if cleared:
         _, persist_reasons = _hook_state.update_state_at(
             _memory_state_path(key), lambda s, slug=slug: _drop_file_entry(s, slug)
         )
-        _fold_persist_reasons(reasons, persist_reasons)
-    _tally_result(run, slug, reasons, outcome)
+        _fold_persist_reasons(reasons, persist_reasons, run)
     return reasons, False, outcome.calls, cleared
 
 
@@ -1643,6 +1727,12 @@ def _collect(run):
     state_path = _memory_state_path(key)
     state, reasons = _hook_state.read_state_at(state_path)
     run["reasons"] = reasons  # K02: the SAME list, mutated as this round goes
+    # R4-C3: captured BEFORE `reasons` can grow any further below -- this is
+    # specifically "did THIS round's own opening read already see trouble",
+    # the premise _fold_persist_reasons needs to tell a genuine MID-round
+    # flip (see its own docstring) apart from the round simply continuing to
+    # resolve brokenness it already knew about at the top.
+    run["state_read_clean_at_start"] = not reasons
 
     files_state_raw = state.get("files")
     if isinstance(files_state_raw, dict):
@@ -1747,7 +1837,6 @@ def _collect(run):
         fingerprint = _current_fingerprint()
         budget = _BATCH_SIZE
         aborted = False
-        deleted_count = 0
 
         # -- pending deletes (vanished local files), retried first every round.
         # K01: a slug this round's listing could not conclusively resolve
@@ -1775,11 +1864,18 @@ def _collect(run):
             run["calls"] += c
             budget -= 1
             if cleared:
-                deleted_count += 1
+                # R4-C1: written into `run` the INSTANT this deletion is
+                # confirmed -- mirroring `_reconcile_orphans`'s own R2-C07
+                # pattern for `orphans_deleted` -- not accumulated in a
+                # local counter only flushed once this WHOLE loop finishes.
+                # A worker thread abandoned mid-loop (stuck in a LATER
+                # slug's own state-drop persist) used to lose every EARLIER
+                # slug's already-confirmed deletion too, because the local
+                # counter never reached the line that copies it into
+                # `run["extra"]`.
+                run["extra"]["deleted"] = run["extra"].get("deleted", 0) + 1
             if ab:
                 aborted = True
-        if deleted_count:
-            run["extra"]["deleted"] = deleted_count
 
         # -- orphan reconciliation: independent of the batch above/below (a
         # failure here does not stop the sync batch, and vice versa) UNLESS
@@ -1839,7 +1935,7 @@ def _collect(run):
                         return new
 
                     _, persist_reasons = _hook_state.update_state_at(state_path, _mark_reconciled)
-                    _fold_persist_reasons(reasons, persist_reasons)
+                    _fold_persist_reasons(reasons, persist_reasons, run)
                     if to_register:
                         files_state.update(to_register)
                 elif to_register:
@@ -1847,7 +1943,7 @@ def _collect(run):
                         state_path,
                         lambda s, to_register=to_register: _register_placeholder_entries(s, to_register),
                     )
-                    _fold_persist_reasons(reasons, persist_reasons)
+                    _fold_persist_reasons(reasons, persist_reasons, run)
                     files_state.update(to_register)
 
         # -- dirty set: already-synced files whose content or redaction rule
@@ -1861,7 +1957,6 @@ def _collect(run):
         # edit must not queue behind a backlog of fingerprint-only churn. --
         dirty = []
         content_changed_of = {}
-        dirty_scan_errors = []
         if not aborted:
             for slug in sorted_slugs:
                 stored = files_state.get(slug)
@@ -1872,15 +1967,29 @@ def _collect(run):
                 except FileNotFoundError:
                     continue  # vanished mid-scan: an ordinary race
                 except OSError:
-                    dirty_scan_errors.append(slug)
+                    # R4-C1: written into `run["extra"]` the INSTANT this is
+                    # known, not accumulated in a local list only copied
+                    # over once the WHOLE scan loop finishes (mirrors
+                    # `unresolved_files`'s own R3-T04 treatment, one level
+                    # up). The scan loop itself can stall on a LATER slug
+                    # (another `os.stat`/hash that hangs rather than
+                    # raising, e.g. a hard NFS stall) -- a worker thread
+                    # abandoned there must not lose an error already seen
+                    # on an EARLIER slug in the SAME loop. Bounded the same
+                    # way the round-end write used to be; a subsequence of
+                    # `sorted_slugs` (itself sorted) stays sorted appended
+                    # in iteration order, so this is not a behaviour change
+                    # for a round that completes normally.
+                    errors = run["extra"].setdefault("dirty_scan_errors", [])
+                    if len(errors) < 5:
+                        errors.append(slug)
                     continue
                 if is_dirty:
                     dirty.append(slug)
                     content_changed_of[slug] = file_hash != stored.get("file_hash")
             dirty.sort(key=lambda s: (not content_changed_of.get(s, True), s))
-        if dirty_scan_errors:
+        if run["extra"].get("dirty_scan_errors"):
             reasons.append("unknown")
-            run["extra"]["dirty_scan_errors"] = sorted(dirty_scan_errors)[:5]
 
         # R2-C09 (post_implementation R2): the one-slot reservation for a
         # waiting new file that used to live here is REMOVED -- it violated
@@ -1982,14 +2091,24 @@ def _record(reason, started, run, work_left_behind):
     round-end write existed, and removing the write removed the need for
     the follow-up row with it.
 
-    R3-T05 (post_implementation R3): the one case this does NOT cover is
-    the worker thread being ABANDONED (``timeout``) rather than returning
-    normally -- ``run_with_deadline`` cannot kill it, only stop waiting
-    for it, so it keeps running and MAY still be mid-write (or about to
-    start one) in ``_collect`` at the exact moment THIS function runs. A
-    genuine failure in such a write has no row left to fold into; see the
-    module docstring's own correction of this same point, under A9-7, for
-    the full reasoning and why the window is narrow and self-correcting.
+    R3-T05 (post_implementation R3; narrowed by R4-C1, post_implementation
+    R4): the one case this does NOT cover is the worker thread being
+    ABANDONED (``timeout``) rather than returning normally --
+    ``run_with_deadline`` cannot kill it, only stop waiting for it, so it
+    keeps running and MAY still be mid-write (or about to start one) in
+    ``_collect`` at the exact moment THIS function runs. After R4-C1 that
+    write can no longer be one of this round's own ONE-TIME facts (those
+    are now written into ``run`` before it starts, see
+    ``_tally_result``'s own docstring) -- only a single file's own LOCAL
+    bookkeeping (its state entry, the cursor, ``reconciled``) is still at
+    risk, and a genuine failure in that one write has no row left to fold
+    into. In a real process the window closes within
+    ``_LEDGER_BUDGET_SECONDS`` of this function's own write starting --
+    ``_hook_runner.finish``'s ``os._exit(0)`` genuinely kills the stuck
+    thread along with the rest of the process; see the module docstring's
+    own correction of this same point, under A9-7, for the full reasoning
+    and why the window is narrow and self-correcting, not merely assumed
+    to be.
     """
     elapsed_ms = int((time.monotonic() - started) * 1000)
     # A work thread abandoned mid-call never reaches the line that assigns
@@ -2088,9 +2207,23 @@ def main():
     # on its own schedule. Purely additive on the NORMAL-completion path
     # (both facts are already in `run["reasons"]` by then too) --
     # `also_failed` dedupes, so this changes nothing there.
+    # R4-C1 (post_implementation R4): a THIRD and FOURTH fact `_collect`
+    # can already know at the instant a worker thread is abandoned, for
+    # the exact same reason the two above are reconstructed here --
+    # `_tally_result` (dedup_merged's own accounting) and the dirty-scan
+    # loop's own per-slug write (dirty_scan_errors) now both happen BEFORE
+    # that file's own blocking per-file persist, but neither one, by
+    # itself, gets its fact into `run["reasons"]` too: that still happens
+    # only once the CALLER's `reasons.extend(...)` runs, which an
+    # abandoned thread never reaches either. Purely additive on the
+    # normal-completion path, same as the two above.
     reasons_seen = list(run.get("reasons") or [])
     if run["extra"].get("unresolved_files") and "unknown" not in reasons_seen:
         reasons_seen.append("unknown")
+    if run["extra"].get("dirty_scan_errors") and "unknown" not in reasons_seen:
+        reasons_seen.append("unknown")
+    if run["extra"].get("dedup_merged") and "dedup_merged" not in reasons_seen:
+        reasons_seen.append("dedup_merged")
     for failed_entry in list(run["extra"].get("failed") or []):
         failed_reason = failed_entry.get("reason")
         if failed_reason:
