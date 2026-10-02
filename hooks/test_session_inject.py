@@ -1478,13 +1478,48 @@ class _NonOSErrorBrokenStderr:
 class _RaisingStdout:
     """A stand-in for ``sys.stdout`` whose ``write`` always raises -- what a
     closed stdout pipe (the host already gone) looks like to
-    ``sys.stdout.write(...)``. No ``flush``/``fileno`` needed: ``write``
-    itself raises before ``main()`` ever reaches its own
-    ``sys.stdout.flush()``, and ``_silence_stdout``'s own blanket
-    ``except Exception: pass`` tolerates a missing ``fileno`` just fine."""
+    ``sys.stdout.write(...)``. No ``flush`` needed: ``write`` itself raises
+    before ``main()`` ever reaches its own ``sys.stdout.flush()``.
+
+    Deliberately has no ``fileno`` either -- that also makes it this file's
+    own ``TestSilenceStdout`` fixture below, not only
+    ``TestRecordRunsBeforeTheDiagnosticPrint``'s. ``_silence_stdout``'s
+    blanket ``except Exception: pass`` does tolerate the resulting
+    missing-``fileno()`` ``AttributeError`` without raising, but "tolerates
+    ... just fine" overstated it (R2-K2): before that fix, the SAME call
+    leaked the devnull fd it had already opened every time this class stood
+    in for ``sys.stdout`` -- see ``TestSilenceStdout`` for the direct pin."""
 
     def write(self, *args, **kwargs):
         raise OSError("stdout closed")
+
+
+class TestSilenceStdout(unittest.TestCase):
+    """``_silence_stdout`` (``main()``'s own ``except Exception`` around the
+    brief write, further down, calls it) must resolve ``sys.stdout.
+    fileno()`` BEFORE opening the devnull fd it dup2's onto that descriptor
+    -- the same ordering this file's own local ``_silence_stderr`` (for the
+    import guards, above) and ``_hook_runner._silence_stderr`` already use,
+    and for the same reason: a stand-in stream with no real ``fileno()`` at
+    all (``_RaisingStdout`` above, this hook's own C6 test fixture) must not
+    leave the just-opened devnull fd dangling when that call raises
+    (R2-K2)."""
+
+    def test_does_not_leak_a_devnull_fd_when_fileno_is_unavailable(self):
+        opened = []
+        real_open = os.open
+
+        def tracking_open(path, flags):
+            fd = real_open(path, flags)
+            opened.append(fd)
+            return fd
+
+        with mock.patch.object(_MOD.os, "open", side_effect=tracking_open), \
+                mock.patch.object(sys, "stdout", _RaisingStdout()):
+            _MOD._silence_stdout()  # _RaisingStdout has no .fileno() at all; must not raise
+        for fd in opened:
+            with self.assertRaises(OSError):
+                os.fstat(fd)  # fstat on a closed fd raises EBADF; a leaked one would not
 
 
 class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):

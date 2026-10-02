@@ -647,11 +647,22 @@ def _silence_stdout():
     Python flushes stdout again at exit. Against a pipe the host has already
     closed that fails again, and the process exits 120 -- a hook error from a
     plugin whose contract is exit 0, always.
+
+    ``sys.stdout.fileno()`` is resolved BEFORE ``os.open`` (R2-K2: an earlier
+    revision opened the devnull fd FIRST and left it dangling whenever
+    ``fileno()`` itself raised -- a stand-in stream with no real descriptor
+    at all, such as this file's own ``_RaisingStdout`` test fixture, or a
+    real ``sys.stdout`` with no fd behind it). Mirrors the ordering this
+    file's own local ``_silence_stderr`` (for the import guards, above) and
+    ``_hook_runner._silence_stderr`` already use, for the same reason.
     """
     try:
+        target_fd = sys.stdout.fileno()
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
-        os.close(devnull)
+        try:
+            os.dup2(devnull, target_fd)
+        finally:
+            os.close(devnull)
     except Exception:
         pass  # not a real file descriptor (tests), or nothing left to protect
 
@@ -692,15 +703,20 @@ def main():
     # this comment, which claimed "_collect never prints: a thread that may
     # be abandoned must stay off stdio"): _collect DOES print, on this same
     # worker thread -- its own `except Exception` around `_failure_report`
-    # below reports a broken ledger read via a bare `print(...,
+    # above reports a broken ledger read via a bare `print(...,
     # file=sys.stderr)`. That is exactly WHY `guard_stderr()` above must run
     # before this call, not after: without it, that print would hit the
-    # SAME two failure shapes `_warn` itself guards against (fd 2 closed
-    # before start -> falls back to sys.stdout, corrupting this hook's own
-    # injected-context channel; stderr's read end already closed ->
-    # BrokenPipeError escapes `_collect` entirely, turning a benign
-    # `not_configured` run into a spurious `http_error`). Pinned by
-    # test_session_inject.py's TestGuardStderrPrecedesTheWorkerThread.
+    # SAME two failure shapes the import guards' own `_import_warn` (above)
+    # handles locally (fd 2 closed before start -> falls back to sys.stdout,
+    # corrupting this hook's own injected-context channel; stderr's read end
+    # already closed -> BrokenPipeError escapes `_collect` entirely, turning
+    # a benign `not_configured` run into a spurious `http_error`). This
+    # file's own `_warn` (below) is a bare `print(..., file=sys.stderr)`
+    # too, with no such handling of its own -- it relies solely on
+    # `guard_stderr()` above, same as this print (R2-K4, correcting an
+    # earlier revision of this comment that credited `_warn` itself with
+    # guarding against these). Pinned by test_session_inject.py's
+    # TestGuardStderrPrecedesTheWorkerThread.
     outcome, left_behind = _hook_runner.run_with_deadline(
         lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
     )

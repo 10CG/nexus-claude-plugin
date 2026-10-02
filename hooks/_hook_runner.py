@@ -319,8 +319,8 @@ class _StderrGuard:
     A write failing here is swallowed by the ``except OSError`` below on
     EVERY call through this object, not only the first -- including the
     ``.flush()`` CPython's own unconditional reflush at shutdown makes
-    against this SAME guard again. ``_silence_stderr()``, run on that first
-    failure, additionally reroutes the underlying file descriptor to
+    against this SAME guard again. ``_silence_stderr(self._real)``, run on
+    that first failure, additionally reroutes the underlying file descriptor to
     ``os.devnull`` so a LATER write through this object does not merely get
     swallowed but actually succeeds -- a second, non-redundant layer for
     anything that reads the written bytes back (nothing in this plugin

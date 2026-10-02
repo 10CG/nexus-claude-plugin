@@ -260,6 +260,52 @@ class TestSilenceStderr(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(fd)  # fstat on a closed fd raises EBADF; a leaked one would not
 
+    def test_redirects_the_passed_streams_own_fd_not_a_different_one(self):
+        """R2-K1: the test above (and every other test in this class) passes
+        a stand-in object straight to the function -- none of them can tell
+        ``stream.fileno()`` (the argument, correct since C3) apart from
+        ``sys.stderr.fileno()`` (the GLOBAL, what an earlier revision read
+        instead) in a case where the two are not already the same fd by
+        construction. This one gives the function a private pipe's write
+        end -- deliberately never fd 2 -- and checks THAT descriptor, not
+        merely that nothing raised. Found, by mutation, to be the gap it
+        looks like: reverting line 282 back to ``sys.stderr.fileno()`` --
+        the exact pre-C3 shape -- redirects the real fd 2 instead and the
+        REST of this file's own test output silently vanishes into
+        /dev/null from that point on (no failure text, no summary line,
+        only a non-zero exit code) -- the live consequence ``guard_stderr``
+        exists to prevent, reproduced here against this suite's own fd 2
+        rather than argued about.
+
+        Protects the real fd 2 regardless of which way this goes: if the
+        regression above is present, this call redirects the test process's
+        OWN real stderr to devnull instead of the pipe, and the restore
+        below undoes exactly that before the test ends."""
+        saved = os.dup(2)
+        self.addCleanup(os.close, saved)
+        self.addCleanup(os.dup2, saved, 2)  # LIFO: restore fd 2 BEFORE closing `saved`
+        before_fd2 = os.fstat(2)
+
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+
+        class _PipeStream:
+            def fileno(self):
+                return write_fd
+
+        try:
+            _hook_runner._silence_stderr(_PipeStream())
+            self.assertTrue(
+                os.path.samestat(os.fstat(write_fd), os.stat(os.devnull)),
+                "the STREAM's own fd must now point at devnull",
+            )
+            self.assertTrue(
+                os.path.samestat(os.fstat(2), before_fd2),
+                "fd 2 (this test process's real stderr) must be untouched",
+            )
+        finally:
+            os.close(write_fd)
+
 
 class TestStderrGuard(unittest.TestCase):
     """``_StderrGuard`` itself (moved here from handoff_sync.py by Amendment
@@ -303,14 +349,21 @@ class TestStderrGuard(unittest.TestCase):
     def test_wrapping_a_broken_real_stream_does_not_raise(self):
         """The direct pin the test above cannot provide -- calls
         ``_StderrGuard``'s own ``write``/``flush`` straight, with nothing
-        upstream able to paper over a regression here. ``sys.stderr`` is
-        patched to this SAME guard object first: ``_silence_stderr()``
-        (triggered internally by the OSError below) reads the GLOBAL
-        ``sys.stderr``, not ``self``, and this keeps that call safe -- it
+        upstream able to paper over a regression here. Since C3, the guard's
+        own ``except OSError`` calls ``_silence_stderr(self._real)`` -- the
+        stream THIS guard wraps, never the global ``sys.stderr`` -- so it
         delegates through ``_BrokenStderr``'s missing ``fileno()`` (an
         ``AttributeError``, swallowed by ``_silence_stderr``'s own blanket
-        except) instead of redirecting the REAL test process's fd 2 to
-        ``/dev/null`` for the rest of the suite."""
+        except) regardless of what ``sys.stderr`` happens to be at the time.
+        Patching ``sys.stderr`` to this SAME guard object below is therefore
+        not load-bearing for THIS test -- it is only what the comment block
+        further down (ahead of ``test_write_failure_silences_the_wrapped_
+        stream_not_the_global_one``) calls the "invisible either way" case,
+        kept so this test does not quietly depend on whatever ``sys.stderr``
+        is left as by an earlier test. ``TestSilenceStderr.test_redirects_
+        the_passed_streams_own_fd_not_a_different_one`` above is what
+        actually pins the argument-vs-global distinction itself, with a
+        real fd instead of a mocked ``_silence_stderr``."""
         guard = _hook_runner._StderrGuard(_BrokenStderr())
         with mock.patch.object(sys, "stderr", guard):
             self.assertEqual(guard.write("x"), 1)  # swallowed, not raised
