@@ -655,6 +655,68 @@ class TestExplicitPathState(_TempStateDir):
         self.assertEqual(on_disk, healthy)
         self.assertEqual(read_reasons, [])
 
+    def test_an_eacces_read_failure_during_update_self_heals_via_rename(self):
+        """R3-T02: EACCES/EPERM are NOT the same shape as a transient EIO
+        -- this uid cannot read this file now and will not be able to
+        later either (the permission bits, or the owner, are what is
+        wrong), so the file's CONTENT is already useless to this process,
+        exactly like a missing or corrupt one. The normal atomic-rename
+        write only needs write+execute on the DIRECTORY, not on the file
+        being replaced, so it still succeeds even though this open()
+        itself cannot -- self-healing the condition instead of refusing
+        to write forever (which is what made the condition permanent:
+        R2-C06 treated EVERY non-ENOENT OSError, EACCES included, as
+        "could not confirm safe, refuse")."""
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"cursor": 1}')
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == path:
+                raise PermissionError(13, "Permission denied")
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
+                mock.patch("sys.stderr") as stderr:
+            new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 99})
+        self.assertNotIn("state_write_failed", reasons)
+        self.assertEqual(new, {"cursor": 99})
+        self.assertTrue(stderr.write.called, "the read failure must still be diagnosed on stderr")
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn(path, printed)
+        # Read it back for REAL, outside the patch: the rename genuinely landed.
+        on_disk, read_reasons = _hook_state.read_state_at(path)
+        self.assertEqual(on_disk, {"cursor": 99})
+        self.assertEqual(read_reasons, [])
+
+    def test_an_eio_read_failure_during_update_still_refuses_with_a_diagnostic(self):
+        """The other half of the same split: a TRANSIENT failure (EIO and
+        friends) stays NOT rebuildable, unchanged from R2-C06 -- but now
+        prints a distinct "refusing to overwrite" diagnostic alongside
+        the read-side one, where the previous code printed nothing at all
+        on this branch."""
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"cursor": 1}')
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == path:
+                raise OSError(5, "Input/output error")
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
+                mock.patch("sys.stderr") as stderr:
+            new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 99})
+        self.assertIn("state_write_failed", reasons)
+        self.assertTrue(stderr.write.called)
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn(path, printed)
+        self.assertIn("refusing", printed.lower())
+
     def test_corrupt_json_during_an_update_still_rebuilds_and_is_not_a_failure(self):
         """The other half of the same split: a file that reads fine at the
         OS level but is not valid JSON (or not a JSON object) is genuine

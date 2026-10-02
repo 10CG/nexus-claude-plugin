@@ -791,6 +791,48 @@ class TestDelete(_ClientCase):
         self.assertEqual((out.reason, out.deleted, out.action), ("http_error", 0, None))
 
 
+class TestDeleteWriteStatus(_ClientCase):
+    """R3-T06 (memory_sync post_implementation R3): ``write_status`` was
+    previously set only by ``upsert``'s own POST/PATCH, so a caller
+    tallying a DELETE-origin failure (memory_sync's own pending-delete /
+    orphan-reconciliation bookkeeping) had nothing but ``status`` to read
+    -- the last status ANY call on that outcome received, which a lookup's
+    own 200 (or, for a multi-row delete, an EARLIER row's own status)
+    could leave stale once the call that actually failed got no response
+    at all. ``_delete_row`` now sets it on every attempt it makes, exactly
+    like ``upsert``'s own write call -- the LAST row attempted (the one
+    that failed, if any; otherwise the last one that succeeded) is what a
+    caller actually wants to attribute the outcome to."""
+
+    def test_write_status_reflects_the_delete_calls_own_response(self):
+        self.backend.reply(200, _page(_row("s", content_hash="x"))).reply(204, None)
+        out = self.client().delete("fact", "s")
+        self.assertEqual(out.write_status, 204)
+
+    def test_a_second_rows_failure_overwrites_the_first_rows_success(self):
+        a = _row("s", content_hash="x", row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        b = _row("s", content_hash="x", row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(a, b)).reply(204, None).reply(422, {"detail": "nope"})
+        out = self.client().delete("fact", "s")
+        self.assertEqual(out.reason, "rejected_422")
+        self.assertEqual(out.write_status, 422, "must reflect the FAILING row, not the first row's 204")
+
+    def test_write_status_is_none_when_the_delete_call_itself_never_got_a_response(self):
+        self.backend.reply(200, _page(_row("s", content_hash="x")))
+        real_urlopen = _ingest_client.urllib.request.urlopen
+
+        def flaky_opener(req, timeout=None):
+            if req.get_method() == "DELETE":
+                raise TimeoutError("the delete call itself timed out")
+            return real_urlopen(req, timeout=timeout)
+
+        client = _ingest_client.IngestClient(self.backend.url, "", USER, CONTAINER, HOOK, opener=flaky_opener)
+        out = client.delete("fact", "s")
+        self.assertIsNone(out.write_status)
+        self.assertEqual(out.status, 200)  # the last status SEEN is still the lookup's
+        self.assertEqual(out.reason, "timeout")
+
+
 class TestContract(unittest.TestCase):
     def test_every_reason_this_module_emits_is_in_the_tables(self):
         import re

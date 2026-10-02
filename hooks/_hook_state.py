@@ -494,13 +494,36 @@ def _read_state_file_detailed(path):
     JSON, or valid JSON that is not an object) sets ``safe_to_rebuild=True``
     -- rebuilding from empty in those cases is the existing, intentional
     self-heal, not a failure.
+
+    R3-T02 (memory_sync post_implementation R3): ``EACCES``/``EPERM`` are
+    a THIRD shape, distinct from both a transient ``OSError`` and genuine
+    JSON corruption -- this uid cannot read this file NOW and will not be
+    able to LATER either (the permission bits, or the owner, are what is
+    wrong, not a transient blip), so the file's CONTENT is already as
+    useless to this process as a missing or corrupt one. Folding it into
+    the R2-C06 "refuse, report state_write_failed" branch made the
+    refusal itself permanent: the ordinary atomic-rename write that would
+    self-heal it only needs write+execute on the DIRECTORY, never read
+    (or even write) permission on the file being REPLACED, so it would
+    have succeeded the whole time -- but ``_update_state_file`` never
+    attempted it, because this function told it not to. Every OTHER
+    caller of this read (plain ``read_state``/``read_state_at``, which
+    discard ``safe_to_rebuild`` entirely) is unaffected either way: a
+    straight read already has nothing to lose by returning the same
+    placeholder here as before (the PLAIN-READ contract above still
+    holds). Every non-``ENOENT`` ``OSError`` is now diagnosed on stderr
+    with the path (the previous code printed nothing on this branch at
+    all, EACCES/EPERM included).
     """
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return {}, [], True
-    except OSError:
+    except OSError as exc:
+        print(f"[{path}] could not read state: {exc!r}", file=sys.stderr)
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            return {}, ["unknown"], True
         return {}, ["unknown"], False
     except ValueError:
         return {}, ["unknown"], True
@@ -576,6 +599,14 @@ def _update_state_file(path, mutate):
                 # and report the genuine failure; the caller's `current`
                 # is the same placeholder it would get from a plain read,
                 # never a destructive guess persisted to disk.
+                #
+                # R3-T02: a distinct diagnostic from the read-side one
+                # ``_read_state_file_detailed`` already printed above --
+                # the previous code printed nothing at all on this branch,
+                # leaving a reader unable to tell "read failed, so this
+                # update never even attempted a write" apart from any
+                # other `state_write_failed` source.
+                print(f"[{path}] refusing to overwrite: state could not be safely read", file=sys.stderr)
                 reasons.append("state_write_failed")
                 return current, reasons
             try:

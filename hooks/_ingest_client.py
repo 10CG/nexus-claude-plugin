@@ -501,8 +501,26 @@ class IngestClient:
     def _delete_row(self, outcome, memory_id, what):
         """Soft-delete one row. Only the route's own answer counts: 204, or
         404 for a row that is already gone. A 200 with a body is somebody
-        else's page, not a deletion (A8-5)."""
+        else's page, not a deletion (A8-5).
+
+        R3-T06 (memory_sync post_implementation R3): sets ``outcome.
+        write_status`` on every attempt, exactly like ``upsert``'s own
+        POST/PATCH already does -- generalising a name that used to mean
+        "upsert's own write call" to "the write call this Outcome is
+        actually about", covering ``delete()``'s own calls through here
+        too. A caller attributing a DELETE-origin failure (memory_sync's
+        pending-delete / orphan-reconciliation bookkeeping) previously had
+        only ``status`` to read -- the last status ANY call on this
+        outcome received, which an earlier row in the SAME delete loop
+        (when several duplicate rows are found for one external_id) could
+        leave stale once a LATER row's own call got no response at all.
+        Harmless for ``upsert``'s own use of this method (``_dedup``, run
+        BEFORE the real write): ``upsert`` overwrites ``write_status``
+        again right after its own POST/PATCH call, so a dedup delete's
+        value set here is simply superseded, never read in between.
+        """
         response = self._call(outcome, "DELETE", "/memories/" + urllib.parse.quote(memory_id, safe=""))
+        outcome.write_status = response.status if response is not None else None
         if response is None:
             return False
         if response.status in (204, 404):
