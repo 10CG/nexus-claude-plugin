@@ -610,6 +610,63 @@ class TestDedup(_ClientCase):
         self.assertEqual(out.reason, "dedup_merged")
 
 
+class TestWriteStatus(_ClientCase):
+    """R2-C04: ``Outcome.status`` is the last HTTP status ANY ``_call``
+    received on this outcome -- including a dedup ``DELETE`` that runs
+    before the real create/update write. A caller deciding whether the
+    WRITE itself got a 404 (to retry a PATCH whose target vanished) must
+    not be fooled by an earlier, unrelated call's status. ``write_status``
+    is set only by ``upsert``'s own POST/PATCH."""
+
+    def test_a_dedup_deletes_404_does_not_leak_into_write_status_on_patch(self):
+        older, newer = self._two_rows_for_write_status("old")
+        self.backend.reply(200, _page(newer, older))
+        self.backend.reply(404, {"detail": "already gone"})  # the dedup DELETE: counts as merged
+        self.backend.reply(200, {"memory_id": older["memory_id"]})  # the PATCH itself: a real 200
+        out = self.client().upsert("fact", "s", "changed", {})
+        self.assertEqual(out.status, 200)
+        self.assertEqual(out.write_status, 200)
+        self.assertEqual(out.dedup_merged, 1)
+
+    def _two_rows_for_write_status(self, digest):
+        older = _row("s", content_hash=digest, created_at="2026-09-20T00:00:00.000001Z",
+                     row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        newer = _row("s", content_hash=digest, created_at="2026-09-21T00:00:00.000001Z",
+                     row_id="bbbbbbbb-1111-4111-8111-111111111111")
+        return older, newer
+
+    def test_a_dedup_deletes_404_does_not_leak_into_write_status_on_post(self):
+        """The create path: upsert's own write is the POST. The lookup's
+        own GET also goes through ``_call`` and sets ``status`` -- that
+        must not leak into ``write_status`` either."""
+        self.backend.reply(200, _page())
+        self.backend.reply(201, {"memory_id": "m1"})
+        out = self.client().upsert("fact", "s", "c", {})
+        self.assertEqual(out.write_status, 201)
+
+    def test_write_status_is_none_when_the_write_call_itself_never_got_a_response(self):
+        """A transport failure on the PATCH itself (not an earlier call)
+        must leave write_status None -- never confused with a real 404
+        the write call received."""
+        older, newer = self._two_rows_for_write_status("old")
+        self.backend.reply(200, _page(newer, older))
+        self.backend.reply(404, {"detail": "already gone"})
+        real_urlopen = _ingest_client.urllib.request.urlopen
+
+        def flaky_opener(req, timeout=None):
+            if req.get_method() == "PATCH":
+                raise TimeoutError("the write call itself timed out")
+            return real_urlopen(req, timeout=timeout)
+
+        client = _ingest_client.IngestClient(
+            self.backend.url, "", USER, CONTAINER, HOOK, opener=flaky_opener,
+        )
+        out = client.upsert("fact", "s", "changed", {})
+        self.assertIsNone(out.write_status)
+        self.assertEqual(out.status, 404)  # the last status SEEN is still the dedup delete's
+        self.assertEqual(out.reason, "timeout")
+
+
 class TestRedaction(_ClientCase):
     def test_content_and_every_metadata_string_are_redacted_before_send_and_counted(self):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m"})
@@ -864,6 +921,20 @@ class TestReviewRound1(_ClientCase):
         self.assertEqual(out.memory_id, rows[-1]["memory_id"])  # the earliest of the page
         self.assertIn("page full", out.detail)
         self.assertTrue(err.write.called)
+
+    def test_page_rows_reflects_the_raw_page_not_the_verified_count(self):
+        """R2-C11: a caller deciding whether a lookup page was FULL (more
+        duplicates may exist beyond it) needs the RAW row count the
+        response actually carried, not `found` (the count AFTER
+        `_is_ours` filtering) -- a page with LOOKUP_LIMIT raw rows where
+        most fail verification must still read as "full"."""
+        ours = _row("s", content_hash="x", row_id="11111111-1111-4111-8111-111111111111")
+        foreign = _row("someone-elses/s", content_hash="y", row_id="22222222-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(ours, foreign, foreign, foreign, foreign)).reply(204, None)
+        out = self.client().delete("fact", "s")
+        self.assertEqual(out.found, 1)
+        self.assertEqual(out.page_rows, 5)
+        self.assertEqual(out.deleted, 1)
 
     def test_delete_carries_no_content_type_and_bulk_on_writes(self):
         """A8-9: `Content-Type: application/json` with no body."""

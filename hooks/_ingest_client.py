@@ -182,7 +182,23 @@ class Outcome:
         # duplicates than `LOOKUP_LIMIT` holds), neither of which this
         # client itself retries beyond the next run's own lookup.
         self.found = 0
-        self.status = None  # last HTTP status seen
+        # The RAW row count the lookup page actually carried, before
+        # `_is_ours` verification (R2-C11; set only by `_lookup`). `found`
+        # (above) is the VERIFIED count, which can be smaller than the page
+        # a caller needs to know was FULL -- a page with LOOKUP_LIMIT raw
+        # rows where one fails verification still means more duplicates may
+        # exist beyond it, even though `found` alone reads as "not full".
+        self.page_rows = 0
+        self.status = None  # last HTTP status seen (ANY call on this outcome, e.g. a dedup DELETE)
+        # The status the upsert's OWN write (POST or PATCH) received, set
+        # only by `upsert` right after that call -- never by `_lookup`'s own
+        # GET or `_dedup`'s own DELETE (R2-C04). `status` above is clobbered
+        # by every `_call`, so a caller deciding "did the WRITE itself get a
+        # 404" must read this, not `status` -- a dedup delete that happens
+        # to 404 (counted as success) must not be mistaken for the write.
+        # `None` when the write call never got a response at all (a
+        # transport failure/timeout), distinct from a real 404.
+        self.write_status = None
         self.retry_after = None
         self.detail = None  # last error body / message, for stderr
 
@@ -443,6 +459,7 @@ class IngestClient:
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             outcome.fail("http_error", "lookup: 2xx but not a memory list")
             return None
+        outcome.page_rows = len(rows)  # R2-C11: the RAW count, before verification
         verified = [r for r in rows if self._is_ours(r, layer, external_id)]
         if rows and not verified:
             outcome.fail("filter_suspect", f"lookup returned {len(rows)} row(s), none with our keys")
@@ -573,6 +590,7 @@ class IngestClient:
                 "/memories",
                 body={"user_id": self.user_id, "content": content, "memory_type": "semantic", "metadata": meta},
             )
+            outcome.write_status = response.status if response is not None else None
             if response is None or self._refused(outcome, response, "create"):
                 return outcome
             body = response.json()
@@ -613,6 +631,7 @@ class IngestClient:
             "/memories/" + urllib.parse.quote(row["memory_id"], safe=""),
             body=patch,
         )
+        outcome.write_status = response.status if response is not None else None
         if response is None or self._refused(outcome, response, "update"):
             return outcome
         body = response.json()

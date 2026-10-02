@@ -618,6 +618,60 @@ class TestExplicitPathState(_TempStateDir):
             fh.write("{not json")
         self.assertEqual(_hook_state.read_state_at(path), ({}, ["unknown"]))
 
+    def test_a_transient_read_failure_during_update_does_not_overwrite_healthy_state(self):
+        """R2-C06: a read-side OSError that is NOT corruption (EIO, ESTALE,
+        too many open files, ...) must not be treated as "nothing here,
+        safe to rebuild" -- update_state_at must refuse to write at all,
+        leaving the file's real (healthy) content on disk untouched, and
+        report the genuine failure as state_write_failed. The previous
+        behaviour silently overwrote a HEALTHY file with data derived from
+        an empty dict, because the read side folded "could not even read
+        it" and "read it, it is corrupt" into the same unknown reason."""
+        path = self._path("memory-sync", "-x-y.json")
+        healthy = {"cursor": 7, "files": {"f1": {"file_hash": "sha256:ok"}}}
+        reasons = _hook_state.write_state_at(path, healthy)
+        self.assertEqual(reasons, [])
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == path:
+                raise OSError(5, "Input/output error")
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
+                mock.patch("sys.stderr"):
+            new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 99})
+        # The read side also reports its own `unknown` (it could not even
+        # open the file) alongside the genuine `state_write_failed` --
+        # callers that only react to `state_write_failed` (every
+        # memory_sync.py call site, via `_fold_persist_reasons`) are
+        # unaffected either way; this assertion is about the failure
+        # actually being there, not about it being the ONLY one.
+        self.assertIn("state_write_failed", reasons)
+        # Read it back for REAL, outside the patch: the file on disk must
+        # be exactly what it was before the failed update, not {} and not
+        # a mutation applied to {}.
+        on_disk, read_reasons = _hook_state.read_state_at(path)
+        self.assertEqual(on_disk, healthy)
+        self.assertEqual(read_reasons, [])
+
+    def test_corrupt_json_during_an_update_still_rebuilds_and_is_not_a_failure(self):
+        """The other half of the same split: a file that reads fine at the
+        OS level but is not valid JSON (or not a JSON object) is genuine
+        corruption, not a transient failure -- update_state_at may rebuild
+        from empty exactly as before, and that rebuild is NOT itself
+        state_write_failed (ruling item 4: a repaired corrupt file whose
+        write still lands is not a failure)."""
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 1})
+        self.assertEqual(new, {"cursor": 1})
+        self.assertNotIn("state_write_failed", reasons)
+        self.assertIn("unknown", reasons)
+        self.assertEqual(_hook_state.read_state_at(path), ({"cursor": 1}, []))
+
     def test_two_cwds_sharing_a_basename_get_distinct_paths(self):
         """The exact X1 corollary failure shape: two worktrees both named
         "nexus" must not resolve to the same state file the way

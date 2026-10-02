@@ -466,18 +466,47 @@ def _read_state_file(path):
 
     A missing file is a first run, not a problem. A corrupt one rebuilds from
     empty and reports ``unknown``, because the hook is about to behave as
-    though it had never synced anything.
+    though it had never synced anything. This is the PLAIN-READ contract
+    (unchanged, R2-C06): a straight read has nothing to lose by returning a
+    placeholder for a file it could not even open -- the caller was not
+    about to write anything derived from it. ``_update_state_file`` below
+    cannot make the same call; see ``_read_state_file_detailed``.
+    """
+    data, reasons, _safe_to_rebuild = _read_state_file_detailed(path)
+    return data, reasons
+
+
+def _read_state_file_detailed(path):
+    """``(data, reasons, safe_to_rebuild)`` -- the read-modify-write path's
+    own view of the same read, distinguishing WHY ``data`` came back empty.
+
+    R2-C06 (post_implementation R2): ``_update_state_file`` used to call
+    the 2-tuple ``_read_state_file`` and treat ANY ``{}`` it got back --
+    missing, corrupt, OR merely unreadable this instant -- as "safe to
+    rebuild from nothing", then unconditionally WROTE ``mutate({})`` over
+    whatever was really on disk. A transient read-side failure (``EIO``,
+    ``ESTALE``, too many open files -- the file is fine, this one open()
+    just failed) is not corruption: ``current`` here is a PLACEHOLDER that
+    never reflected the real file, and ``safe_to_rebuild=False`` tells the
+    caller to refuse the write entirely and report the genuine failure
+    (``state_write_failed``, ruling item 4) rather than destroy a healthy
+    file. Only a missing file (a first run) or GENUINE corruption (invalid
+    JSON, or valid JSON that is not an object) sets ``safe_to_rebuild=True``
+    -- rebuilding from empty in those cases is the existing, intentional
+    self-heal, not a failure.
     """
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return {}, []
-    except (OSError, ValueError):
-        return {}, ["unknown"]
+        return {}, [], True
+    except OSError:
+        return {}, ["unknown"], False
+    except ValueError:
+        return {}, ["unknown"], True
     if not isinstance(data, dict):
-        return {}, ["unknown"]
-    return data, []
+        return {}, ["unknown"], True
+    return data, [], True
 
 
 def read_state(name, cwd):
@@ -537,8 +566,18 @@ def _update_state_file(path, mutate):
     new = {}
     try:
         with _locked(path, reasons):
-            current, read_reasons = _read_state_file(path)
+            current, read_reasons, safe_to_rebuild = _read_state_file_detailed(path)
             reasons.extend(read_reasons)
+            if not safe_to_rebuild:
+                # R2-C06: the read itself failed (not corruption) --
+                # `current` is a placeholder, not this project's real
+                # state. Writing anything derived from it would overwrite
+                # a HEALTHY file with data built from {}. Refuse the write
+                # and report the genuine failure; the caller's `current`
+                # is the same placeholder it would get from a plain read,
+                # never a destructive guess persisted to disk.
+                reasons.append("state_write_failed")
+                return current, reasons
             try:
                 new = mutate(dict(current))
             except Exception as exc:  # noqa: BLE001 - caller bug, not ours

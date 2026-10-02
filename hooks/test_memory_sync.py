@@ -1107,6 +1107,119 @@ class TestOrphanReconciliation(_WriteCase):
         self.assertFalse(self._state().get("reconciled"))
 
 
+class TestR2C01IndeterminateFilesNeverOrphaned(_WriteCase):
+    """R2-C01: a slug ``_list_memory_files`` could not conclusively
+    resolve (``indeterminate`` -- a dangling symlink, an lstat failure)
+    must be treated as "still present" everywhere a vanished-file or
+    orphan decision is made -- including orphan RECONCILIATION, which the
+    previous version left OUT of the candidate set it passed as "local
+    slugs" (only ``set(local_files)``): an indeterminate file's server
+    row then looked exactly like every other orphan and got soft-deleted
+    the moment it fell inside the guard's ceiling, with no trace in the
+    ledger that it was ever anything other than a normal cleanup."""
+
+    def test_a_dangling_symlink_is_never_orphan_deleted_during_reconciliation(self):
+        self._write("kept")
+        linked_target = os.path.join(self.tmp.name, "nonexistent-target.md")
+        linked_path = os.path.join(self.memory_dir, "linked.md")
+        os.symlink(linked_target, linked_path)
+        linked_row = _row(self._ext("linked"))
+        self.backend.reply(200, _page(linked_row))
+        self.backend.reply(200, _page())  # ends the listing scan
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # "kept": new file
+        self._run()
+        deletes = [r for r in self.requests if r["method"] == "DELETE"]
+        self.assertEqual(deletes, [], self.requests)
+        self.assertEqual(len(self.requests), 4, self.requests)  # the 2 listing GETs + kept's own 2
+        posts = [r for r in self.requests if r["method"] == "POST"]
+        self.assertEqual(len(posts), 1, self.requests)
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertIn("linked", entry.get("unresolved_files", []))
+
+    def test_an_lstat_failure_mock_twin_is_never_orphan_deleted(self):
+        """Mock twin of the real dangling symlink above, pinned under
+        root / any platform by failing ``os.lstat`` for the one entry."""
+        self._write("kept")
+        linked_path = os.path.join(self.memory_dir, "linked.md")
+        with open(linked_path, "w", encoding="utf-8") as fh:
+            fh.write("placeholder")
+        real_lstat = os.lstat
+
+        def flaky_lstat(path, *a, **kw):
+            if path == linked_path:
+                raise PermissionError(13, "Permission denied")
+            return real_lstat(path, *a, **kw)
+
+        linked_row = _row(self._ext("linked"))
+        self.backend.reply(200, _page(linked_row))
+        self.backend.reply(200, _page())
+        self.backend.reply(*_empty_lookup()).reply(*_created())
+        with mock.patch.object(os, "lstat", side_effect=flaky_lstat):
+            self._run()
+        deletes = [r for r in self.requests if r["method"] == "DELETE"]
+        self.assertEqual(deletes, [], self.requests)
+        self.assertEqual(len(self.requests), 4, self.requests)
+        posts = [r for r in self.requests if r["method"] == "POST"]
+        self.assertEqual(len(posts), 1, self.requests)
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertIn("linked", entry.get("unresolved_files", []))
+
+    def test_steady_state_with_an_unresolvable_file_is_reported_every_round(self):
+        """Once a project IS reconciled, a permanently-indeterminate file
+        (a dangling symlink nobody ever fixes) must keep being reported
+        every round -- not silently and permanently ignored just because
+        there happens to be no network call to make for it specifically."""
+        kept_path = self._write("kept")
+        st = os.stat(kept_path)
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key),
+            {"cursor": 0, "reconciled": True, "files": {"kept": {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(kept_path), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }}},
+        )
+        linked_target = os.path.join(self.tmp.name, "nonexistent-target.md")
+        os.symlink(linked_target, os.path.join(self.memory_dir, "linked.md"))
+        self._run()
+        self.assertEqual(self.requests, [])
+        entry = self._last_entry()
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertIn("linked", entry.get("unresolved_files", []))
+        self.requests.clear()
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "unknown")
+
+    def test_the_pending_delete_path_also_never_treats_an_indeterminate_slug_as_vanished(self):
+        """Not itself a regression (the pending-delete walk already
+        excluded ``indeterminate`` before this fix) -- locked in
+        alongside the reconciliation fix so the two paths cannot drift
+        apart again."""
+        path = self._write("was-synced")
+        st = os.stat(path)
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key),
+            {"cursor": 0, "reconciled": True, "files": {"was-synced": {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }}},
+        )
+        # Replaced by a dangling symlink of the SAME name -- still
+        # "there" (indeterminate), not genuinely gone.
+        os.remove(path)
+        os.symlink(os.path.join(self.tmp.name, "nonexistent.md"), path)
+        self._run()
+        self.assertEqual([r["method"] for r in self.requests if r["method"] == "DELETE"], [])
+        self.assertIn("was-synced", self._state().get("files", {}))
+
+
 class TestX1PrefixIsolation(_WriteCase):
     """X1 (owner 2026-10-01): required tests (a)-(c) from the owner ruling."""
 
@@ -1261,18 +1374,27 @@ class TestPerFileStateWriteFailure(_WriteCase):
     before this fix, so a failing write there silently vanished -- the run
     was recorded clean even though nothing was actually persisted."""
 
-    def _fail_first_update(self):
-        """Patches ``_hook_state.update_state_at`` so its FIRST call (the
-        per-file persist under test) returns a genuine failure without
-        writing anything, while every LATER call (the round-end
-        cursor/reconciled persist) runs for real -- a transient failure on
-        exactly one write, not a wholesale breakage of the primitive."""
+    def _fail_update_for_slug(self, slug):
+        """Patches ``_hook_state.update_state_at`` so the ONE call whose
+        mutate closure is specifically for ``slug`` -- identified by
+        ``slug`` appearing among that closure's own default-argument
+        values, since every per-file merge/drop write closes over the
+        slug it is for -- returns a genuine failure without writing
+        anything, while every OTHER call (reconciliation's own
+        reconciled/placeholder persist, a cursor-only advance, a
+        DIFFERENT file's own write) runs for real. Identifying the call
+        this way (R2-C03), rather than by ordinal position, survives the
+        reconciliation block now ALSO persisting (reconciled=True) before
+        a brand-new file's own cursor-walk write -- call ORDER is no
+        longer a stable way to pick out one specific file's write."""
         real = _hook_state.update_state_at
-        calls = []
 
         def side_effect(path, mutate):
-            calls.append(path)
-            if len(calls) == 1:
+            try:
+                is_for_slug = slug in (mutate.__defaults__ or ())
+            except Exception:
+                is_for_slug = False
+            if is_for_slug:
                 current, _ = _hook_state.read_state_at(path)
                 return current, ["state_write_failed"]
             return real(path, mutate)
@@ -1286,7 +1408,7 @@ class TestPerFileStateWriteFailure(_WriteCase):
         self._write("f1")
         self.backend.reply(*_empty_lookup())  # reconciliation
         self.backend.reply(*_empty_lookup()).reply(*_created("m1"))
-        with self._fail_first_update():
+        with self._fail_update_for_slug("f1"):
             self._run()
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "state_write_failed")
@@ -1317,7 +1439,7 @@ class TestPerFileStateWriteFailure(_WriteCase):
         _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
         os.remove(path)
         self.backend.reply(200, _page(_row(self._ext("gone")))).reply(204, None)
-        with self._fail_first_update():
+        with self._fail_update_for_slug("gone"):
             self._run()
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "state_write_failed")
@@ -1671,48 +1793,12 @@ class TestK01ZeroLocalFilesPendingDelete(_WriteCase):
 
 
 class TestK02RoundFactsSurviveTheRecord(_WriteCase):
-    def test_a_round_end_persist_failure_is_a_followup_row_not_a_lost_main_row(self):
-        """K02 (ruling item 4 / the handoff_sync-converged shape): the
-        round's cursor/reconciled advance now happens in ``_record``,
-        AFTER the main ledger row -- a genuine failure to persist it must
-        not retroactively corrupt that already-written row; it is a
-        SEPARATE follow-up row."""
-        self._write("f1")
-        self.backend.reply(*_empty_lookup())  # reconciliation: sets new_reconciled True
-        self.backend.reply(*_empty_lookup()).reply(*_created("m1"))
-        real = _hook_state.update_state_at
-
-        # Fail only the ROUND-END persist, recognised by its own mutate
-        # closure's parameter names (every PER-FILE persist's mutate closes
-        # over "slug"/"entry"/"to_register" instead -- see memory_sync.py's
-        # own _mutate in _record) -- not by call order, which this fix is
-        # explicitly allowed to rearrange.
-        def selective(path, mutate):
-            try:
-                is_round_end = "cursor" in mutate.__code__.co_varnames
-            except Exception:
-                is_round_end = False
-            if is_round_end:
-                current, _ = _hook_state.read_state_at(path)
-                return current, ["state_write_failed"]
-            return real(path, mutate)
-
-        with mock.patch.object(_hook_state, "update_state_at", side_effect=selective):
-            self._run()
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        self.assertGreaterEqual(len(entries), 2, entries)
-        main_row, followup = entries[-2], entries[-1]
-        self.assertEqual(main_row["reason"], "none")
-        self.assertTrue(main_row["ok"])
-        self.assertEqual(followup["reason"], "state_write_failed")
-        self.assertFalse(followup["ok"])
-        # The file itself DID sync (the per-file persist was not touched).
-        self.assertIn("f1", self._state().get("files", {}))
-
     def test_also_failed_is_present_even_empty_on_a_timeout_row(self):
-        """K02 ruling item 3: main()'s own abnormal-exit branch always
-        sets also_failed (even to []), since _collect's own normal-path
-        computation never ran. A REAL worker-thread abandonment -- every
+        """Ruling item 6 (A9-20): main()'s own also_failed computation
+        (R2-C12: now the ONLY computation, unconditional for every path,
+        not just this abnormal-exit one) always sets the key (even to
+        []), since _collect's own per-round reasons list may be abandoned
+        mid-round. A REAL worker-thread abandonment -- every
         network call is itself deadline-aware (by design: that is what
         stops a slow SERVER from ever producing this scenario in
         production), so this pins it the only way left: a LOCAL,
@@ -1732,6 +1818,263 @@ class TestK02RoundFactsSurviveTheRecord(_WriteCase):
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "timeout")
         self.assertIn("also_failed", entry)
+
+
+class TestR2C03PerFileCursorPersistence(_WriteCase):
+    """R2-C03 (A9-7 as actually ruled, post_implementation R2): the
+    round's cursor and reconciled flag are persisted the INSTANT they are
+    known -- per file for the cursor (merged into that file's own state
+    entry write, or a cursor-only write for a deterministic local skip),
+    and at reconciliation's own conclusion for the flag -- never deferred
+    to a round-end write that runs AFTER the ledger row. The previous
+    version did exactly the round-end persist the binding ruling's own
+    text excludes (handoff_sync's own shape), which could starve a
+    confirmed-synced file's cursor advance behind an unrelated, slow
+    ledger write."""
+
+    def test_the_cursor_is_on_disk_for_every_file_this_round_synced_before_the_ledger_row(self):
+        """Seven new files, one more than ``_BATCH_SIZE`` -- the cursor
+        stops at 5 (not wrapped to 0, which it WOULD be after a full lap
+        syncs every file -- TestBatchingAndCursor's own wrap test already
+        covers that case) -- so a cursor already correctly on disk is
+        unambiguous."""
+        for i in range(7):
+            self._write(f"file{i}")
+        self.backend.reply(*_empty_lookup())  # reconciliation
+        for i in range(5):
+            self.backend.reply(*_empty_lookup()).reply(*_created(f"m{i}"))
+        seen = {}
+        real_record_run = _hook_state.record_run
+
+        def spy(*a, **kw):
+            on_disk = _hook_state.read_state_at(_MOD._memory_state_path(self.key))[0]
+            seen["cursor"] = on_disk.get("cursor")
+            seen["files"] = sorted((on_disk.get("files") or {}).keys())
+            return real_record_run(*a, **kw)
+
+        with mock.patch.object(_hook_state, "record_run", side_effect=spy):
+            self._run()
+        self.assertEqual(seen.get("cursor"), 5, "by the time record_run runs, the cursor must already be on disk")
+        self.assertEqual(seen.get("files"), [f"file{i}" for i in range(5)])
+
+    def test_a_zero_file_round_makes_no_state_write_at_all(self):
+        """The other half of the same fix (and K02's original motivation,
+        post_implementation R1 finding K02): since reconciled/cursor are
+        now written as they happen inside _collect rather than
+        unconditionally at round end, a round that touches NOTHING does
+        not call update_state_at even once -- the exact write that used
+        to be able to take a contended lock and burn the whole work
+        budget on a round that would not have changed a single byte."""
+        path = self._write("f1")
+        st = os.stat(path)
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key),
+            {"cursor": 0, "reconciled": True, "files": {"f1": {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }}},
+        )
+        calls = []
+        real = _hook_state.update_state_at
+
+        def spy(path, mutate):
+            calls.append(path)
+            return real(path, mutate)
+
+        with mock.patch.object(_hook_state, "update_state_at", side_effect=spy):
+            self._run()
+        self.assertEqual(calls, [])
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "none")
+
+
+class TestR2C05ReconciledPersistFailureFoldsIntoTheMainRow(_WriteCase):
+    def test_a_reconciled_persist_failure_is_one_more_reason_not_a_followup_row(self):
+        """R2-C05 (as redesigned by R2-C03): since reconciled is now
+        persisted the instant it is known -- inside _collect, strictly
+        before _record ever runs -- a genuine failure to persist it is
+        simply one more reason this round produced, folded into the SAME
+        row via _fold_persist_reasons; there is no longer a separate
+        end-of-round write for it to fail AFTER the ledger row, so no
+        more follow-up row either. orphans_deleted (a one-time,
+        destructive fact) survives in also_failed regardless of which
+        reason wins the scalar slot."""
+        self._write("kept")
+        row = _row(self._ext("gone"))
+        self.backend.reply(200, _page(row))
+        self.backend.reply(200, _page())  # ends the listing scan
+        self.backend.reply(200, _page(row)).reply(204, None)  # the orphan delete itself
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # "kept": a new file
+
+        real = _hook_state.update_state_at
+
+        def selective(path, mutate):
+            try:
+                is_reconciled_write = (
+                    "to_register" in mutate.__code__.co_varnames
+                    and "reconciled" in mutate.__code__.co_consts
+                )
+            except Exception:
+                is_reconciled_write = False
+            if is_reconciled_write:
+                current, _ = _hook_state.read_state_at(path)
+                return current, ["state_write_failed"]
+            return real(path, mutate)
+
+        with mock.patch.object(_hook_state, "update_state_at", side_effect=selective):
+            self._run()
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        self.assertEqual(len(entries), 1, entries)
+        entry = entries[-1]
+        self.assertEqual(entry["reason"], "state_write_failed")
+        self.assertFalse(entry["ok"])
+        self.assertIn("orphans_deleted", entry.get("also_failed", []))
+        self.assertEqual(entry.get("orphans_deleted"), 1)
+        # The disk write genuinely did not land: reconciled stays unset
+        # (or False), so the next round retries reconciliation.
+        self.assertFalse(self._state().get("reconciled"))
+
+
+class TestR2C07OrphanDeletionCountSurvivesAbandonment(_WriteCase):
+    def test_a_mid_batch_hang_during_orphan_deletion_still_reports_the_first_deletion(self):
+        """R2-C07: each orphan deletion's count/reason is written straight
+        into ``run`` the INSTANT it succeeds (mirroring ``_ingest_client.
+        _dedup``'s own A8-6 pattern), not accumulated locally and reported
+        only once ``_reconcile_orphans`` returns -- a worker thread
+        abandoned mid-batch (a local stall unrelated to any one network
+        call, e.g. a pathological filesystem) must not lose a deletion
+        that had ALREADY happened before the stall."""
+        self._write("kept")
+        row_a = _row(self._ext("a"), row_id="aaaaaaaa-1111-4111-8111-111111111111",
+                     created_at="2026-10-01T10:00:00.000002Z")
+        row_b = _row(self._ext("b"), row_id="bbbbbbbb-1111-4111-8111-111111111111",
+                     created_at="2026-10-01T10:00:00.000001Z")
+        self.backend.reply(200, _page(row_a, row_b))
+        self.backend.reply(200, _page())
+        self.backend.reply(200, _page(row_a)).reply(204, None)  # a: deleted cleanly
+
+        real_delete = _ingest_client.IngestClient.delete
+
+        def hanging_delete(self_client, layer, external_id):
+            if external_id == self._ext("b"):
+                time.sleep(2.0)  # exceeds the shortened work budget below
+            return real_delete(self_client, layer, external_id)
+
+        # _MIN_REMAINING_SECONDS (3.0s) must also shrink: otherwise the
+        # per-item budget check trips on the very FIRST orphan (there is
+        # no scenario where a work budget is both > 3.0s, so the check
+        # passes, and < 2.0s, so the hang still exceeds it).
+        with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 0.5), \
+                mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
+                mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.05), \
+                mock.patch.object(_ingest_client.IngestClient, "delete", hanging_delete):
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertEqual(entry.get("orphans_deleted"), 1, entry)
+        self.assertIn("orphans_deleted", entry.get("also_failed", []))
+
+
+class TestR2C10ReconcileAttributionAndForwardProgress(_WriteCase):
+    def test_a_listing_failure_is_attributed_to_the_reconcile_stage(self):
+        self._write("kept")
+        self.backend.reply(500, {"detail": "boom"})
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # "kept": new file, independent phase
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "http_error")
+        self.assertEqual(entry.get("reconcile", {}).get("reason"), "http_error")
+
+    def test_the_pending_delete_zero_files_guard_records_how_many_were_blocked(self):
+        path = self._write("only")
+        st = os.stat(path)
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key),
+            {"cursor": 0, "reconciled": True, "files": {"only": {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }}},
+        )
+        os.remove(path)
+        self._run()
+        self.assertEqual(self._last_entry().get("pending_delete_guard"), 1)
+
+    def test_a_server_that_ignores_the_cursor_and_repeats_the_same_page_is_caught(self):
+        """Contract §6.2: a before_created_at/before_id pair the backend
+        silently ignores would otherwise re-serve the identical first page
+        forever -- without a forward-progress check, this hangs the round
+        in an ever-growing, never-terminating list loop (bounded only by
+        _RECONCILE_MAX_PAGES/the deadline) instead of being reported."""
+        self._write("kept")
+        same_row = _row(self._ext("a"))
+        # The backend ignores the cursor and returns the identical page
+        # every single time -- scripted twice is enough to prove the
+        # SECOND page is where this stops, not the thousandth.
+        self.backend.reply(200, _page(same_row))
+        self.backend.reply(200, _page(same_row))
+        # filter_suspect (like the existing per-row verification failure,
+        # K04) does not abort the WHOLE round -- the regular sync batch is
+        # an independent phase and still gets its own turn.
+        self.backend.reply(*_empty_lookup()).reply(*_created())
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "filter_suspect")
+        listing_gets = [r for r in self.requests if r["method"] == "GET" and "external_id" not in r["query"]]
+        self.assertEqual(len(listing_gets), 2, self.requests)
+        self.assertFalse(self._state().get("reconciled"))
+
+
+class TestR2C12AlsoFailedIsComputedForEveryLedgerRow(_WriteCase):
+    """R2-C12: also_failed's computation lives in ONE place (main(), after
+    `reason` is known, before `_record` runs) and applies to EVERY path
+    that writes a ledger row -- not just the abnormal-exit branch. The
+    previous version only computed it at the very end of _collect's own
+    normal return, so a round that exited through an EARLIER return (not_
+    configured, the K01 directory-listing failure, ...) wrote a row with
+    no also_failed key at all."""
+
+    def test_a_directory_listing_failure_still_carries_also_failed(self):
+        kept_path = self._write("kept")
+        gone_path = self._write("gone")
+        for slug, path in (("kept", kept_path), ("gone", gone_path)):
+            st = os.stat(path)
+            _hook_state.update_state_at(
+                _MOD._memory_state_path(self.key),
+                lambda s, slug=slug, path=path, st=st: {
+                    **s, "cursor": 0, "reconciled": True,
+                    "files": {**(s.get("files") or {}), slug: {
+                        "mtime": st.st_mtime, "size": st.st_size,
+                        "ctime": getattr(st, "st_ctime_ns", None),
+                        "file_hash": _MOD._whole_file_hash(path),
+                        "synced_at": "2026-01-01T00:00:00Z",
+                        "redaction_fingerprint": _MOD._current_fingerprint(),
+                    }},
+                },
+            )
+        real_listdir = os.listdir
+
+        def flaky_listdir(path):
+            if path == self.memory_dir:
+                raise PermissionError(13, "Permission denied")
+            return real_listdir(path)
+
+        with mock.patch.object(os, "listdir", side_effect=flaky_listdir):
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertIn("also_failed", entry)
+
+    def test_not_configured_carries_also_failed_too(self):
+        self._write("f1")
+        self._run(NEXUS_API_URL="")
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "not_configured")
+        self.assertIn("also_failed", entry)
+        self.assertEqual(entry["also_failed"], [])
 
 
 class TestK03AbortPropagation(_WriteCase):
@@ -1876,10 +2219,23 @@ class TestK05UnreadableFileDuringDirtyScan(_WriteCase):
 
 class TestK05UnreadableFileMockTwin(_WriteCase):
     """Same scenario as TestK05UnreadableFileDuringDirtyScan, pinned under a
-    root CI runner (chmod 000 is a no-op for root) by mocking os.stat for
-    the one candidate file."""
+    root CI runner (chmod 000 is a no-op for root).
 
-    def test_an_os_stat_failure_during_the_dirty_scan_is_skipped_not_fatal(self):
+    R2-C14 (post_implementation R2): the twin mocks ``open()`` for the one
+    candidate file, not ``os.stat()``. Non-root ``chmod 0`` on a regular
+    file does not block ``os.stat`` at all (only directory SEARCH
+    permission matters for stat-ing an entry inside it) -- the real
+    failure, under both chmod-000 and root-equivalent conditions, is
+    ``_whole_file_hash``'s own ``open(path, "rb")``. The previous twin
+    mocked ``os.stat`` instead, which happened to land in the SAME
+    ``except OSError:`` in ``_collect`` today (``_dirty_check`` calls
+    ``os.stat`` first) but pins the WRONG call: a mutant that moves the
+    hash computation's exception handling so it no longer shares that
+    guard (verified: the previous twin stays falsely GREEN under exactly
+    that mutant, while this one correctly goes red) would have shipped
+    with the old twin never noticing."""
+
+    def test_an_open_failure_during_the_dirty_scan_is_skipped_not_fatal(self):
         bad_path = self._write("bad", body="original bad body")
         good_path = self._write("good", body="original good body")
         for slug, path in (("bad", bad_path), ("good", good_path)):
@@ -1901,15 +2257,15 @@ class TestK05UnreadableFileMockTwin(_WriteCase):
             fh.write("\n\nmore")
         with open(good_path, "a", encoding="utf-8") as fh:
             fh.write("\n\nmore")
-        real_stat = os.stat
+        real_open = open
 
-        def flaky_stat(path, *a, **kw):
-            if path == bad_path:
+        def flaky_open(target, *a, **kw):
+            if target == bad_path:
                 raise PermissionError(13, "Permission denied")
-            return real_stat(path, *a, **kw)
+            return real_open(target, *a, **kw)
 
         self.backend.reply(200, _page(_row(self._ext("good"), content_hash="sha256:" + "1" * 64))).reply(*_updated("m1"))
-        with mock.patch.object(os, "stat", side_effect=flaky_stat):
+        with mock.patch.object(_MOD, "open", create=True, side_effect=flaky_open):
             self._run()
         self.assertFalse(self._last_entry()["ok"])
         self.assertEqual(self._last_entry()["reason"], "unknown")
@@ -1928,6 +2284,44 @@ class TestK05CorruptStateShape(_WriteCase):
         self.assertEqual(self._last_entry()["reason"], "unknown")
         self.assertIn("f1", self._state().get("files", {}))
         self.assertIsInstance(self._state()["files"], dict)
+
+    def test_a_non_dict_entry_for_a_vanished_slug_is_tracked_not_dropped(self):
+        """R2-C08: a per-entry shape defect (``files[slug]`` itself not a
+        dict -- a hand edit, a partial write a crash interrupted) used to
+        be silently DROPPED from ``files_state``, which made a ghost slug
+        with no local file invisible to the vanished-file computation: it
+        was never queued for DELETE, the server row survived forever, and
+        every round kept reporting ``unknown`` for a shape that could
+        never actually self-heal. Normalizing the bad entry to the SAME
+        empty placeholder shape K22 already uses keeps the slug tracked:
+        round 1 queues it for DELETE (closing the server row and healing
+        the shape via `_drop_file_entry`), and round 2 is a clean run."""
+        kept_path = self._write("kept")
+        st = os.stat(kept_path)
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key),
+            {"cursor": 0, "reconciled": True, "files": {
+                "ghost": "corrupted-entry",
+                "kept": {
+                    "mtime": st.st_mtime, "size": st.st_size,
+                    "ctime": getattr(st, "st_ctime_ns", None),
+                    "file_hash": _MOD._whole_file_hash(kept_path),
+                    "synced_at": "2026-01-01T00:00:00Z",
+                    "redaction_fingerprint": _MOD._current_fingerprint(),
+                },
+            }},
+        )
+        self.backend.reply(200, _page(_row(self._ext("ghost")))).reply(204, None)
+        self._run()
+        self.assertEqual([r["method"] for r in self.requests], ["GET", "DELETE"], self.requests)
+        self.assertFalse(self._last_entry()["ok"])
+        self.assertEqual(self._last_entry()["reason"], "unknown")
+        self.assertNotIn("ghost", self._state().get("files", {}))
+
+        self.requests.clear()
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "none")
 
 
 def _redact_text_that_always_grows_by(n):
@@ -2035,10 +2429,26 @@ class TestK09ConcurrentRunLock(_WriteCase):
         self._write("f1")
         self._run()
         self.assertEqual(self.requests, [])
-        entry = self._last_entry()
-        self.assertTrue(entry["ok"])
-        self.assertEqual(entry["reason"], "nothing_to_do")
-        self.assertTrue(entry.get("peer_running"))
+
+    def test_a_peer_running_round_writes_no_ledger_row_of_its_own(self):
+        """R2-C13: the loser's own ledger write and the winner's race --
+        on a round where the WINNER did only LOCAL work (no network call
+        at all, e.g. an orphan_guard trip), the two can land in either
+        order, and since the reporter reads only the LAST row, the
+        loser's harmless "nothing_to_do"/peer_running row could overwrite
+        and bury the winner's real failure. A losing run writes NOTHING:
+        a prior run's row (seeded here, standing in for the winner's)
+        already covers this round, and there is no "stuck peer" to
+        report either -- flock releases the instant that process exits."""
+        _hook_state.record_run(_MOD.HOOK, ok=False, reason="orphan_guard", cwd=self.cwd)
+        before, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        lock_fd = _MOD._acquire_run_lock(_MOD._memory_run_lock_path(self.key))
+        self.addCleanup(_MOD._release_run_lock, lock_fd)
+        self._write("f1")
+        self._run()
+        self.assertEqual(self.requests, [])
+        after, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        self.assertEqual(after, before, "a peer-running round must not append its own ledger row")
 
     def test_the_lock_is_released_so_the_next_round_proceeds_normally(self):
         lock_fd = _MOD._acquire_run_lock(_MOD._memory_run_lock_path(self.key))
@@ -2049,6 +2459,67 @@ class TestK09ConcurrentRunLock(_WriteCase):
         self.backend.reply(*_empty_lookup()).reply(*_empty_lookup()).reply(*_created())
         self._run()
         self.assertTrue(any(r["method"] == "POST" for r in self.requests))
+
+
+class TestR2C02RunLockNonContentionOSError(unittest.TestCase):
+    """R2-C02: ``_acquire_run_lock`` must treat only a REAL contention
+    signal (``BlockingIOError``/EAGAIN/EWOULDBLOCK, what ``flock(...,
+    LOCK_NB)`` actually raises when a peer holds the lock) as "a peer is
+    running" -- any OTHER ``OSError`` (``ENOLCK``, ``EOPNOTSUPP``, a test
+    double's ``EACCES``, ...) means the filesystem cannot do ``flock`` at
+    all, which the function's own docstring says must degrade to
+    proceeding WITHOUT a lock, not be mistaken for contention."""
+
+    def test_enolck_degrades_to_the_no_run_lock_sentinel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.run.lock")
+
+            def raise_enolck(fd, op):
+                raise OSError(_MOD.errno.ENOLCK, "No locks available")
+
+            with mock.patch.object(_MOD.fcntl, "flock", side_effect=raise_enolck):
+                result = _MOD._acquire_run_lock(path)
+        self.assertEqual(result, _MOD._NO_RUN_LOCK)
+
+    def test_a_real_blockingioerror_still_means_a_peer_holds_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.run.lock")
+
+            def raise_blocking(fd, op):
+                raise BlockingIOError(_MOD.errno.EAGAIN, "Resource temporarily unavailable")
+
+            with mock.patch.object(_MOD.fcntl, "flock", side_effect=raise_blocking):
+                result = _MOD._acquire_run_lock(path)
+        self.assertIsNone(result)
+
+
+class TestR2C02RunLockEndToEnd(_WriteCase):
+    """The behavioural guarantee end to end: a filesystem that cannot
+    flock at all must not silently stop every future round the way
+    "contended" would. The injected failure is scoped to the RUN-LOCK fd
+    specifically (by its own path, via /proc/self/fd) so the state
+    file's own unrelated flock use (_hook_state._locked) is untouched."""
+
+    def test_a_non_contention_flock_error_still_lets_the_round_do_its_work(self):
+        self._write("f1")
+        self.backend.reply(*_empty_lookup()).reply(*_empty_lookup()).reply(*_created())
+        real_flock = _MOD.fcntl.flock
+
+        def selective_enolck(fd, op):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                target = ""
+            if target.endswith(".run.lock") and (op & _MOD.fcntl.LOCK_NB):
+                raise OSError(_MOD.errno.ENOLCK, "No locks available")
+            return real_flock(fd, op)
+
+        with mock.patch.object(_MOD.fcntl, "flock", side_effect=selective_enolck):
+            self._run()
+        self.assertTrue(any(r["method"] == "POST" for r in self.requests), self.requests)
+        entry = self._last_entry()
+        self.assertFalse(entry.get("peer_running"))
+        self.assertEqual(entry.get("run_lock"), "unavailable")
 
 
 class TestK10WorkerThreadStderrGuard(unittest.TestCase):
@@ -2208,6 +2679,14 @@ class TestK12PerFileBudgetChecks(_WriteCase):
         self.assertEqual(self._state()["files"]["b-dirty"]["file_hash"], "sha256:" + "0" * 64)
 
     def test_orphan_delete_budget_check_before_the_second_orphan(self):
+        """R2-C07: ``orphans_deleted`` is now recorded the INSTANT row_a's
+        delete succeeds -- BEFORE the budget check for row_b even runs --
+        so by A8-6's own precedent (one-time destructive facts win a
+        same-run tie against a later, non-priority-table failure)
+        ``orphans_deleted`` is the scalar ``reason`` here, not
+        ``budget_exhausted``; the budget boundary itself (exactly one
+        delete attempted, the round stops there) is unchanged, and
+        ``budget_exhausted`` still reaches the ledger via ``also_failed``."""
         self._write("kept")
         row_a = _row(self._ext("a"), row_id="aaaaaaaa-1111-4111-8111-111111111111",
                      created_at="2026-10-01T10:00:00.000002Z")
@@ -2221,7 +2700,10 @@ class TestK12PerFileBudgetChecks(_WriteCase):
                 mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 0.0), \
                 mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 0.5):
             self._run()
-        self.assertEqual(self._last_entry()["reason"], "budget_exhausted")
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "orphans_deleted")
+        self.assertIn("budget_exhausted", entry.get("also_failed", []))
+        self.assertEqual(entry.get("orphans_deleted"), 1)
         deletes = [r for r in self.requests if r["method"] == "DELETE"]
         self.assertEqual(len(deletes), 1, self.requests)
         self.assertFalse(self._state().get("reconciled"))
@@ -2392,30 +2874,56 @@ class TestK18DirtySetRotation(_WriteCase):
         self.assertIn(real_slug, patches[0]["path"] + str(patches[0]["json"]))
 
     def test_a_persistently_failing_dirty_backlog_does_not_starve_new_files(self):
+        """R2-C09: the previous version reserved one of this round's N
+        slots for a new file whenever the dirty set alone would consume
+        the whole batch -- which violates the BINDING TASK-006 acceptance
+        list ("dirty set first", C row) and A8-2's "spread by N per round"
+        exactly as written: a round with >= N genuinely dirty files must
+        spend its whole batch on them, same as any other round. Five
+        ALREADY-SYNCED files are genuinely edited (ordinary dirty, not a
+        permanent rejection) alongside one brand-new file: round 1 is the
+        dirty set's full batch (all five PATCHed, "aa-new" untouched);
+        "aa-new" gets its own first try on round 2, once the backlog it
+        was never entitled to cut in front of has cleared."""
         fp = _MOD._current_fingerprint()
-        files = {}
+        old_paths = {}
         for i in range(5):
-            slug = f"poison-{i}"
-            self._write(slug)
+            slug = f"dirty-{i}"
+            old_paths[slug] = self._write(slug, body="original")
+        files = {}
+        for slug, path in old_paths.items():
             files[slug] = {
-                "mtime": 1.0, "size": -1, "ctime": -1,  # always dirty (forces recompute every round)
+                "mtime": 1.0, "size": -1, "ctime": -1,  # force the fast path to miss every round
                 "file_hash": "sha256:" + "0" * 64, "synced_at": "2026-01-01T00:00:00Z",
                 "redaction_fingerprint": fp,
             }
         _hook_state.write_state_at(
             _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": files},
         )
+        for slug in old_paths:
+            self._write(slug, body="edited for real")
         self._write("aa-new")
-        for _ in range(4):  # 4 of the 5 poisoned dirty files get a slot (each REJECTED, still a POST attempt)...
-            self.backend.reply(*_empty_lookup()).reply(422, {"detail": "poison"})
-        self.backend.reply(*_empty_lookup()).reply(*_created())  # ...the reserved slot goes to the new file
+        for i in range(5):
+            self.backend.reply(
+                200, _page(_row(self._ext(f"dirty-{i}"), content_hash="sha256:" + "0" * 64)),
+            ).reply(*_updated(f"m{i}"))
         self._run()
-        posts = [r["json"]["metadata"]["external_id"] for r in self.requests if r["method"] == "POST"]
-        self.assertEqual(len(posts), 5, self.requests)  # 4 rejected attempts + aa-new's own
-        self.assertIn(self._ext("aa-new"), posts, "the new file must get its slot THIS round, not starve")
-        self.assertNotIn(self._ext("poison-4"), posts, "the 5th poison file is left for a later round")
-        self.assertIn("aa-new", self._state().get("files", {}))
-        self.assertEqual(self._last_entry()["reason"], "rejected_422")
+        # A PATCH never carries `external_id` (an IDENTITY_KEY, §4) -- the
+        # lookup GETs right before each one do, and are what pin WHICH
+        # five files this round touched.
+        looked_up = [r["query"]["external_id"] for r in self.requests if r["method"] == "GET"]
+        self.assertEqual(sorted(looked_up), sorted(self._ext(f"dirty-{i}") for i in range(5)), self.requests)
+        patched = [r for r in self.requests if r["method"] == "PATCH"]
+        self.assertEqual(len(patched), 5, self.requests)
+        posted = [r["json"]["metadata"]["external_id"] for r in self.requests if r["method"] == "POST"]
+        self.assertEqual(posted, [], "the whole round 1 batch belongs to the dirty set, not the new file")
+        self.assertNotIn("aa-new", self._state().get("files", {}))
+
+        self.requests.clear()
+        self.backend.reply(*_empty_lookup()).reply(*_created())
+        self._run()
+        posted_round2 = [r["json"]["metadata"]["external_id"] for r in self.requests if r["method"] == "POST"]
+        self.assertEqual(posted_round2, [self._ext("aa-new")], self.requests)
 
 
 class TestK19SingleFileRead(_WriteCase):
@@ -2669,6 +3177,150 @@ class TestK27Patch404Retries(_WriteCase):
         self.assertFalse(self._last_entry()["ok"])
         self.assertNotIn("f1", self._state().get("files", {}))
 
+
+class TestR2C04PatchRetryTriggersOnlyOnTheWritesOwn404(unittest.TestCase):
+    """R2-C04: the retry must key off the WRITE call's own HTTP status
+    (``write_status``), never ``status`` (the last status ANY call on this
+    outcome received, including an unrelated dedup DELETE) -- a timeout on
+    the PATCH itself, arriving right after a dedup delete that happened to
+    404, must not be retried; and a dedup_merged fact from the first
+    attempt must survive into a successful retry's own outcome."""
+
+    class _FakeClient:
+        def __init__(self, outcomes, remaining=100.0):
+            self._outcomes = list(outcomes)
+            self.calls = []
+            self._remaining = remaining
+
+        def upsert(self, layer, external_id, content, metadata, *, local_updated_at, updated_key):
+            self.calls.append(external_id)
+            return self._outcomes.pop(0)
+
+        def remaining(self):
+            return self._remaining
+
+    @staticmethod
+    def _make_outcome(*, aborts_reason, write_status, status, memory_id=None, dedup_merged=0, calls=1, action=None):
+        out = _ingest_client.Outcome()
+        out.status = status
+        out.write_status = write_status
+        out.memory_id = memory_id
+        out.dedup_merged = dedup_merged
+        out.calls = calls
+        out.action = action
+        if aborts_reason is not None:
+            out.reasons = [aborts_reason]
+        return out
+
+    def test_a_write_timeout_right_after_a_dedup_404_is_not_retried(self):
+        first = self._make_outcome(
+            aborts_reason="timeout", write_status=None, status=404, memory_id="m1", dedup_merged=1,
+        )
+        client = self._FakeClient([first])
+        result = _MOD._upsert_retrying_404(
+            client, "fact", "k/f1", "content", {}, local_updated_at=None, updated_key="aria.modified",
+        )
+        self.assertEqual(len(client.calls), 1, "a non-404 write status must never retry")
+        self.assertIs(result, first)
+        self.assertEqual(result.dedup_merged, 1)
+
+    def test_a_real_404_on_the_write_itself_still_retries(self):
+        first = self._make_outcome(aborts_reason="http_error", write_status=404, status=404, memory_id="m1")
+        second = self._make_outcome(aborts_reason=None, write_status=200, status=200, action="updated")
+        client = self._FakeClient([first, second])
+        result = _MOD._upsert_retrying_404(
+            client, "fact", "k/f1", "content", {}, local_updated_at=None, updated_key="aria.modified",
+        )
+        self.assertEqual(len(client.calls), 2)
+        self.assertIs(result, second)
+
+    def test_dedup_merged_from_the_first_attempt_survives_a_successful_retry(self):
+        first = self._make_outcome(
+            aborts_reason="http_error", write_status=404, status=404, memory_id="m1",
+            dedup_merged=1, calls=3,
+        )
+        second = self._make_outcome(aborts_reason=None, write_status=201, status=201, calls=2, action="created")
+        client = self._FakeClient([first, second])
+        result = _MOD._upsert_retrying_404(
+            client, "fact", "k/f1", "content", {}, local_updated_at=None, updated_key="aria.modified",
+        )
+        self.assertEqual(result.dedup_merged, 1)
+        self.assertIn("dedup_merged", result.reasons)
+        self.assertEqual(result.calls, 5)
+
+    def test_insufficient_budget_before_the_retry_does_not_retry(self):
+        first = self._make_outcome(aborts_reason="http_error", write_status=404, status=404, memory_id="m1")
+        client = self._FakeClient([first], remaining=0.5)
+        with mock.patch.object(_MOD, "_MIN_REMAINING_SECONDS", 3.0):
+            result = _MOD._upsert_retrying_404(
+                client, "fact", "k/f1", "content", {}, local_updated_at=None, updated_key="aria.modified",
+            )
+        self.assertEqual(len(client.calls), 1)
+        self.assertIs(result, first)
+
+
+class TestR2C11PageFullUsesRawPageLength(_WriteCase):
+    """R2-C11: ``page_full`` must be judged on the RAW page length the
+    lookup actually received (``outcome.page_rows``), never ``outcome.
+    found`` (the VERIFIED count after ``_is_ours`` filtering) -- a full
+    page where one row fails verification still means more duplicates may
+    exist beyond it, so the mapping must be retained even though every
+    VERIFIED row on this page was deleted."""
+
+    def _seed_gone(self):
+        """``kept`` stays on disk, correctly synced, so "gone" vanishing is
+        an ordinary single vanished file -- not the K01 "zero local files"
+        guard, which would block the delete attempt entirely and make
+        these assertions pass for the wrong reason."""
+        kept_path = self._write("kept")
+        path = self._write("gone")
+        entries = {}
+        for slug, p in (("kept", kept_path), ("gone", path)):
+            st = os.stat(p)
+            entries[slug] = {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(p), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": entries},
+        )
+        os.remove(path)
+
+    def test_a_full_raw_page_with_one_unverified_row_still_blocks_clearing(self):
+        self._seed_gone()
+        ours = [
+            _row(self._ext("gone"), row_id=f"{i:08d}-1111-4111-8111-111111111111",
+                 created_at=f"2026-10-01T10:00:00.00000{i}Z")
+            for i in range(4)
+        ]
+        unverified = _row("another-project/gone", row_id="99999999-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(*(ours + [unverified])))  # 5 raw rows, 4 ours
+        for _ in range(4):
+            self.backend.reply(204, None)
+        self._run()
+        deletes = [r for r in self.requests if r["method"] == "DELETE"]
+        self.assertEqual(len(deletes), 4, self.requests)
+        self.assertIn("gone", self._state().get("files", {}), "a full raw page must not clear the mapping")
+
+    def test_a_full_page_fully_deleted_still_retains_the_mapping(self):
+        """The other edge: every row on a FULL page is ours and gets
+        deleted (found == LOOKUP_LIMIT == deleted) -- still retained,
+        because a 6th duplicate could exist beyond this one page."""
+        self._seed_gone()
+        rows = [
+            _row(self._ext("gone"), row_id=f"{i:08d}-1111-4111-8111-111111111111",
+                 created_at=f"2026-10-01T10:00:00.00000{i}Z")
+            for i in range(5)
+        ]
+        self.backend.reply(200, _page(*rows))
+        for _ in range(5):
+            self.backend.reply(204, None)
+        self._run()
+        deletes = [r for r in self.requests if r["method"] == "DELETE"]
+        self.assertEqual(len(deletes), 5, self.requests)
+        self.assertIn("gone", self._state().get("files", {}))
 
 
 class TestModuleCleanupOrdering(unittest.TestCase):
