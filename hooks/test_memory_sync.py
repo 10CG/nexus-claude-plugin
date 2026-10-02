@@ -705,6 +705,54 @@ class TestSingleFileSync(_WriteCase):
         self.assertEqual(self._last_entry()["reason"], "file_unparsable")
 
 
+class TestStaleLocal(_WriteCase):
+    """Amendment A8-2 / TASK-006 verification bullet 6: ``upsert`` returning
+    ``stale_local`` (the server's copy is newer than this local file) must
+    be treated as PROCESSED this round -- the file's state entry is written
+    (moving it out of the dirty set) so it does not occupy the NEXT round's
+    N slot by being retried every time for no reason."""
+
+    _OLD = "2020-01-01T00:00:00.000Z"
+    _NEW = "2030-01-01T00:00:00.000Z"
+
+    def test_stale_local_updates_state_and_is_not_retried_next_round(self):
+        self._write("f1", modified=self._OLD, body="version one")
+        self.backend.reply(*_empty_lookup())  # reconciliation, round 1 only
+        self.backend.reply(*_empty_lookup()).reply(*_created("m1"))
+        self._run()
+        self.assertTrue(self._state().get("reconciled"))  # round 2 must not re-reconcile
+
+        # Round 2: the body changes locally (so content_changed is True and
+        # the "unchanged" skip is never reached), but the server's row
+        # claims a NEWER aria.modified than this local file's -- the local
+        # edit must not clobber it.
+        path = self._write("f1", modified=self._OLD, body="version two, now longer")
+        self.requests.clear()
+        self.backend.reply(
+            200,
+            _page(_row(
+                self._ext("f1"), content_hash="sha256:" + "9" * 64,
+                extra={"aria.modified": self._NEW},
+            )),
+        )
+        self._run()
+        # stale_local never PATCHes: the server's copy already wins.
+        self.assertEqual([r["method"] for r in self.requests], ["GET"])
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "stale_local")
+        self.assertTrue(entry["ok"])  # a skip, not a failure
+
+        # Processed, not left dirty: the state entry now matches the
+        # CURRENT (round 2) file, so a later round does not re-attempt it.
+        state_after = self._state()
+        self.assertEqual(state_after["files"]["f1"]["file_hash"], _MOD._whole_file_hash(path))
+
+        self.requests.clear()
+        self._run()
+        self.assertEqual(self.requests, [], "a stale_local file must not occupy the next round's N slot")
+        self.assertEqual(self._last_entry()["reason"], "none")
+
+
 class TestTruncation(_WriteCase):
     def test_a_long_file_is_truncated_and_marked(self):
         body = ("x" * 9000 + "\n\n") * 3  # well over the 10000 cap
@@ -737,6 +785,27 @@ class TestBatchingAndCursor(_WriteCase):
     def _write_n(self, n, prefix="file"):
         for i in range(n):
             self._write(f"{prefix}{i}")
+
+    def test_the_batch_cap_is_an_actual_ceiling_not_a_fixture_coincidence(self):
+        """``_BATCH_SIZE = 5`` must cap the round even when MORE than 5
+        files are eligible -- every other fixture in this class happens to
+        use exactly 5 (or fewer) files, which would pass just the same if
+        the cap were raised or removed outright. Seven brand-new files:
+        only the first five (cursor/sorted order) are POSTed, and the
+        cursor stops at 5 -- not 6, and not wrapped to 0."""
+        self._write_n(7)
+        self.backend.reply(*_empty_lookup())  # reconciliation
+        for i in range(5):
+            self.backend.reply(*_empty_lookup()).reply(*_created(f"m{i}"))
+        self._run()
+        posted_ids = [
+            r["json"]["metadata"]["external_id"] for r in self.requests if r["method"] == "POST"
+        ]
+        self.assertEqual(posted_ids, [self._ext(f"file{i}") for i in range(5)])
+        self.assertEqual(self._state().get("cursor"), 5)
+        # The two files the cap left untouched this round are not in state
+        # at all yet -- they are genuinely deferred, not silently dropped.
+        self.assertEqual(sorted(self._state().get("files", {})), [f"file{i}" for i in range(5)])
 
     def test_abort_on_the_third_file_stops_the_round_and_records_the_first_two(self):
         self._write_n(5)
@@ -1145,6 +1214,77 @@ class TestAlsoFailed(_WriteCase):
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "http_error")
         self.assertIn("dedup_merged", entry.get("also_failed", []))
+
+
+class TestPerFileStateWriteFailure(_WriteCase):
+    """CRITICAL (independent gate finding): a genuine state-write failure on
+    a PER-FILE persist (``_sync_file`` / ``_delete_file``) must be folded
+    into this round's accumulated reasons -- and hence into
+    ``worst_reason`` / the ledger row -- exactly like the round-end
+    cursor/reconciled persist already does (memory_sync.py's own module
+    docstring, A9-7, documents this; these two tests pin it as actual
+    behaviour instead of just a claim in a comment). Both call sites
+    (``_sync_file`` line ~625, ``_delete_file`` line ~641) discarded the
+    ``(state, reasons)`` tuple ``_hook_state.update_state_at`` returns
+    before this fix, so a failing write there silently vanished -- the run
+    was recorded clean even though nothing was actually persisted."""
+
+    def _fail_first_update(self):
+        """Patches ``_hook_state.update_state_at`` so its FIRST call (the
+        per-file persist under test) returns a genuine failure without
+        writing anything, while every LATER call (the round-end
+        cursor/reconciled persist) runs for real -- a transient failure on
+        exactly one write, not a wholesale breakage of the primitive."""
+        real = _hook_state.update_state_at
+        calls = []
+
+        def side_effect(path, mutate):
+            calls.append(path)
+            if len(calls) == 1:
+                current, _ = _hook_state.read_state_at(path)
+                return current, ["state_write_failed"]
+            return real(path, mutate)
+
+        return mock.patch.object(_hook_state, "update_state_at", side_effect=side_effect)
+
+    def test_a_failed_persist_right_after_a_successful_post_is_reported(self):
+        """Reproduces the independent gate's finding directly: a
+        201-Created POST succeeds, but persisting that file's OWN state
+        entry fails -- the run must not come back clean."""
+        self._write("f1")
+        self.backend.reply(*_empty_lookup())  # reconciliation
+        self.backend.reply(*_empty_lookup()).reply(*_created("m1"))
+        with self._fail_first_update():
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "state_write_failed")
+        self.assertFalse(entry["ok"])
+        # The write genuinely never landed -- self-healing (f1 is retried
+        # next round) is fine; vanishing from the LEDGER is the bug.
+        self.assertNotIn("f1", self._state().get("files", {}))
+
+    def test_a_failed_persist_right_after_a_confirmed_delete_is_reported(self):
+        path = self._write("gone")
+        st = os.stat(path)
+        state = {
+            "cursor": 0, "reconciled": True,
+            "files": {"gone": {"mtime": st.st_mtime, "size": st.st_size,
+                                "file_hash": _MOD._whole_file_hash(path),
+                                "synced_at": "2026-01-01T00:00:00Z",
+                                "redaction_fingerprint": _MOD._current_fingerprint()}},
+        }
+        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        os.remove(path)
+        self.backend.reply(200, _page(_row(self._ext("gone")))).reply(204, None)
+        with self._fail_first_update():
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "state_write_failed")
+        self.assertFalse(entry["ok"])
+        # The DELETE genuinely succeeded server-side; only the local
+        # bookkeeping failed to persist, so "gone" is retried (a harmless
+        # re-delete) next round rather than the failure vanishing.
+        self.assertIn("gone", self._state().get("files", {}))
 
 
 # ════════════════════════════════════════════════════════════════════════

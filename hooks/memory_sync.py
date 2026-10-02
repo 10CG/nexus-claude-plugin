@@ -578,6 +578,13 @@ def _sync_file(client, key, project_name, slug, path, fingerprint):
     completed (Amendment A8-2): the server's copy is newer, so there is
     nothing more for THIS run to do with this file, and leaving it dirty
     forever would retry it every round for no reason.
+
+    A genuine failure to persist that entry (``state_write_failed``) is
+    folded into the REASONS this function returns, exactly like the
+    round-end cursor/reconciled persist at the bottom of ``_collect`` does
+    -- not discarded. This call always runs strictly before ``_record``
+    (A9-7), so there is no already-written ledger row for the failure to
+    arrive too late for; it is simply one more reason this round produced.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -606,6 +613,7 @@ def _sync_file(client, key, project_name, slug, path, fingerprint):
     )
     if outcome.aborts_round:
         return list(outcome.reasons), True, outcome.calls
+    reasons = list(outcome.reasons)
     if outcome.action in ("created", "updated", "unchanged") or "stale_local" in outcome.reasons:
         entry = {
             "mtime": st.st_mtime,
@@ -614,11 +622,12 @@ def _sync_file(client, key, project_name, slug, path, fingerprint):
             "synced_at": _now_iso(),
             "redaction_fingerprint": fingerprint,
         }
-        _hook_state.update_state_at(
+        _, persist_reasons = _hook_state.update_state_at(
             _memory_state_path(key),
             lambda s, slug=slug, entry=entry: _merge_file_entry(s, slug, entry),
         )
-    return list(outcome.reasons), False, outcome.calls
+        reasons.extend(persist_reasons)
+    return reasons, False, outcome.calls
 
 
 def _delete_file(client, key, slug):
@@ -630,15 +639,22 @@ def _delete_file(client, key, slug):
     OTHER outcome it does not, so a failed delete is retried on the next
     round, before anything else in the batch, exactly as the C row
     requires.
+
+    A genuine failure to persist that clear (``state_write_failed``) is
+    folded into the returned reasons, same as ``_sync_file`` above and for
+    the same reason: this call, too, always runs strictly before
+    ``_record``.
     """
     outcome = client.delete("fact", f"{key}/{slug}")
     if outcome.aborts_round:
         return list(outcome.reasons), True, outcome.calls
+    reasons = [r for r in outcome.reasons if r != "nothing_to_do"]
     if outcome.deleted > 0 or "nothing_to_do" in outcome.reasons:
-        _hook_state.update_state_at(
+        _, persist_reasons = _hook_state.update_state_at(
             _memory_state_path(key), lambda s, slug=slug: _drop_file_entry(s, slug)
         )
-    return [r for r in outcome.reasons if r != "nothing_to_do"], False, outcome.calls
+        reasons.extend(persist_reasons)
+    return reasons, False, outcome.calls
 
 
 def _now_iso():
