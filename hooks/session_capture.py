@@ -107,6 +107,70 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+
+def _import_warn(message):
+    """Print one diagnostic line to stderr, never raising (A9-21 R1 fix
+    round, finding C1).
+
+    Used ONLY by the two import guards immediately below: at this point in
+    the file ``_hook_runner`` may itself be the missing piece (one of these
+    guards exists to report exactly that), so nothing here may depend on
+    it -- in particular not ``_hook_runner.guard_stderr()``, which is what
+    protects every OTHER stderr write in this file (installed at the top of
+    ``main()``, before anything runs). Named distinctly from a hook's own
+    ``_warn`` (this file has none; ``session_inject.py``'s own ``_warn``
+    takes different arguments and is defined further down, after these
+    guards) rather than reused, mirroring ``handoff_sync.py``'s identical
+    local pair -- Amendment A9-21 moved the ``_StderrGuard`` CLASS into
+    ``_hook_runner``, but left each hook's own import-time ``_warn`` /
+    ``_silence_stderr`` local on purpose.
+
+    ``sys.stderr is None`` (fd 2 closed before the interpreter even
+    started) is checked first: a bare ``print(message, file=None)`` does
+    not raise -- it silently FALLS BACK to ``sys.stdout``, which would put
+    this diagnostic on the one channel a SessionEnd hook's contract
+    requires to stay empty (confirmed empirically). There is no real file
+    descriptor to redirect in this shape, so this simply skips the write.
+
+    A closed stderr PIPE is a different shape (a live stream whose
+    ``write`` raises ``BrokenPipeError``, an ``OSError`` subclass):
+    swallowing that from this one call is not enough on its own, because
+    CPython's own interpreter shutdown unconditionally reflushes stdout
+    AND stderr again once this process is on its way out, retrying the
+    SAME write against the SAME closed pipe with no Python-level ``except``
+    left near it at that point -- exit code 120, not 0.
+    ``_silence_stderr`` below reroutes the underlying descriptor to
+    ``os.devnull`` so that retry lands somewhere that accepts anything.
+    """
+    if sys.stderr is None:
+        return
+    try:
+        print(message, file=sys.stderr)
+    except OSError:
+        _silence_stderr()
+
+
+def _silence_stderr():
+    """After a failed write through ``_import_warn`` above, stop the
+    interpreter retrying it on the way out.
+
+    ``sys.stderr.fileno()`` is resolved BEFORE ``os.open``: the reverse
+    order opened the devnull fd first, and a failing ``fileno()`` (a test
+    double, or any future stderr replacement with no real descriptor)
+    would then leave it dangling, swallowed by the blanket
+    ``except Exception: pass`` below.
+    """
+    try:
+        target_fd = sys.stderr.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, target_fd)
+        finally:
+            os.close(devnull)
+    except Exception:
+        pass  # not a real file descriptor (tests), or nothing left to protect
+
+
 try:
     import _identity
 except Exception as exc:  # a broken or partial install
@@ -114,7 +178,7 @@ except Exception as exc:  # a broken or partial install
     # a traceback is exit 1, reported as a hook error on every session end.
     if __name__ != "__main__":
         raise
-    print(f"[session-capture] cannot import _identity: {exc!r}", file=sys.stderr)
+    _import_warn(f"[session-capture] cannot import _identity: {exc!r}")
     sys.exit(0)
 
 try:
@@ -127,7 +191,7 @@ except Exception as exc:  # a broken or partial install
     # as required, not as optional bookkeeping like _hook_state below.
     if __name__ != "__main__":
         raise
-    print(f"[session-capture] cannot import _hook_runner: {exc!r}", file=sys.stderr)
+    _import_warn(f"[session-capture] cannot import _hook_runner: {exc!r}")
     sys.exit(0)
 
 try:
@@ -901,6 +965,28 @@ def _record(reason, started, run):
 def main():
     """Run the hook. Returns True when a worker thread had to be left behind."""
     started = time.monotonic()
+    # Installed before the work thread starts (Amendment A9-21, carried over
+    # from handoff_sync.py's TASK-005 original): every later print(...,
+    # file=sys.stderr) in this process -- the diagnostic print below,
+    # _record's own ledger-write prints, _hook_runner.write_with_budget's own
+    # fallback print -- looks up sys.stderr fresh at call time, so this one
+    # call protects all of them, whichever thread reaches them. The
+    # diagnostic print below now runs AFTER _record (see the comment right
+    # above that call), so this guard is no longer the ONLY thing standing
+    # between a closed stderr pipe and a lost ledger row -- but it still
+    # matters independently of that ordering: CPython's own unconditional
+    # reflush of stdout AND stderr at interpreter shutdown (behind every
+    # exit path, including the "clean" one -- see _hook_runner.finish)
+    # retries the SAME write against the SAME closed pipe regardless of
+    # what main() itself already did, with no Python-level except left
+    # anywhere near it -- that is exit code 120, not 0. And with fd 2
+    # closed before the interpreter even started, sys.stderr is None, and a
+    # bare print(msg, file=None) silently falls back to sys.stdout -- which
+    # this hook's contract requires to stay empty -- independent of
+    # ordering too. guard_stderr() is idempotent, so repeated in-process
+    # main() calls within the same test process do not double-wrap
+    # (production runs this once per process).
+    _hook_runner.guard_stderr()
     run = {"cwd": None, "calls": 0, "extra": {}}
 
     # The work runs against a deadline of its own. urllib's timeout is per
@@ -913,11 +999,11 @@ def main():
     )
 
     reason = "unknown"
+    diagnostic = None
     if left_behind:
         reason = "timeout"
-        print(
-            f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind",
-            file=sys.stderr,
+        diagnostic = (
+            f"[{HOOK}] {reason}: no result after {_WORK_BUDGET_SECONDS}s; leaving the work behind"
         )
     elif "result" not in outcome:
         # Still exit 0 with no stdout -- but no longer without a trace.
@@ -930,10 +1016,24 @@ def main():
             reason = "http_error"
         else:
             reason = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
-        print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+        diagnostic = f"[{HOOK}] {reason}: {exc!r}"
     else:
         reason = outcome["result"]
-    return _record(reason, started, run) or left_behind
+
+    # _record (the ledger row for THIS run) runs BEFORE the diagnostic
+    # print, not after (R2-c05, mirrored from handoff_sync.py): the old
+    # order printed first, and a stderr write that fails -- a closed pipe,
+    # the host already exiting -- used to raise straight out of main()
+    # before _record ever ran, silently losing the row for a run that had
+    # a genuine, useful reason to report (timeout / a real exception).
+    # guard_stderr() above is a first, independent net (it keeps a stderr
+    # write from raising at all); this ordering is a second, independent
+    # one -- it still protects the ledger row even if some OTHER exception
+    # source in the diagnostic (not an OSError) were to escape that guard.
+    record_left_behind = _record(reason, started, run)
+    if diagnostic is not None:
+        print(diagnostic, file=sys.stderr)
+    return record_left_behind or left_behind
 
 
 if __name__ == "__main__":

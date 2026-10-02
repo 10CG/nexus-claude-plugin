@@ -41,6 +41,7 @@ import unittest
 import urllib.parse
 from unittest import mock
 
+import _hook_runner
 import _hook_state
 import _identity
 import _ingest_client
@@ -65,8 +66,13 @@ def _assert_stderr_not_left_wrapped():
     `mod.main()` THROUGH it should be able to leave this module's global
     `sys.stderr` permanently replaced with a `_StderrGuard`. A future test
     that calls `mod.main()` directly, bypassing `_run_main`, would not be
-    caught by that fix alone -- this is the module-wide backstop."""
-    if isinstance(sys.stderr, _MOD._StderrGuard):
+    caught by that fix alone -- this is the module-wide backstop.
+
+    `_StderrGuard` moved into `_hook_runner` under Amendment A9-21 (it used
+    to be `_MOD._StderrGuard`); this file imports `_hook_runner` directly
+    (same module object `handoff_sync.py` itself imports, via `sys.modules`)
+    so the isinstance check still names the real class after the move."""
+    if isinstance(sys.stderr, _hook_runner._StderrGuard):
         raise AssertionError(
             "a test left sys.stderr wrapped in _StderrGuard -- every OTHER "
             "test_*.py module run in this same `unittest discover` process "
@@ -1917,7 +1923,7 @@ class TestRunMainRestoresStderr(_WriteCase):
         self._write("2026-09-20-1000-x.md")
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         before = sys.stderr
-        self.assertNotIsInstance(before, _MOD._StderrGuard)  # the real fixture precondition
+        self.assertNotIsInstance(before, _hook_runner._StderrGuard)  # the real fixture precondition
         self._run()
         self.assertIs(sys.stderr, before)
 
@@ -1957,7 +1963,7 @@ class TestMainDoesNotDoubleWrapStderr(unittest.TestCase):
                 # Still exactly ONE layer: `sys.stderr` is a `_StderrGuard`
                 # wrapping the ORIGINAL sentinel directly, not a
                 # `_StderrGuard` wrapping a `_StderrGuard` wrapping it.
-                self.assertIsInstance(sys.stderr, _MOD._StderrGuard)
+                self.assertIsInstance(sys.stderr, _hook_runner._StderrGuard)
                 self.assertIs(sys.stderr._real, sentinel)
         finally:
             sys.stdin = old_stdin
@@ -3357,100 +3363,6 @@ class TestSilenceStderrFdHygiene(unittest.TestCase):
                 os.fstat(fd)  # fstat on a closed fd raises EBADF; a leaked one would not
 
 
-class TestStderrGuardProtectsWriteWithBudget(unittest.TestCase):
-    """R4-c04, the OTHER half (the import guards are covered end to end by
-    ``TestImportGuards``' closed-pipe tests): ``_hook_runner.write_with_
-    budget``'s own fallback ``print(..., file=sys.stderr)`` is a bare,
-    unguarded write too (a "net under a net" for a ``write()`` that does
-    not already protect itself, per that module's own docstring). Once
-    ``_StderrGuard`` is installed (``main()``, before the work thread
-    starts), it protects THIS print as well, since ``write_with_budget``
-    looks up ``sys.stderr`` fresh at call time same as everything else --
-    the fix in ``main()`` is not scoped to only this file's own ``_warn``
-    call sites. R5-c04: proving that specifically needs a DIRECT test of
-    ``_StderrGuard`` itself (below) -- the end-to-end test through
-    ``write_with_budget`` alone cannot tell "``_StderrGuard`` protected
-    this" apart from "``run_with_deadline``'s own separate, OUTER
-    ``except Exception`` did", because the latter would swallow whatever
-    escaped the former just the same."""
-
-    def test_a_write_that_raises_does_not_escape_through_a_broken_real_stream(self):
-        """R5-c04: this pins the LAYERED integration -- `write_with_budget`
-        completes (not left behind) even when its target raises AND the
-        fallback diagnostic print that follows also fails -- but it does
-        NOT, on its own, pin `_StderrGuard`'s OWN `except OSError`
-        specifically: `run_with_deadline`'s own OUTER `except Exception`
-        (`_hook_runner.py`'s `work()`) would swallow whatever escaped
-        `_StderrGuard` just the same, so `left_behind` reads `False`
-        whether or not `_StderrGuard` protects anything at all (confirmed:
-        removing its `except OSError` entirely still leaves this exact
-        assertion green). `test_stderr_guard_wrapping_a_broken_real_
-        stream_does_not_raise` below tests the class directly, which is
-        what actually pins ITS contract; this one stays as the end-to-end
-        "nothing hangs or crashes the caller" claim its own name makes."""
-        guarded_stderr = _MOD._StderrGuard(_BrokenStderr())  # no real fd behind it either
-        with mock.patch.object(sys, "stderr", guarded_stderr):
-            def failing_write():
-                raise RuntimeError("boom, escapes write()'s own protections")
-
-            left_behind = _MOD._hook_runner.write_with_budget(failing_write, 2.0, "probe")
-        self.assertFalse(left_behind)  # the thread completed; nothing hung or crashed the test
-
-    def test_stderr_guard_wrapping_a_broken_real_stream_does_not_raise(self):
-        """R5-c04: the direct pin the test above cannot provide -- calls
-        `_StderrGuard`'s own `write`/`flush` straight, with nothing
-        upstream (`run_with_deadline`'s outer catch) able to paper over a
-        regression here. `sys.stderr` is patched to this SAME guard object
-        first: `_silence_stderr()` (triggered internally by the OSError
-        below) reads the GLOBAL `sys.stderr`, not `self`, and this keeps
-        that call safe -- it delegates through `_BrokenStderr`'s missing
-        `fileno()` (an `AttributeError`, swallowed by `_silence_stderr`'s
-        own blanket except) instead of redirecting the REAL test
-        process's fd 2 to `/dev/null` for the rest of the suite."""
-        guard = _MOD._StderrGuard(_BrokenStderr())
-        with mock.patch.object(sys, "stderr", guard):
-            self.assertEqual(guard.write("x"), 1)  # swallowed, not raised
-            guard.flush()  # must not raise either
-
-    def test_stderr_guard_passes_through_unknown_attributes(self):
-        """R5-c09: `__getattr__` is purely defensive -- nothing in this
-        plugin currently reads anything off `sys.stderr` beyond `write` /
-        `flush` / `fileno` (all three explicitly defined) -- but deleting
-        it entirely still passed the WHOLE suite before this test existed
-        (confirmed against a temp copy). A future consumer (stdlib code, a
-        sibling module, `_ingest_client`) reading e.g. `sys.stderr.
-        encoding` off an already-installed guard would otherwise hit a
-        bare `AttributeError` with nothing here to catch that regression."""
-        class _Extra:
-            encoding = "utf-8"
-
-            def isatty(self):
-                return False
-
-        real = _Extra()
-        guard = _MOD._StderrGuard(real)
-        self.assertEqual(guard.encoding, "utf-8")
-        self.assertFalse(guard.isatty())  # a bound method, delegated and callable
-        with self.assertRaises(AttributeError):
-            guard.does_not_exist_anywhere
-
-    def test_stderr_guard_wrapping_none_does_not_raise(self):
-        """R5-c02: `sys.stderr is None` is not only the interpreter-startup
-        shape `_warn` itself guards against (R4-c07) -- `main()` wraps
-        WHATEVER `sys.stderr` currently is, `None` included, in a
-        `_StderrGuard` (R4-c06), and any LATER write through that guard
-        (from `_ingest_client`'s own unguarded prints, ruling 15) must not
-        raise `AttributeError` calling `.write`/`.flush` on a `None`
-        `_real`. No existing test constructed `_StderrGuard(None)` --
-        `test_a_write_that_raises_does_not_escape_through_a_broken_real_
-        stream` above only ever wraps a `_BrokenStderr()`; mutating either
-        method's `self._real is None` guard away passed the whole suite
-        before this test existed (confirmed against a temp copy)."""
-        guard = _MOD._StderrGuard(None)
-        self.assertEqual(guard.write("x"), 1)
-        guard.flush()  # must not raise
-
-
 class TestImportGuards(unittest.TestCase):
     """handoff_sync.py's own three import guards (R1-c31): none of them had
     a test of its own, unlike session_capture.py's / session_inject.py's
@@ -3668,12 +3580,15 @@ class TestSubprocess(unittest.TestCase):
         and `flush`'s still-intact guard no-ops at shutdown same as ever;
         confirmed empirically against a temp copy -- see the `_StderrGuard`
         class docstring's own two-guards paragraph). `write`'s side is
-        pinned directly instead, by `test_stderr_guard_wrapping_none_
-        does_not_raise` above (see `TestImportGuards`' sibling test above
-        for the one shape that DOES exercise `_warn`'s OWN `sys.stderr is
-        None` branch, a different guard again: a missing sibling module,
-        whose bare `print` runs before any `_StderrGuard` exists to wrap
-        anything)."""
+        pinned directly instead, by `test_hook_runner.TestStderrGuard.
+        test_wrapping_none_does_not_raise` (A9-21 moved `_StderrGuard`
+        itself into `_hook_runner`, and that test with it -- NOT "above",
+        and NOT in this file any more, correcting an earlier revision of
+        this paragraph written before that move) -- see `TestImportGuards`'
+        sibling test above for the one shape that DOES exercise `_warn`'s
+        OWN `sys.stderr is None` branch, a different guard again: a
+        missing sibling module, whose bare `print` runs before any
+        `_StderrGuard` exists to wrap anything)."""
         run_env = _scrub_subprocess_env()
         run_env["NEXUS_HOOK_STATE_DIR"] = self.state_dir
         proc = subprocess.Popen(
