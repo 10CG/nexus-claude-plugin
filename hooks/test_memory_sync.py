@@ -39,6 +39,7 @@ only, is structurally blind to a thread started under any OTHER name) --
 for why that order is itself load-bearing).
 """
 
+import ast
 import errno
 import glob
 import hashlib
@@ -70,16 +71,27 @@ _PROXY_VARS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_pr
 _NO_PROXY = {"no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"}
 
 # H1 (hermeticity incident, 2026-10-02): captured at IMPORT time, before
-# setUpModule below ever patches HOME -- this is the developer's own real
-# home, never the throwaway one `root`/`home` (below) point every hook at
-# for the rest of this module's run.
-_REAL_HOME = os.path.expanduser("~")
-_REAL_NEXUS_DIR = os.path.join(_REAL_HOME, ".nexus")
+# setUpModule below ever patches HOME / NEXUS_HOOK_STATE_DIR -- the
+# developer's own real state root, resolved by the same production helper
+# every hook uses (NEXUS_HOOK_STATE_DIR if the shell sets it, else
+# ~/.nexus/hooks), never the throwaway one `root`/`home` (below) point
+# every hook at for the rest of this module's run. Only ever NAMED in
+# failure messages; what the guards actually check is resolved again, by
+# the same helper, at the moment they run (F7, review of the env-once
+# round, 2026-10-03: the previous ``~/.nexus`` constants pointed those
+# messages at the wrong place whenever NEXUS_HOOK_STATE_DIR was set).
+_REAL_STATE_ROOT = _hook_state.state_root()
 
 # G1 (second targeted review of the hygiene round, 2026-10-02): the real
 # `_identity.memory_dir_key`, captured before `setUpModule` wraps the
 # module attribute below, so the wrapper can still call through to it.
 _REAL_MEMORY_DIR_KEY = _identity.memory_dir_key
+# F1/F5 (review of the env-once round, 2026-10-03): the real
+# `_identity.container_id`, captured before `_WriteCase.setUp` replaces it
+# with a constant, so `TestP1WorkerReadsNoConfigurationFromTheEnvironment`
+# can put the env-reading original back for the one test that needs
+# NEXUS_CONTAINER_ID to be read for real.
+_REAL_CONTAINER_ID = _identity.container_id
 _SEEN_MEMORY_DIR_KEYS_LOCK = threading.Lock()
 _SEEN_MEMORY_DIR_KEYS = set()
 
@@ -98,6 +110,13 @@ _BASELINE_THREADS = None
 # see there. Keyed by the exact per-hook state-subdirectory path
 # (``<a state root>/memory-sync``) `_assert_no_new_state_subdir` checks.
 _REAL_STATE_SUBDIRS_EXISTED_BEFORE = {}
+
+# F7 (review of the env-once round, 2026-10-03): the exact patcher
+# `setUpModule` installs the fake HOME / NEXUS_HOOK_STATE_DIR with, so
+# `TestRealHomeGuardRegistration` can check the cleanup that runs right
+# before the guard is THIS patcher's own stop (by identity), not merely
+# some `_patch_dict.stop` at that position. `None` until `setUpModule`.
+_MODULE_ENV_PATCHER = None
 
 
 def _recording_memory_dir_key(cwd):
@@ -276,8 +295,11 @@ def _assert_no_leaked_state_files(real_nexus_dir, keys, context=""):
     directory lived under ``/tmp``.
 
     As of P1 (2026-10-03) this incident's own root cause is closed in
-    production -- the worker thread no longer reads the environment at
-    all, so it cannot resolve a DIFFERENT root once one has been restored
+    production -- the worker thread no longer reads its configuration
+    (state root, URL, token, identity, config dir) from the environment,
+    so it cannot resolve a DIFFERENT root once one has been restored (the
+    standard library still reads ``os.environ`` on that thread -- PATH for
+    git, proxy variables for urllib; see memory_sync.py's P1 paragraph)
     -- and P2 widens the module-level thread join this guard runs after
     to cover any thread this module's run started, not only the two
     `_hook_runner` names. This function is still a SINGLE, point-in-time
@@ -333,10 +355,10 @@ def _assert_no_new_state_subdir(state_subdir, existed_before, context=""):
         return
     if os.path.isdir(state_subdir):
         raise AssertionError(
-            f"found a file named by a key this module resolved -- the REAL state "
-            f"root{context}'s own {state_subdir!r} did not exist before this module's "
-            "own test run and does now, even though nothing inside it matches one of "
-            "this run's own keys -- a worker thread touched the real filesystem anyway"
+            f"the REAL state root{context}'s own {state_subdir!r} did not exist before "
+            "this module's own test run and does now -- something this run started "
+            "created it, whatever is or is not inside it (a key-named file inside it "
+            "is reported separately, by the per-key check)"
         )
 
 
@@ -355,15 +377,15 @@ def _assert_no_leaked_state_files_for_module():
     restored to its REAL value by the time this runs -- see setUpModule's
     own registration order) -- AND the conventional default
     (``_hook_state.DEFAULT_STATE_DIR``, expanded), rather than the
-    hardcoded ``_REAL_NEXUS_DIR`` constant this used to check alone. A
+    hardcoded ``~/.nexus`` constant this used to check alone. A
     mutation to either production helper's OWN resolution (a typo in the
     default, a wrong env var precedence) now shows up here automatically,
     because this calls the SAME code -- it does not re-derive its own,
     independent guess of where production would have gone wrong.
     `TestRealHomeGuardRegistration.test_the_registered_entry_itself_
     detects_a_run_lock_leak` pins this specifically by pointing
-    ``NEXUS_HOOK_STATE_DIR`` at a sentinel, not by patching
-    ``_REAL_NEXUS_DIR`` (the previous version of that test)."""
+    ``NEXUS_HOOK_STATE_DIR`` at a sentinel, not by patching the
+    ``~/.nexus`` constant the previous version of that test patched."""
     keys = _memory_dir_keys_seen()
     production_root = _hook_state.state_root()
     default_root = os.path.expanduser(_hook_state.DEFAULT_STATE_DIR)
@@ -486,9 +508,10 @@ def _assert_worker_threads_finished(context="", join_seconds=None):
     if lingering:
         raise AssertionError(
             f"worker thread(s) outlived their own test{context}: {lingering} -- "
-            "if it is still running, it may write for real into "
-            f"{os.path.join(_REAL_NEXUS_DIR, 'hooks', _MOD.HOOK)!r} once HOME is "
-            "restored; check there for a stray state file, its .lock, or a <key>.run.lock"
+            "anything still running resolves its paths from whatever environment is "
+            "current when it gets there (main()'s own ledger write does, by design); "
+            f"check the REAL state root {_REAL_STATE_ROOT!r} for a stray ledger row, "
+            f"or a <key>.json / .lock / .run.lock under its {_MOD.HOOK!r} subdirectory"
         )
 
 
@@ -541,9 +564,11 @@ def _assert_no_untracked_thread_outlived_the_module(join_seconds):
     if lingering:
         raise AssertionError(
             f"thread(s) started during this module's own test run outlived it: {lingering} -- "
-            "if any is still running, it may write for real into "
-            f"{os.path.join(_REAL_NEXUS_DIR, 'hooks', _MOD.HOOK)!r} (or wherever "
-            "NEXUS_HOOK_STATE_DIR now points once HOME is restored)"
+            "anything still running resolves its paths from whatever environment is "
+            "current when it gets there, which is about to be the REAL one "
+            f"(state root {_REAL_STATE_ROOT!r}); main()'s own ledger write is one such "
+            "path even after P1 -- the worker itself no longer reads its configuration "
+            "from the environment"
         )
 
 
@@ -592,6 +617,8 @@ def setUpModule():
     env.update({"HOME": home, "NEXUS_HOOK_STATE_DIR": os.path.join(root, "state")})
     env.update(_NO_PROXY)
     patcher = mock.patch.dict(os.environ, env, clear=True)
+    global _MODULE_ENV_PATCHER
+    _MODULE_ENV_PATCHER = patcher
     patcher.start()
     # F1 (targeted review of the hygiene round, 2026-10-02): registered
     # BEFORE `patcher.stop` -- not after, as this used to read -- so that
@@ -5129,121 +5156,308 @@ class TestBackstopSelfTest(_WriteCase):
             self._join_hung_worker(release)
 
 
-class TestP1WorkerNeverRereadsEnvironmentAfterHandoff(_WriteCase):
-    """P1 (adversarial review of b3bb60d, 2026-10-03, finding 6): the
-    production root cause -- ``_collect`` read ``NEXUS_API_URL`` at its
-    own top, but ``NEXUS_API_TOKEN`` only much later, after the run lock
-    had already re-resolved ``_hook_state.state_root()`` -- so a worker
-    thread released after the CALLING thread's own environment had
-    already moved on would pick up whatever NEW values were current at
-    that point, not the ones the round actually started with.
+# ── P1: the worker reads no configuration from the environment ──────────
 
-    Parks the REAL worker thread ``main()`` itself starts (via
-    ``_identity.project_root``, the EARLIEST point in ``_collect`` this
-    test can intercept without also mocking away the very call whose
-    env-dependent descendants -- ``_memory_dir``, ``_memory_state_path_
-    under``, ``_memory_run_lock_path_under``, the ``IngestClient``
-    construction -- it exists to pin), confirms it is genuinely blocked
-    there, THEN swaps ``NEXUS_API_TOKEN`` / ``NEXUS_HOOK_STATE_DIR`` /
-    ``HOME`` / ``CLAUDE_CONFIG_DIR`` to sentinels an unfixed worker would
-    read AFTER being released, and only then releases it. ``main()``
-    itself runs on its OWN thread (not this test's), with its real,
-    default work budget, so the round completes NORMALLY once released
-    -- this is not a timeout/abandonment scenario (``TestBackstopSelfTest``
-    already covers that shape); the point here is that the round
-    SUCCEEDS, using the environment it started with, while the sentinel
-    one sits in ``os.environ`` the whole time it does its real work."""
+# Every way a function can read (or rewrite) the process environment
+# without going through a helper: attribute chains, matched on the dotted
+# name (``os.environ.get(...)`` contains ``os.environ``), and the same
+# names imported bare via ``from os import ...`` / ``from os.path import ...``.
+_ENV_READS = (
+    "os.environ", "os.environb", "os.getenv", "os.getenvb", "os.putenv", "os.unsetenv",
+    "os.path.expanduser", "os.path.expandvars",
+)
+# The other hook modules a worker-path function can call into. The
+# standard library is deliberately NOT followed: it does read os.environ
+# on the worker thread (PATH for the git subprocess, proxy variables in
+# urllib) -- see memory_sync.py's own P1 paragraph.
+_SIBLING_MODULES = ("_hook_runner", "_hook_state", "_identity", "_ingest_client", "_redact")
 
-    def test_a_parked_worker_completes_using_the_env_main_captured_not_a_later_swap(self):
+
+def _dotted_name(node):
+    """``"a.b.c"`` for a plain ``Name``/``Attribute`` chain, else ``None``."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _parse_hook_module(name):
+    path = os.path.join(_HOOKS_DIR, f"{name}.py")
+    with open(path, encoding="utf-8") as fh:
+        return ast.parse(fh.read(), filename=path)
+
+
+def _top_level_defs(tree):
+    return {
+        n.name: n for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _env_aliases(tree):
+    """Local names a ``from os import ...`` / ``from os.path import ...``
+    binds to one of ``_ENV_READS``, mapped to the dotted name they stand for."""
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in ("os", "os.path"):
+            for alias in node.names:
+                dotted = f"{node.module}.{alias.name}"
+                if dotted in _ENV_READS:
+                    aliases[alias.asname or alias.name] = dotted
+    return aliases
+
+
+def _worker_entry_points(tree):
+    """The top-level names ``main()`` hands ``_hook_runner.run_with_deadline``
+    as the worker's target, read from ``main()``'s own source -- so a
+    renamed or added worker function is followed, not silently left out."""
+    defs = _top_level_defs(tree)
+    main = defs["main"]
+    roots = set()
+    for node in ast.walk(main):
+        if (isinstance(node, ast.Call) and node.args
+                and _dotted_name(node.func) == "_hook_runner.run_with_deadline"):
+            for sub in ast.walk(node.args[0]):
+                if isinstance(sub, ast.Name) and sub.id in defs:
+                    roots.add(sub.id)
+    return roots
+
+
+def _environment_reads_reachable_from(entry_points, trees=None):
+    """Every environment read reachable from ``entry_points`` -- ``(module,
+    top-level name)`` pairs -- following bare-name references to that
+    module's own top-level functions and classes and ``<sibling>.<name>``
+    references into the other hook modules, transitively. A class is
+    walked whole (every method), since a call through an instance cannot
+    be resolved statically.
+
+    Returns ``(reads, visited)``: ``reads`` is a sorted list of ``(module,
+    function, read, lineno)``; ``visited`` is every ``(module, name)``
+    actually examined, so a caller can check the walk was not vacuous.
+    ``trees`` lets a self-test substitute a mutated module."""
+    trees = dict(trees or {})
+    cache = {}
+
+    def module_info(module):
+        if module not in cache:
+            tree = trees.get(module) or _parse_hook_module(module)
+            cache[module] = (_top_level_defs(tree), _env_aliases(tree))
+        return cache[module]
+
+    reads, visited = set(), set()
+    stack = list(entry_points)
+    while stack:
+        module, name = stack.pop()
+        if (module, name) in visited:
+            continue
+        visited.add((module, name))
+        defs, aliases = module_info(module)
+        node = defs.get(name)
+        if node is None:
+            continue  # a module-level constant, or not defined here: nothing to walk
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Attribute):
+                dotted = _dotted_name(sub)
+                if dotted in _ENV_READS:
+                    reads.add((module, name, dotted, sub.lineno))
+                elif isinstance(sub.value, ast.Name) and sub.value.id in _SIBLING_MODULES:
+                    stack.append((sub.value.id, sub.attr))
+            elif isinstance(sub, ast.Name):
+                if sub.id in aliases:
+                    reads.add((module, name, aliases[sub.id], sub.lineno))
+                elif sub.id in defs:
+                    stack.append((module, sub.id))
+    return sorted(reads), visited
+
+
+class TestP1WorkerReadsNoConfigurationFromTheEnvironment(_WriteCase):
+    """P1 (adversarial review of b3bb60d, 2026-10-03, finding 6), re-pinned
+    by F1 + F5 (review of the env-once round, 2026-10-03): main() reads all
+    seven environment inputs once, on the calling thread, before the
+    worker starts; the worker uses only what was captured.
+
+    Replaces the earlier version of this test, which parked the REAL
+    worker thread, swapped four variables from the test thread and then
+    released it. main()'s own ledger write -- another thread, resolving
+    its path when it runs -- raced that swap: a false red under load (up
+    to 11/40 on this machine), and a narrow window in which the ledger
+    row could land under the developer's real HOME. It also swapped only
+    four of the seven inputs and checked only the token (L5-L8 survived).
+
+    Here nothing runs concurrently. ``_hook_runner.run_with_deadline`` is
+    replaced for the WORK call only (the ledger write still goes through
+    the real one): the round's own work runs inline, on this thread,
+    inside a window in which all seven inputs are sentinels, and that
+    window is closed again before main() goes on to its ledger write.
+    Every sentinel has a way to show it was read: a second backend that
+    must receive nothing, a token / user / container that must never
+    appear on a request, a state root that must never be created, a HOME
+    that must stay empty, and a config directory holding a memory file of
+    its own that would be posted if it were listed."""
+
+    def test_the_round_uses_what_main_captured_while_every_input_is_a_sentinel(self):
         self._write("f1")
         self.backend.reply(*_empty_lookup())  # orphan reconciliation: nothing to see
         self.backend.reply(*_empty_lookup()).reply(*_created())  # upsert dedup lookup + POST
 
-        real_project_root = _identity.project_root
-        release_event = threading.Event()
-        hit_event = threading.Event()
+        sentinel_backend = _Backend()
+        self.addCleanup(sentinel_backend.close)
+        sentinel_root = os.path.join(self.tmp.name, "sentinel-state-root")
+        sentinel_home = os.path.join(self.tmp.name, "sentinel-home")
+        os.makedirs(sentinel_home)
+        sentinel_config = os.path.join(self.tmp.name, "sentinel-config")
+        sentinel_memory_dir = os.path.join(sentinel_config, "projects", self.key, "memory")
+        os.makedirs(sentinel_memory_dir)
+        _write_memory_file(sentinel_memory_dir, "sentinel-only")
+        sentinel_env = {
+            "NEXUS_API_URL": sentinel_backend.url,
+            "NEXUS_API_TOKEN": "sentinel-token-must-never-be-sent",
+            "NEXUS_HOOK_STATE_DIR": sentinel_root,
+            "HOME": sentinel_home,
+            "CLAUDE_CONFIG_DIR": sentinel_config,
+            "NEXUS_DEFAULT_USER_ID": "sentinel-user",
+            "NEXUS_CONTAINER_ID": "sentinel-box",
+        }
 
-        def parked_project_root(cwd, _real=real_project_root):
-            hit_event.set()
-            release_event.wait(10.0)
-            return _real(cwd)
+        work_name = f"{_MOD.HOOK}-work"
+        real_run_with_deadline = _hook_runner.run_with_deadline
+        inline_runs = []
+
+        def work_inline_under_sentinels(target, budget, name):
+            if name != work_name:
+                return real_run_with_deadline(target, budget, name)  # the ledger write: untouched
+            inline_runs.append(name)
+            outcome = {}
+            with mock.patch.dict(os.environ, sentinel_env):
+                try:
+                    outcome["result"] = target()
+                except Exception as exc:  # the same contract run_with_deadline keeps
+                    outcome["error"] = exc
+            return outcome, False
 
         original_token = "original-token-must-be-the-one-sent"
-        env = {
-            "NEXUS_API_URL": self.backend.url,
-            "NEXUS_HOOK_STATE_DIR": self.state_dir,
-            "NEXUS_DEFAULT_USER_ID": USER,
-            "CLAUDE_CONFIG_DIR": self.config_dir,
-            "NEXUS_API_TOKEN": original_token,
-        }
-        clean = {k: os.environ[k] for k in _BASE_ENV_KEYS if k in os.environ}
-        clean.update(_NO_PROXY)
-        clean.update(env)
+        with mock.patch.object(_identity, "container_id", _REAL_CONTAINER_ID), \
+                mock.patch.object(_hook_runner, "run_with_deadline", work_inline_under_sentinels):
+            self._run(NEXUS_API_TOKEN=original_token, NEXUS_CONTAINER_ID=CONTAINER)
 
-        old_stdin = sys.stdin
-        sys.stdin = io.StringIO(json.dumps({"cwd": self.cwd}))
-
-        def drive_main():
-            with mock.patch.dict(os.environ, clean, clear=True), \
-                    mock.patch.object(sys, "stderr", sys.stderr), \
-                    mock.patch.object(_identity, "project_root", side_effect=parked_project_root):
-                _MOD.main()
-
-        driver = threading.Thread(target=drive_main, name="test-p1-main-driver", daemon=True)
-        driver.start()
-        try:
-            self.assertTrue(hit_event.wait(5.0), "the parked worker never even started")
-            # drive_main's own env patch, installed on ITS thread, is still
-            # the active process environment here -- os.environ is
-            # process-wide, not per-thread, and neither main() nor its own
-            # worker thread has returned yet. Swapping it now, from THIS
-            # (the test's own) thread, models the calling environment
-            # having moved on behind the parked worker's back -- exactly
-            # the shape the adversarial review's own reproduction used.
-            sentinel_root = os.path.join(self.tmp.name, "sentinel-state-root")
-            sentinel_home = os.path.join(self.tmp.name, "sentinel-home")
-            sentinel_config = os.path.join(self.tmp.name, "sentinel-config")
-            os.makedirs(sentinel_home, exist_ok=True)
-            with mock.patch.dict(os.environ, {
-                "NEXUS_API_TOKEN": "sentinel-token-must-never-be-sent",
-                "NEXUS_HOOK_STATE_DIR": sentinel_root,
-                "HOME": sentinel_home,
-                "CLAUDE_CONFIG_DIR": sentinel_config,
-            }):
-                release_event.set()
-                # Wait for the ROUND'S OWN WORK -- _collect's own thread,
-                # by name -- to finish WHILE the sentinel env is still
-                # active, so anything it does mid-work is observed under
-                # the sentinel (it must do nothing: P1's whole point).
-                # main()'s OWN ledger write, which follows on `driver`'s
-                # thread once this worker rejoins it, is a SEPARATE,
-                # pre-existing, cross-hook mechanism this fix does not
-                # touch (every hook's ledger write resolves its own path
-                # fresh when IT runs) -- it must run AFTER the sentinel
-                # env is gone, not while it is still up, so it is
-                # deliberately left OUTSIDE this `with` block.
-                work_name = f"{_MOD.HOOK}-work"
-                for t in threading.enumerate():
-                    if t.name == work_name and t is not threading.current_thread():
-                        t.join(10.0)
-                        self.assertFalse(t.is_alive(), "the round's own worker did not finish in time")
-            self.assertFalse(os.path.exists(sentinel_root), "must never touch the sentinel state root")
-            self.assertFalse(os.path.exists(sentinel_config), "must never touch the sentinel config dir")
-            driver.join(10.0)
-            self.assertFalse(driver.is_alive(), "main() did not return after its own worker finished")
-        finally:
-            release_event.set()
-            sys.stdin = old_stdin
-            driver.join(5.0)
-
+        self.assertEqual(inline_runs, [work_name], "the round's own work did not run inside the sentinel window")
+        self.assertEqual(sentinel_backend.requests, [], "a request followed a URL read after main() captured its own")
+        self.assertTrue(self.requests, "the round made no request at all -- nothing below would be checked")
+        for request in self.requests:
+            self.assertEqual(request["headers"].get("x-api-key"), original_token, request)
+            if request["method"] == "GET":
+                self.assertEqual(request["query"].get("user_id"), USER, request)
+                self.assertEqual(request["query"].get("container_id"), CONTAINER, request)
         posts = [r for r in self.requests if r["method"] == "POST"]
         self.assertEqual(len(posts), 1, self.requests)
-        self.assertEqual(
-            posts[0]["headers"].get("x-api-key"), original_token,
-            "the POST must carry the token main() captured, never the sentinel",
+        self.assertEqual(posts[0]["json"]["user_id"], USER)
+        self.assertEqual(posts[0]["json"]["metadata"]["container_id"], CONTAINER)
+        self.assertEqual(posts[0]["json"]["metadata"]["external_id"], self._ext("f1"))
+        self.assertFalse(os.path.exists(sentinel_root), "must never touch the sentinel state root")
+        self.assertEqual(os.listdir(sentinel_home), [], "must never write under the sentinel HOME")
+        self.assertIn("f1", self._state().get("files", {}))  # written under the ORIGINAL root
+        self.assertEqual(self._last_entry()["reason"], "none")
+
+
+class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
+    """The static half of P1 (F1 + F5, review of the env-once round,
+    2026-10-03). The runtime test above only sees the branches one
+    scripted round takes; this walks EVERY function the worker can reach
+    -- in memory_sync.py and, transitively, in the other hook modules --
+    and fails on an environment read in any of them, taken or not.
+    Deterministic: no thread, no environment change, nothing written."""
+
+    def setUp(self):
+        self.roots = _worker_entry_points(_parse_hook_module("memory_sync"))
+
+    def _reads(self, tree=None):
+        trees = {"memory_sync": tree} if tree is not None else None
+        return _environment_reads_reachable_from([("memory_sync", r) for r in self.roots], trees)
+
+    def _mutated(self, function, statement):
+        tree = _parse_hook_module("memory_sync")
+        _top_level_defs(tree)[function].body.insert(1, ast.parse(statement).body[0])
+        return tree
+
+    def test_no_function_the_worker_can_reach_reads_the_environment(self):
+        self.assertTrue(self.roots, "found no worker target in main() -- the check below would be vacuous")
+        reads, visited = self._reads()
+        self.assertEqual(reads, [], "a function the worker thread can reach reads the environment itself")
+        # Not vacuous: the walk really reached the worker's own work, and
+        # really crossed into the other hook modules.
+        reached = {name for module, name in visited if module == "memory_sync"}
+        for expected in ("_sync_file", "_delete_file", "_reconcile_orphans", "_acquire_run_lock"):
+            self.assertIn(expected, reached)
+        self.assertIn(("_ingest_client", "IngestClient"), visited)
+        self.assertIn(("_identity", "memory_dir_key"), visited)
+
+    def test_the_same_walk_does_find_main_s_own_reads(self):
+        """The control: main() -- on the calling thread -- is where the
+        reads moved to, and the same analysis that finds none on the
+        worker path finds them there."""
+        reads, _ = _environment_reads_reachable_from([("memory_sync", "main")])
+        in_main = {read for module, function, read, _line in reads if (module, function) == ("memory_sync", "main")}
+        self.assertLessEqual({"os.environ", "os.path.expanduser"}, in_main)
+        self.assertIn(("_hook_state", "state_root", "os.environ"), {r[:3] for r in reads})
+        self.assertIn(("_identity", "container_id", "os.environ"), {r[:3] for r in reads})
+
+    def test_each_way_back_in_is_caught(self):
+        cases = (
+            ("_sync_file", 'os.environ.get("NEXUS_API_TOKEN")'),  # L1-shaped: a late token read
+            ("_collect", 'os.environ.get("NEXUS_API_URL")'),  # L7/L8-shaped: the URL read back
+            ("_delete_file", "_identity.container_id()"),  # L6-shaped
+            ("_sync_file", '_identity.user_id("/x")'),  # L5-shaped
+            ("_reconcile_orphans", "_hook_state.state_root()"),  # L2/L3-shaped
+            ("_collect", '_memory_state_path("k")'),  # only transitively: the convenience form resolves the root
+            ("_list_memory_files", 'os.path.expanduser("~/.claude")'),  # L4-shaped
         )
-        state = self._state()  # reads back from self.state_dir -- the ORIGINAL root
-        self.assertIn("f1", state.get("files", {}))
+        for function, statement in cases:
+            with self.subTest(function=function, statement=statement):
+                reads, _ = self._reads(self._mutated(function, statement))
+                self.assertTrue(reads, f"{statement} in {function} went unnoticed")
+
+    def test_a_bare_alias_imported_from_os_is_caught_too(self):
+        tree = _parse_hook_module("memory_sync")
+        tree.body.insert(0, ast.parse("from os import getenv as g").body[0])
+        _top_level_defs(tree)["_acquire_run_lock"].body.insert(1, ast.parse('g("X")').body[0])
+        reads, _ = self._reads(tree)
+        self.assertIn(("memory_sync", "_acquire_run_lock", "os.getenv"), {r[:3] for r in reads})
+
+    def test_an_os_call_that_reads_no_environment_is_not_flagged(self):
+        """Compared with the unmutated walk, not with ``[]``: this pins
+        what the injection adds (nothing), independently of whether the
+        baseline itself is clean -- that is the first test's job."""
+        baseline, _ = self._reads()
+        reads, _ = self._reads(self._mutated("_sync_file", "os.getcwd()"))
+        self.assertEqual(reads, baseline)
+
+
+class TestF3EnvironmentReadFailureIsStillRecorded(_WriteCase):
+    """F3 (review of the env-once round, 2026-10-03): P1 moved main()'s
+    environment reads in front of run_with_deadline's own exception net,
+    where a failure in them (today: only ``socket.gethostname()``, when
+    NEXUS_CONTAINER_ID is unset) escaped main() and vanished through
+    ``__main__``'s blanket ``except Exception: pass`` -- no ledger row, no
+    stderr line, exit 0 -- instead of the ``unknown`` row and diagnostic
+    the same failure produced while the read still sat inside _collect."""
+
+    def test_a_failing_container_id_read_still_writes_a_row_and_a_stderr_line(self):
+        self._write("f1")
+        err = io.StringIO()
+        failure = OSError("simulated gethostname failure")
+        with mock.patch.object(_identity, "container_id", side_effect=failure), \
+                mock.patch.object(sys, "stderr", err):
+            self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertFalse(entry["ok"])
+        self.assertIn(f"[{_MOD.HOOK}] unknown: {failure!r}", err.getvalue())
+        self.assertEqual(self.requests, [], "nothing may be sent when the round's own inputs could not be read")
+        self.assertFalse(os.path.exists(_MOD._memory_state_path(self.key)))
 
 
 class TestP2ModuleThreadCheckCoversUntrackedThreads(unittest.TestCase):
@@ -5275,6 +5489,23 @@ class TestP2ModuleThreadCheckCoversUntrackedThreads(unittest.TestCase):
             intruder.join(5.0)
             self.assertFalse(intruder.is_alive(), "the intruder thread outlived this test")
 
+    def test_it_raises_for_a_default_named_non_daemon_timer(self):
+        """F6 (review of the env-once round, 2026-10-03): the case above is
+        a DAEMON thread under a CUSTOM name; skipping non-daemon threads
+        (T7) or default-named ``Thread-N`` ones (T8) both survived it. A
+        ``threading.Timer`` is both -- the shape the R8 reproduction used."""
+        timer = threading.Timer(30.0, lambda: None)
+        self.assertFalse(timer.daemon)
+        self.assertTrue(timer.name.startswith("Thread-"), timer.name)
+        timer.start()
+        try:
+            with self.assertRaisesRegex(AssertionError, "outlived"):
+                _assert_no_untracked_thread_outlived_the_module(0.05)
+        finally:
+            timer.cancel()
+            timer.join(5.0)
+            self.assertFalse(timer.is_alive(), "the timer thread outlived this test")
+
     def test_it_stays_silent_once_the_untracked_thread_has_actually_finished(self):
         done = threading.Event()
         t = threading.Thread(target=done.set, name="short-lived-arbitrary-name", daemon=True)
@@ -5295,7 +5526,7 @@ class TestRealHomeGuardIsPinned(unittest.TestCase):
     """G2 (second targeted review of the hygiene round, 2026-10-02):
     `_assert_no_leaked_state_files` itself had no test that would fail if
     IT were the thing broken. These call it directly against a SENTINEL
-    temp directory passed in explicitly -- never `_REAL_NEXUS_DIR` -- so
+    temp directory passed in explicitly -- never the real state root -- so
     they can freely create and remove files with no risk to a real
     developer machine, and never need the real ``~/.nexus`` to exist."""
 
@@ -5452,6 +5683,12 @@ class TestRealHomeGuardRegistration(unittest.TestCase):
         self.assertIs(patcher.in_dict, os.environ)
         self.assertIs(patcher.clear, True)
         self.assertEqual(patcher.values.get("HOME"), os.environ["HOME"])
+        # F7 (review of the env-once round, 2026-10-03): mutant V4b -- a
+        # SECOND patch.dict with the same values and clear=True, registered
+        # between the guard and the real patcher -- passed every check
+        # above, yet restored the FAKE environment right before the guard
+        # ran. Only identity tells the two apart.
+        self.assertIs(patcher, _MODULE_ENV_PATCHER)
         # and the temp root is removed only after the guard ran
         rmtree_at = [i for i, fn in enumerate(cleanups) if fn is shutil.rmtree]
         self.assertTrue(rmtree_at and max(rmtree_at) < guard_at, (rmtree_at, guard_at))
@@ -5466,7 +5703,7 @@ class TestRealHomeGuardRegistration(unittest.TestCase):
         SURVIVE, because the guard's own idea of "the real root" never
         moved with it. Pointing NEXUS_HOOK_STATE_DIR at a sentinel
         directory here, rather than patching this test file's own
-        `_REAL_NEXUS_DIR` constant (the previous version of this test),
+        ``~/.nexus`` constant (the previous version of this test),
         exercises the SAME production helper (`_hook_state.state_root()`)
         the registered entry now calls, so a regression in either
         direction shows up here (kills V1 / V2).
@@ -5489,8 +5726,12 @@ class TestRealHomeGuardRegistration(unittest.TestCase):
             os.makedirs(state_dir)
             with open(os.path.join(state_dir, f"{key}.run.lock"), "w"):
                 pass
-            with mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": sentinel}):
-                with self.assertRaisesRegex(AssertionError, "REAL state root"):
+            # F2 (review of the env-once round, 2026-10-03): marked as
+            # already existing, so the bare-directory branch stays out of
+            # it and only the per-key check can raise here.
+            with mock.patch.dict(_REAL_STATE_SUBDIRS_EXISTED_BEFORE, {state_dir: True}), \
+                    mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": sentinel}):
+                with self.assertRaisesRegex(AssertionError, "found a file named by a key"):
                     _assert_no_leaked_state_files_for_module()
 
     def test_the_default_root_is_also_checked_even_when_NEXUS_HOOK_STATE_DIR_points_elsewhere(self):
@@ -5521,14 +5762,97 @@ class TestRealHomeGuardRegistration(unittest.TestCase):
             with open(leak_path, "w"):
                 pass
             try:
-                with mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": unrelated_root}):
-                    with self.assertRaisesRegex(AssertionError, "REAL state root"):
+                # F2: per-key branch only, as in the test above.
+                with mock.patch.dict(_REAL_STATE_SUBDIRS_EXISTED_BEFORE, {state_dir: True}), \
+                        mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": unrelated_root}):
+                    with self.assertRaisesRegex(AssertionError, "found a file named by a key"):
                         _assert_no_leaked_state_files_for_module()
             finally:
                 if pre_existing_top:
                     shutil.rmtree(state_dir, ignore_errors=True)
                 else:
                     shutil.rmtree(created_top, ignore_errors=True)
+
+
+class TestRealHomeGuardBranchesArePinnedSeparately(unittest.TestCase):
+    """F2 (review of the env-once round, 2026-10-03): the registered guard
+    has three independent ways to fire -- a key-named file (per-key), a
+    memory-sync subdirectory that did not exist before this module ran
+    (bare directory), and a listing error that must not read as "nothing
+    here" -- and the two pins above used to put a ``<key>.run.lock`` into
+    a directory that did not exist before, so EITHER branch alone turned
+    them red and neither was pinned: deleting the per-key check (K1),
+    listing the root instead of its subdirectory (K2), deleting the
+    bare-directory check (K3) or reading a non-ENOENT listing error as
+    empty (K4) each left everything green. On any machine that has ever
+    run this hook for real, the subdirectory already exists, the
+    bare-directory branch is off, and the per-key check is the only one
+    left -- so each branch gets a test where it is the ONLY one that can
+    fire. Every test points NEXUS_HOOK_STATE_DIR at its own sentinel and
+    calls the registered entry itself."""
+
+    def _key(self, project):
+        with mock.patch.object(_identity, "_resolved_root", return_value=(project, False)):
+            key, _degraded = _identity.memory_dir_key(project)  # recorded via the wrapper
+        self.assertIn(key, _memory_dir_keys_seen())
+        return key
+
+    def _check(self, sentinel, existed_before):
+        state_dir = os.path.join(sentinel, _MOD.HOOK)
+        with mock.patch.dict(_REAL_STATE_SUBDIRS_EXISTED_BEFORE, {state_dir: existed_before}), \
+                mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": sentinel}):
+            _assert_no_leaked_state_files_for_module()
+
+    def test_per_key_alone_catches_a_run_lock_in_a_directory_that_already_existed(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as sentinel:
+            key = self._key(project)
+            os.makedirs(os.path.join(sentinel, _MOD.HOOK))
+            with open(os.path.join(sentinel, _MOD.HOOK, f"{key}.run.lock"), "w"):
+                pass
+            with self.assertRaisesRegex(AssertionError, "found a file named by a key"):
+                self._check(sentinel, existed_before=True)
+
+    def test_per_key_alone_catches_a_suffix_only_the_directory_listing_can_find(self):
+        """Kills K2: ``<key>.<anything>`` that is not one of the three fixed
+        names is only found by listing memory-sync's OWN directory."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as sentinel:
+            key = self._key(project)
+            os.makedirs(os.path.join(sentinel, _MOD.HOOK))
+            with open(os.path.join(sentinel, _MOD.HOOK, f"{key}.tmp-future"), "w"):
+                pass
+            with self.assertRaisesRegex(AssertionError, "found a file named by a key"):
+                self._check(sentinel, existed_before=True)
+
+    def test_an_existing_directory_with_no_key_file_in_it_is_silent(self):
+        """The control for the two above: with the directory marked as
+        pre-existing and nothing key-named in it, nothing fires -- so their
+        red really comes from the per-key check."""
+        with tempfile.TemporaryDirectory() as sentinel:
+            os.makedirs(os.path.join(sentinel, _MOD.HOOK))
+            with open(os.path.join(sentinel, _MOD.HOOK, "some-real-project-key.json"), "w"):
+                pass
+            self._check(sentinel, existed_before=True)  # must not raise
+
+    def test_bare_directory_alone_catches_an_empty_new_subdirectory(self):
+        with tempfile.TemporaryDirectory() as sentinel:
+            os.makedirs(os.path.join(sentinel, _MOD.HOOK))
+            with self.assertRaisesRegex(AssertionError, "did not exist before"):
+                self._check(sentinel, existed_before=False)
+
+    def test_a_listing_error_alone_is_not_read_as_no_leak(self):
+        with tempfile.TemporaryDirectory() as sentinel:
+            state_dir = os.path.join(sentinel, _MOD.HOOK)
+            os.makedirs(state_dir)
+            real_listdir = os.listdir
+
+            def listdir_denied_for_the_state_dir(path="."):
+                if os.fspath(path) == state_dir:
+                    raise PermissionError(errno.EACCES, "simulated", state_dir)
+                return real_listdir(path)
+
+            with mock.patch.object(os, "listdir", listdir_denied_for_the_state_dir):
+                with self.assertRaisesRegex(AssertionError, "could not list"):
+                    self._check(sentinel, existed_before=True)
 
 
 if __name__ == "__main__":

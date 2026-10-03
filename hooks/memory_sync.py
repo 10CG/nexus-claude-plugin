@@ -219,8 +219,26 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     environment, not the one the round started with. Resolving every
     input on the CALLING thread, before the worker exists at all, removes
     the window entirely rather than narrowing it: there is no later point
-    at which the worker COULD read a different environment, because it
-    never reads one at all. ``_memory_state_path(key)`` /
+    at which the worker COULD read a different value for any of these,
+    because this module's own code on that thread never reads the
+    environment at all. Correction (review of the env-once round,
+    2026-10-03, finding 4): "the worker never reads the environment" is
+    NOT true of the standard library it calls -- the git subprocess
+    behind ``_identity.memory_dir_key``/``project_root`` looks ``git`` up
+    on the live ``PATH`` and the child inherits the whole live
+    environment, and ``urllib`` reads every ``*_proxy`` variable on its
+    first request. A proxy variable changed behind a running worker
+    therefore still steers its requests (with the captured token). That
+    cannot happen in a real hook process -- nothing changes its
+    environment mid-run -- which is why it is noted here rather than
+    closed; in-process tests strip the proxy variables for exactly this
+    reason. Pinned by ``TestP1WorkerReadsNoConfigurationFromTheEnvironment``
+    (every one of the seven values swapped for a sentinel for the whole
+    of the worker's run) and by a static check that no function the
+    worker can reach reads the environment itself. The reads in ``main()``
+    sit inside the SAME failure net as the worker (F3, same review): an
+    exception there is recorded exactly like one raised by the worker.
+    ``_memory_state_path(key)`` /
     ``_memory_run_lock_path(key)`` (the no-argument, env-reading forms)
     still exist, unchanged, for this module's own tests and any other
     caller OUTSIDE the worker path -- they are simply never called from
@@ -2346,21 +2364,11 @@ def main():
     # worker -- never inside _collect, which runs on a daemon thread
     # run_with_deadline can only ABANDON, never kill (see the module
     # docstring's own P1 paragraph for the incident this closes). The
-    # worker reads every one of these back out of `run`; none of it
-    # touches os.environ, _hook_state.state_root(), or
-    # _identity.container_id() itself.
-    base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
-    token = os.environ.get("NEXUS_API_TOKEN", "")
-    state_root = _hook_state.state_root()
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    # Raw env value (None if unset, possibly ""), not yet folded with the
-    # cwd-derived fallback: `_identity.user_id`'s own `or project_slug(cwd)`
-    # half needs `cwd`, which is not known until _collect reads this
-    # round's own stdin payload (not an environment input -- see P1's own
-    # docstring paragraph for why that stays inside _collect).
-    default_user_id = os.environ.get("NEXUS_DEFAULT_USER_ID")
-    container_id = _identity.container_id()  # NEXUS_CONTAINER_ID or the hostname; no cwd needed
-
+    # worker reads every one of these back out of `run`; none of this
+    # module's own code on that thread touches os.environ,
+    # _hook_state.state_root(), or _identity.container_id() itself (the
+    # standard library still reads os.environ there -- see P1's own
+    # paragraph for exactly where).
     run = {
         "cwd": None,
         "calls": 0,
@@ -2370,17 +2378,36 @@ def main():
         # request it could not finish in time rather than this whole worker
         # thread being abandoned mid-call with nothing recorded.
         "deadline": started + _WORK_BUDGET_SECONDS - _DEADLINE_SLACK_SECONDS,
-        "base_url": base_url,
-        "token": token,
-        "state_root": state_root,
-        "config_dir": config_dir,
-        "default_user_id": default_user_id,
-        "container_id": container_id,
     }
-
-    outcome, left_behind = _hook_runner.run_with_deadline(
-        lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
-    )
+    try:
+        run.update(
+            base_url=os.environ.get("NEXUS_API_URL", "").rstrip("/"),
+            token=os.environ.get("NEXUS_API_TOKEN", ""),
+            state_root=_hook_state.state_root(),
+            config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+            # Raw env value (None if unset, possibly ""), not yet folded
+            # with the cwd-derived fallback: `_identity.user_id`'s own `or
+            # project_slug(cwd)` half needs `cwd`, which is not known until
+            # _collect reads this round's own stdin payload (not an
+            # environment input -- see P1's own docstring paragraph for why
+            # that stays inside _collect).
+            default_user_id=os.environ.get("NEXUS_DEFAULT_USER_ID"),
+            container_id=_identity.container_id(),  # NEXUS_CONTAINER_ID or the hostname; no cwd needed
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded below, exactly like a worker exception
+        # F3 (review of the env-once round, 2026-10-03): these reads used
+        # to sit inside _collect, so a failure here (today: only
+        # socket.gethostname(), when NEXUS_CONTAINER_ID is unset) reached
+        # run_with_deadline's own net and was recorded as `unknown` with a
+        # stderr line. Moving them in front of that net must not turn the
+        # same failure into an unrecorded, silent exit through
+        # __main__'s blanket `except Exception: pass` -- so it takes the
+        # SAME path below a worker exception takes.
+        outcome, left_behind = {"error": exc}, False
+    else:
+        outcome, left_behind = _hook_runner.run_with_deadline(
+            lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
+        )
 
     reason = "unknown"
     diagnostic = None
