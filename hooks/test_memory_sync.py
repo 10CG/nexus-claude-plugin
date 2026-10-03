@@ -126,10 +126,13 @@ def _restore_memory_dir_key():
 
 def _leaked_state_file_candidates(real_nexus_dir, keys):
     """Every path a worker thread resolving ``key`` against
-    ``real_nexus_dir`` as its state root would write to or lock -- the
-    EXACT shape H1's own incident took (`_memory_state_path`'s own
+    ``real_nexus_dir`` as its state root would write to or lock: the
+    shape H1's own incident took (`_memory_state_path`'s own
     ``<key>.json`` plus the sibling ``.lock`` `_hook_state._locked`
-    creates next to it) -- never anything else under ``real_nexus_dir``.
+    creates next to it), K09's ``<key>.run.lock`` (SF-1: the only one an
+    abandoned worker can still create with the current production code),
+    and any other entry named ``<key>.`` + anything that is present --
+    never anything else under ``real_nexus_dir``.
     Narrowing to this (G1, second targeted review of the hygiene round,
     2026-10-02) is what makes the guard built on this immune to a
     concurrent session's own hook legitimately rewriting ITS OWN,
@@ -141,10 +144,29 @@ def _leaked_state_file_candidates(real_nexus_dir, keys):
     collide with a real project's own key, so existence alone, with no
     "before" snapshot, is already conclusive."""
     state_subdir = os.path.join(real_nexus_dir, "hooks", _MOD.HOOK)
+    # SF-1 (targeted review of the guard-pinning round, 2026-10-03): the
+    # fixed pair above missed K09's ``<key>.run.lock`` -- the ONLY file an
+    # abandoned worker can still create under the real home with the
+    # current production code (`_acquire_run_lock` resolves the state root
+    # again and O_CREATs the lock before any deadline check; every later
+    # state write is gated by the deadline the thread has already passed).
+    # Matching every entry named ``<key>.`` + anything covers it and the
+    # next per-key file the hook grows. The dot keeps a longer key that
+    # merely starts with this one (``<key>-x.json``) out. Read-only: a
+    # missing directory lists as nothing, it is never created.
+    try:
+        present = os.listdir(state_subdir)
+    except OSError:
+        present = []
     for key in keys:
         state_path = os.path.join(state_subdir, f"{key}.json")
         yield state_path
         yield state_path + ".lock"
+        yield os.path.join(state_subdir, f"{key}.run.lock")
+        prefix = f"{key}."
+        for name in present:
+            if name.startswith(prefix):
+                yield os.path.join(state_subdir, name)
 
 
 def _assert_no_leaked_state_files(real_nexus_dir, keys, context=""):
@@ -181,7 +203,7 @@ def _assert_no_leaked_state_files(real_nexus_dir, keys, context=""):
     that, this docstring's claims would be exactly as unverified as the
     predecessor's were (H2-1)."""
     leaked = sorted(
-        p for p in _leaked_state_file_candidates(real_nexus_dir, keys) if os.path.exists(p)
+        {p for p in _leaked_state_file_candidates(real_nexus_dir, keys) if os.path.exists(p)}
     )
     if leaked:
         raise AssertionError(
@@ -308,7 +330,7 @@ def _assert_worker_threads_finished(context="", join_seconds=None):
             f"worker thread(s) outlived their own test{context}: {lingering} -- "
             "if it is still running, it may write for real into "
             f"{os.path.join(_REAL_NEXUS_DIR, 'hooks', _MOD.HOOK)!r} once HOME is "
-            "restored; check there for a stray state file and its .lock"
+            "restored; check there for a stray state file, its .lock, or a <key>.run.lock"
         )
 
 
@@ -4875,6 +4897,48 @@ class TestRealHomeGuardIsPinned(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "REAL state root"):
                 _assert_no_leaked_state_files(sentinel, {key})
 
+    def test_it_raises_for_the_run_lock_alone(self):
+        """SF-1 (targeted review of the guard-pinning round, 2026-10-03):
+        the only file an abandoned worker can still create under the
+        real home with the current production code is K09's run lock,
+        ``<key>.run.lock``: `_acquire_run_lock(_memory_run_lock_path(key))`
+        resolves the state root again and opens it with O_CREAT before
+        any deadline check, while every later state write is gated by
+        the deadline the abandoned thread has already passed. A guard
+        that only knows ``.json`` / ``.json.lock`` stays silent for it."""
+        with tempfile.TemporaryDirectory() as sentinel:
+            key = "nexus-hooktest-selftest-run-lock-key"
+            state_dir = os.path.join(sentinel, "hooks", _MOD.HOOK)
+            os.makedirs(state_dir)
+            with open(os.path.join(state_dir, f"{key}.run.lock"), "w"):
+                pass
+            with self.assertRaisesRegex(AssertionError, "REAL state root"):
+                _assert_no_leaked_state_files(sentinel, {key})
+
+    def test_it_raises_for_any_future_per_key_suffix(self):
+        """Matching by ``<key>.`` prefix rather than a fixed suffix list,
+        so the next per-key file the hook grows is covered without
+        anyone remembering to extend this guard."""
+        with tempfile.TemporaryDirectory() as sentinel:
+            key = "nexus-hooktest-selftest-future-suffix-key"
+            state_dir = os.path.join(sentinel, "hooks", _MOD.HOOK)
+            os.makedirs(state_dir)
+            with open(os.path.join(state_dir, f"{key}.some-future-file"), "w"):
+                pass
+            with self.assertRaisesRegex(AssertionError, "REAL state root"):
+                _assert_no_leaked_state_files(sentinel, {key})
+
+    def test_a_key_that_is_a_string_prefix_of_another_key_is_not_confused(self):
+        """``<key>.`` (with the dot) never matches a longer key that merely
+        starts with this one: a sibling directory's ``<key>-x.json`` is not
+        this key's leak."""
+        with tempfile.TemporaryDirectory() as sentinel:
+            state_dir = os.path.join(sentinel, "hooks", _MOD.HOOK)
+            os.makedirs(state_dir)
+            with open(os.path.join(state_dir, "nexus-hooktest-selftest-k-x.json"), "w") as fh:
+                fh.write("{}")
+            _assert_no_leaked_state_files(sentinel, {"nexus-hooktest-selftest-k"})
+
     def test_it_stays_silent_for_an_unrelated_file_from_another_session(self):
         """H2-5's own false-positive reproduction, replayed against this
         guard's replacement: a DIFFERENT project's own hook legitimately
@@ -4905,10 +4969,66 @@ class TestRealHomeGuardKeyRecording(_WriteCase):
     this feeds it an empty, or the wrong, set of keys."""
 
     def test_a_real_run_records_its_own_key(self):
+        """SF-4 (targeted review of the guard-pinning round, 2026-10-03):
+        the key is recorded into a FRESH set for the duration of the run
+        only, so the assertion can only pass through memory_sync's own
+        production call -- a key this test file resolved by itself before
+        the run (setUp does) no longer satisfies it. The fresh set is
+        merged back afterwards so the module-level guard still covers
+        whatever the run recorded."""
         self._write("f1")
         self.backend.reply(*_empty_lookup()).reply(*_empty_lookup()).reply(*_created())
-        self._run()
-        self.assertIn(self.key, _memory_dir_keys_seen())
+        this_module = sys.modules[__name__]
+        fresh = set()
+        try:
+            with mock.patch.object(this_module, "_SEEN_MEMORY_DIR_KEYS", fresh):
+                self.assertNotIn(self.key, _memory_dir_keys_seen())
+                self._run()
+                recorded = _memory_dir_keys_seen()
+        finally:
+            with _SEEN_MEMORY_DIR_KEYS_LOCK:
+                _SEEN_MEMORY_DIR_KEYS.update(fresh)
+        self.assertIn(self.key, recorded)
+
+
+class TestRealHomeGuardRegistration(unittest.TestCase):
+    """SF-2 (targeted review of the guard-pinning round, 2026-10-03): the
+    tests above pin the PARTS (`_assert_no_leaked_state_files` called with
+    a hand-built key set, and the recording set), not the function this
+    module actually registers, nor the fact that it is registered at all.
+    A commented-out registration line, a registered entry that passes an
+    empty key set, or one pointed at the wrong root each left the whole
+    module green. These pin the real entry and the real registration."""
+
+    def test_the_registered_module_cleanup_is_the_guard_and_runs_right_after_env_restore(self):
+        cleanups = [entry[0] for entry in unittest.case._module_cleanups]
+        self.assertIn(
+            _assert_no_leaked_state_files_for_module, cleanups,
+            "setUpModule must register the real-home guard itself (by identity, not by source text)",
+        )
+        guard_at = cleanups.index(_assert_no_leaked_state_files_for_module)
+        # LIFO: the entry registered right AFTER the guard executes right
+        # BEFORE it -- that must be patcher.stop, restoring the real HOME /
+        # NEXUS_HOOK_STATE_DIR, so the guard looks at the real root.
+        after = cleanups[guard_at + 1]
+        self.assertEqual(getattr(after, "__name__", None), "stop")
+        self.assertEqual(type(getattr(after, "__self__", None)).__name__, "_patch_dict")
+        # and the temp root is removed only after the guard ran
+        rmtree_at = [i for i, fn in enumerate(cleanups) if fn is shutil.rmtree]
+        self.assertTrue(rmtree_at and max(rmtree_at) < guard_at, (rmtree_at, guard_at))
+
+    def test_the_registered_entry_itself_detects_a_run_lock_leak(self):
+        this_module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as sentinel:
+            key, _degraded = _identity.memory_dir_key(project)  # recorded via the wrapper
+            self.assertIn(key, _memory_dir_keys_seen())
+            state_dir = os.path.join(sentinel, "hooks", _MOD.HOOK)
+            os.makedirs(state_dir)
+            with open(os.path.join(state_dir, f"{key}.run.lock"), "w"):
+                pass
+            with mock.patch.object(this_module, "_REAL_NEXUS_DIR", sentinel):
+                with self.assertRaisesRegex(AssertionError, "REAL state root"):
+                    _assert_no_leaked_state_files_for_module()
 
 
 if __name__ == "__main__":
