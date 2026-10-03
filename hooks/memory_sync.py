@@ -1005,14 +1005,93 @@ def _register_placeholder_entries(state, to_register):
 
 # ── per-file dirty check (mtime+size fast path, A8-2 fingerprint) ───────
 
+# The one format ``synced_at`` is written in (``_now_iso``) and read back in
+# (``_synced_at_epoch``): whole seconds, UTC. R12 review F3: the two used to
+# spell it out separately, and a drift on the writing side would make every
+# real entry racily clean forever -- silently: no stale content, but the
+# fast path gone for every file and every read error reported.
+_SYNCED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+# R12: a matching stat is trusted only when the newer of the entry's
+# recorded ctime / mtime is MORE than this many seconds older than
+# ``synced_at`` (see ``_racily_clean``). The safety condition is roughly
+# "timestamp granularity <= this window": coarse kernel ticks
+# (milliseconds), whole-second filesystems, FAT's two-second mtime slots
+# (which is also why the comparison is ``>=`` -- a stamp exactly two seconds
+# before a whole-second ``synced_at`` can still share the read's slot).
+_RACY_WINDOW_SECONDS = 2
+
+
+def _synced_at_epoch(value):
+    """``synced_at`` (``_SYNCED_AT_FORMAT``, whole seconds, UTC -- whatever
+    the local zone) as epoch seconds, or ``None`` when it is absent or not
+    in that format."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, _SYNCED_AT_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _racily_clean(stored):
+    """True when a state entry's recorded stat cannot be trusted to show a
+    later change (R12, 2026-10-03): the newer of its recorded ctime and
+    mtime is NO MORE than ``_RACY_WINDOW_SECONDS`` older than ``synced_at``
+    (``>=``: a stamp exactly that far back still counts as racy), or newer
+    than it, or either side is missing or unreadable.
+
+    Why: on a kernel with coarse timestamps two writes inside one
+    timestamp tick get the same mtime and ctime. A file rewritten at the
+    same size right after this hook read it therefore keeps the exact
+    stat the entry recorded, and the fast path would skip its hash for
+    good -- the server keeps the old content until the file next changes
+    (plugin main CI run 1186 hit exactly this in
+    ``TestK21SameSizeContentRewrite``). Same problem and same fix as git's
+    "racy git": only a stat recorded clearly AFTER the file last changed
+    proves the file has not changed since. A racily clean file costs one
+    hash per round until its next real change is synced; an unchanged
+    hash is still ``unchanged``, never a wire call. A ctime / mtime NEWER
+    than ``synced_at`` (a clock step, an mtime set into the future) counts
+    as racy too.
+
+    ``synced_at`` is stamped right BEFORE ``_sync_file`` opens the file
+    (R12 review F2), so a pause of any length between the read and the
+    stamp cannot push the reference past a same-tick rewrite. What this
+    rule cannot see: a filesystem whose clock runs more than the window
+    BEHIND this host's wall clock (an NFS / SMB server with a skewed
+    clock) -- a same-tick rewrite there is still missed.
+
+    Two consequences worth knowing, both intended (R12 review F4 / F6):
+    a racily clean entry is never refreshed, so its file is hashed on
+    EVERY round until its next real change is synced (bounded: one read of
+    at most ``_MAX_DOCUMENT_CHARS`` + 1 bytes, no network); and a read
+    error on such a file is reported (``dirty_scan_errors`` -> ``unknown``)
+    where the same error on a trusted entry goes unnoticed, because the
+    trusted file is never opened at all."""
+    read_at = _synced_at_epoch(stored.get("synced_at"))
+    if read_at is None:
+        return True
+    stamps = []
+    ctime_ns = stored.get("ctime")
+    if isinstance(ctime_ns, int) and not isinstance(ctime_ns, bool):
+        stamps.append(ctime_ns / 1e9)
+    mtime = stored.get("mtime")
+    if isinstance(mtime, (int, float)) and not isinstance(mtime, bool):
+        stamps.append(float(mtime))
+    if not stamps:
+        return True
+    return max(stamps) >= read_at - _RACY_WINDOW_SECONDS
+
+
 def _dirty_check(path, stored, fingerprint):
     """``(dirty, file_hash)`` for an already-synced file (``stored`` is its
     existing state entry, never ``None``).
 
     mtime+size+ctime fast path (C row, widened by K21): the whole-file hash
     is only recomputed when one of the three changed since the file's last
-    successful sync -- an untouched file costs one ``stat()``, nothing
-    else. mtime+size ALONE missed a same-length content rewrite whose
+    successful sync -- an untouched file whose entry is trusted costs one
+    ``stat()`` and one timestamp parse (``_racily_clean``), nothing else. mtime+size ALONE missed a same-length content rewrite whose
     script also rolls mtime back with ``os.utime`` (the earlier docstring
     here assumed that was "essentially always" paired with a size change,
     which is false for e.g. a single fixed-width character edited in
@@ -1022,15 +1101,21 @@ def _dirty_check(path, stored, fingerprint):
     mismatch (A8-2 / K24) dirties the file regardless of mtime/size/ctime --
     the bytes on disk have not changed, the rule that will be applied to
     them has. A false-positive "dirty" from the ctime check alone (e.g. a
-    chmod with no content change) costs one extra hash recompute, which
+    chmod with no content change) costs one hash per round until the file's
+    next real change is synced (a non-dirty entry is never rewritten), which
     then compares equal and is simply ``unchanged`` -- never an extra wire
     call.
+
+    R12 (2026-10-03, plugin main CI run 1186): a matching stat proves
+    nothing for an entry that is RACILY CLEAN (``_racily_clean``) -- the
+    fast path is skipped and the file hashed, exactly like a changed stat.
     """
     st = os.stat(path)
     same_stat = (
         st.st_mtime == stored.get("mtime")
         and st.st_size == stored.get("size")
         and getattr(st, "st_ctime_ns", None) == stored.get("ctime")
+        and not _racily_clean(stored)
     )
     if same_stat:
         file_hash = stored.get("file_hash")
@@ -1353,8 +1438,13 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
     agree with the recorded, wrong, state from then on). ``synced_at`` is
     likewise stamped at READ time, not after the round-trip to the server,
     for the same "what state records must describe the bytes actually
-    sent" reason.
+    sent" reason -- right BEFORE the open (R12 review F2), not after the
+    read: it is also the reference ``_racily_clean`` measures the recorded
+    stat against, and a stamp taken after a pause (a slow read, a suspended
+    machine) could move past a same-tick rewrite that landed right after
+    the read and let the entry be trusted with the wrong hash.
     """
+    synced_at = _now_iso()  # K19 + R12: the reference, taken BEFORE the bytes below are read
     try:
         with open(path, "rb") as fh:
             st = os.fstat(fh.fileno())
@@ -1378,7 +1468,6 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
         reasons = ["unknown"]
         _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
         return reasons, False, 0
-    synced_at = _now_iso()  # K19: the instant the bytes below were read
     file_hash = "sha256:" + hashlib.sha256(raw[: _MAX_DOCUMENT_CHARS + 1]).hexdigest()
     try:
         text = raw[:_MAX_DOCUMENT_CHARS].decode("utf-8")
@@ -1549,7 +1638,7 @@ def _delete_file(client, key, slug, run, state_path):
 
 
 def _now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return time.strftime(_SYNCED_AT_FORMAT, time.gmtime())
 
 
 # ── orphan reconciliation (once per state lifetime; contract §6.2) ──────

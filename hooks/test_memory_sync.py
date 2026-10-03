@@ -1039,6 +1039,20 @@ class TestListMemoryFiles(unittest.TestCase):
         self.assertEqual(list(out), ["real"])
 
 
+def _iso_at(epoch_seconds):
+    """``epoch_seconds`` in ``memory_sync._now_iso``'s own format (whole
+    seconds, UTC) -- what a state entry's ``synced_at`` looks like."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch_seconds))
+
+
+def _read_long_after_last_change(path):
+    """A ``synced_at`` an hour after ``path``'s own ctime: an entry whose
+    bytes were read long after the file last changed, so its recorded stat
+    can be trusted (R12) -- the shape every real entry for a file nobody
+    has touched lately has."""
+    return _iso_at(os.stat(path).st_ctime + 3600)
+
+
 class TestDirtyCheck(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1053,6 +1067,7 @@ class TestDirtyCheck(unittest.TestCase):
             "mtime": st.st_mtime, "size": st.st_size,
             "ctime": getattr(st, "st_ctime_ns", None),  # K21
             "file_hash": _MOD._whole_file_hash(self.path),
+            "synced_at": _read_long_after_last_change(self.path),  # R12: not racily clean
             "redaction_fingerprint": _MOD._current_fingerprint(),
         }
         entry.update(overrides)
@@ -1101,6 +1116,151 @@ class TestDirtyCheck(unittest.TestCase):
         stored = self._stored()
         dirty, _ = _MOD._dirty_check(self.path, stored, stored["redaction_fingerprint"])
         self.assertFalse(dirty)
+
+
+class TestR12RacilyCleanEntries(unittest.TestCase):
+    """R12 (2026-10-03, plugin main CI run 1186): on a kernel with coarse
+    timestamps a write lands on the same mtime / ctime as an earlier one
+    whenever both fall inside one timestamp tick. A file rewritten at the
+    same size right after this hook read it then keeps the exact stat the
+    state entry recorded -- mtime, size and ctime all match -- and the
+    stat fast path skips the hash for good: the server keeps the old
+    content until the file next changes. Same problem, same fix as git's
+    "racy git": an entry whose recorded ctime / mtime is not clearly older
+    than the moment its bytes were read (``synced_at``) proves nothing,
+    so its file is hashed anyway. Hashing more never sends anything: an
+    unchanged hash is still ``unchanged``."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "f.md")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("---\ndescription: d\n---\n\nversion-one")
+
+    def _entry(self, synced_at, file_hash=None):
+        st = os.stat(self.path)
+        return {
+            "mtime": st.st_mtime, "size": st.st_size,
+            "ctime": getattr(st, "st_ctime_ns", None),
+            "file_hash": file_hash or _MOD._whole_file_hash(self.path),
+            "synced_at": synced_at,
+            "redaction_fingerprint": _MOD._current_fingerprint(),
+        }
+
+    def test_a_same_tick_same_size_rewrite_with_an_identical_stat_is_caught(self):
+        """The CI failure's own shape, made deterministic: the entry holds
+        the OLD content's hash but the file's CURRENT stat -- exactly what a
+        rewrite inside the same timestamp tick as the read leaves behind --
+        and its bytes were read in that same second."""
+        old_hash = _MOD._whole_file_hash(self.path)
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("---\ndescription: d\n---\n\nversion-TWO")  # identical length
+        entry = self._entry(_iso_at(os.stat(self.path).st_ctime), file_hash=old_hash)
+        dirty, new_hash = _MOD._dirty_check(self.path, entry, entry["redaction_fingerprint"])
+        self.assertTrue(dirty)
+        self.assertNotEqual(new_hash, old_hash)
+
+    def test_a_racily_clean_unchanged_file_is_hashed_but_stays_clean(self):
+        entry = self._entry(_iso_at(os.stat(self.path).st_ctime))
+        with mock.patch.object(_MOD, "_whole_file_hash", wraps=_MOD._whole_file_hash) as hash_fn:
+            dirty, file_hash = _MOD._dirty_check(self.path, entry, entry["redaction_fingerprint"])
+        self.assertFalse(dirty)
+        hash_fn.assert_called_once_with(self.path)
+        self.assertEqual(file_hash, entry["file_hash"])
+
+    def test_an_entry_read_long_after_the_last_change_keeps_the_fast_path(self):
+        """The steady-state contract: an untouched file costs one stat()."""
+        entry = self._entry(_read_long_after_last_change(self.path))
+        with mock.patch.object(_MOD, "_whole_file_hash") as hash_fn:
+            dirty, _ = _MOD._dirty_check(self.path, entry, entry["redaction_fingerprint"])
+        self.assertFalse(dirty)
+        hash_fn.assert_not_called()
+
+    def test_a_missing_or_malformed_synced_at_proves_nothing(self):
+        for synced_at in (None, "", "yesterday", "2026-13-01T00:00:00Z", 1790000000):
+            with self.subTest(synced_at=synced_at):
+                entry = self._entry(synced_at)
+                with mock.patch.object(_MOD, "_whole_file_hash", wraps=_MOD._whole_file_hash) as hash_fn:
+                    _MOD._dirty_check(self.path, entry, entry["redaction_fingerprint"])
+                hash_fn.assert_called_once_with(self.path)
+
+    def test_the_window_edges(self):
+        """Racily clean while the newer of ctime / mtime is no more than the
+        window older than the read (or newer than it); trusted once it is
+        strictly older than ``read_at - window``. ``newest`` lies in
+        ``[base - 1, base)``, so the boundary sits between ``base + window
+        - 1`` and ``base + window``."""
+        ctime = os.stat(self.path).st_ctime
+        newest = max(ctime, os.stat(self.path).st_mtime)
+        window = _MOD._RACY_WINDOW_SECONDS
+        base = int(newest) + 1  # a whole second strictly after both stamps
+        for read_at, racy in (
+            (base - 5, True),  # "read" before the file last changed
+            (base + window - 1, True),
+            (base + window, False),
+            (base + window + 100, False),
+        ):
+            with self.subTest(read_at=read_at, racy=racy):
+                entry = self._entry(_iso_at(read_at))
+                self.assertIs(_MOD._racily_clean(entry), racy)
+
+    def test_mtime_alone_can_make_an_entry_racy(self):
+        """mtime can be set into the future (touch -d); the newer of the two
+        stamps decides."""
+        future = os.stat(self.path).st_ctime + 7200
+        os.utime(self.path, (future, future))
+        entry = self._entry(_iso_at(future - 3600))
+        self.assertTrue(_MOD._racily_clean(entry))
+
+    # R12 review F1 / F3 / F7 (2026-10-03): the rule's parameters, pinned on
+    # whole-second stamps. Everything above runs on real ext4 / tmpfs stamps,
+    # which always carry a fractional part -- so none of it could tell a
+    # window of 0, 1 or 2 apart, nor ">=" from ">", nor whether ctime is
+    # looked at at all once mtime is: five non-equivalent mutants survived
+    # the whole module, three of them reproduced end to end as "the server
+    # keeps the old content for good". The reviewer's own tests, verbatim
+    # in substance.
+
+    _T = 1_790_000_000  # an even whole second: the start of a FAT 2-second slot
+
+    def _stamps(self, mtime, ctime_seconds, read_at):
+        return {"mtime": float(mtime), "ctime": int(round(ctime_seconds * 1e9)), "synced_at": _iso_at(read_at)}
+
+    def test_whole_second_stamps_two_seconds_before_the_read_are_still_racy(self):
+        """FAT / whole-second filesystems: a same-slot rewrite can land after
+        the read while ``synced_at`` already reads stamp + 2. Pins a window
+        of at least 2 AND ``>=`` rather than ``>``; the second assertion
+        pins the upper bound."""
+        self.assertTrue(_MOD._racily_clean(self._stamps(self._T, self._T, self._T + 2)))
+        self.assertFalse(_MOD._racily_clean(self._stamps(self._T, self._T, self._T + 3)))
+
+    def test_a_read_straddling_one_whole_second_boundary_is_racy(self):
+        self.assertTrue(_MOD._racily_clean(self._stamps(self._T + 0.999, self._T + 0.999, self._T + 1)))
+
+    def test_ctime_alone_can_make_an_entry_racy(self):
+        """mtime restored to a month ago (cp -p, rsync -t, a K21-style
+        script); only ctime says the inode changed just now."""
+        self.assertTrue(_MOD._racily_clean(self._stamps(self._T - 30 * 86400, self._T, self._T)))
+
+    def test_now_iso_round_trips_through_synced_at_epoch(self):
+        """F3: what ``_sync_file`` writes must be what ``_racily_clean`` can
+        read back -- otherwise every real entry is silently racy for good
+        (the fast path gone, every read error reported)."""
+        before = time.time()
+        parsed = _MOD._synced_at_epoch(_MOD._now_iso())
+        self.assertIsNotNone(parsed)
+        self.assertLessEqual(abs(parsed - before), 2)
+
+    def test_synced_at_is_read_as_utc_whatever_the_local_zone(self):
+        """F7: this machine and CI both run in UTC, where parsing as local
+        time happens to give the same answer."""
+        try:
+            with mock.patch.dict(os.environ, {"TZ": "Asia/Shanghai"}):
+                time.tzset()
+                self.assertEqual(_MOD._synced_at_epoch("1970-01-01T00:00:10Z"), 10.0)
+        finally:
+            time.tzset()
 
 
 class TestMetadataBuilding(unittest.TestCase):
@@ -3685,6 +3845,15 @@ class TestK20PartialDeletePreservesMapping(_WriteCase):
 
 class TestK21SameSizeContentRewrite(_WriteCase):
     def test_a_same_length_edit_with_mtime_rolled_back_is_still_dirty(self):
+        """Pins the ctime path itself. R12 (2026-10-03): the entry is
+        recorded as read long after the file last changed, so it is NOT
+        racily clean and only the ctime comparison can catch the edit; and
+        the edit is repeated until the kernel actually gives it a later
+        ctime. The previous version did neither, and failed on plugin
+        main's own CI (run 1186, a kernel with coarse timestamps): the
+        rewrite landed in the same timestamp tick as the first write, so
+        ctime did not move either -- the gap R12's racy-clean rule now
+        closes in production (see TestR12RacilyCleanEntries)."""
         path = self._write("f1", body="version-one-same-length-text")
         st = os.stat(path)
         _hook_state.write_state_at(
@@ -3692,17 +3861,23 @@ class TestK21SameSizeContentRewrite(_WriteCase):
             {"cursor": 0, "reconciled": True, "files": {"f1": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
-                "file_hash": _MOD._whole_file_hash(path), "synced_at": "2026-01-01T00:00:00Z",
+                "file_hash": _MOD._whole_file_hash(path), "synced_at": _read_long_after_last_change(path),
                 "redaction_fingerprint": _MOD._current_fingerprint(),
             }}},
         )
         old_mtime = st.st_mtime
-        with open(path, "r+", encoding="utf-8") as fh:
-            text = fh.read()
-            fh.seek(0)
-            fh.write(text.replace("version-one", "version-TWO"))  # identical length
-        os.utime(path, (old_mtime, old_mtime))
-        new_st = os.stat(path)
+        deadline = time.monotonic() + 5.0
+        while True:
+            with open(path, "r+", encoding="utf-8") as fh:
+                text = fh.read()
+                fh.seek(0)
+                fh.write(text.replace("version-one", "version-TWO"))  # identical length
+            os.utime(path, (old_mtime, old_mtime))
+            new_st = os.stat(path)
+            if new_st.st_ctime_ns != st.st_ctime_ns or time.monotonic() > deadline:
+                break
+            time.sleep(0.01)  # same coarse timestamp tick: try again in the next one
+        self.assertNotEqual(new_st.st_ctime_ns, st.st_ctime_ns, "the kernel never moved ctime")
         self.assertEqual(new_st.st_size, st.st_size)
         self.assertEqual(new_st.st_mtime, old_mtime)
         self.backend.reply(
@@ -3712,6 +3887,43 @@ class TestK21SameSizeContentRewrite(_WriteCase):
         patches = [r for r in self.requests if r["method"] == "PATCH"]
         self.assertEqual(len(patches), 1, self.requests)
         self.assertIn("version-TWO", patches[0]["json"]["content"])
+
+
+class TestR12StampTakenBeforeTheFileIsOpened(_WriteCase):
+    """R12 review F2 (2026-10-03): ``synced_at`` is the reference
+    ``_racily_clean`` measures the recorded stat against. Stamped AFTER the
+    read (the first R12 version), a pause between the read and the stamp
+    -- a slow read, a suspended machine -- could push it past a same-tick
+    rewrite that landed right after the read: the entry is then trusted
+    with the OLD content's hash, and the server keeps the old content for
+    good (reproduced on ramfs with a 2.2 s pause). Stamped right before the
+    open, no pause can do that."""
+
+    def test_synced_at_is_stamped_before_the_file_is_opened(self):
+        self._write("f1")
+        self.backend.reply(*_empty_lookup())  # orphan reconciliation: nothing to see
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # upsert dedup lookup + POST
+        events = []
+        real_now_iso = _MOD._now_iso
+
+        def now_iso_spy():
+            events.append("stamp")
+            return real_now_iso()
+
+        def open_spy(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)) and os.path.basename(os.fsdecode(file)) == "f1.md":
+                events.append("open f1.md")
+            return open(file, *args, **kwargs)
+
+        with mock.patch.object(_MOD, "_now_iso", now_iso_spy), \
+                mock.patch.object(_MOD, "open", open_spy, create=True):
+            self._run()
+        self.assertIn("open f1.md", events, "the file was never opened -- nothing was checked")
+        first_open = events.index("open f1.md")
+        self.assertGreater(first_open, 0, events)
+        self.assertEqual(events[first_open - 1], "stamp", events)
+        self.assertEqual(self._last_entry()["reason"], "none")
+
 
 
 class TestK22ReconciliationRegistersMatchedSlugs(_WriteCase):
