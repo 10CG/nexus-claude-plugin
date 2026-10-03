@@ -1005,6 +1005,59 @@ def _register_placeholder_entries(state, to_register):
 
 # ── per-file dirty check (mtime+size fast path, A8-2 fingerprint) ───────
 
+# R12: how much older than the moment a file's bytes were read its recorded
+# ctime / mtime must be before a matching stat is trusted. Covers coarse
+# kernel timestamps (one tick, milliseconds), filesystems with whole-second
+# or two-second mtimes (FAT), and ``synced_at`` itself being floored to the
+# whole second by ``_now_iso``.
+_RACY_WINDOW_SECONDS = 2
+
+
+def _synced_at_epoch(value):
+    """``synced_at`` (``_now_iso``'s own format, whole seconds, UTC) as
+    epoch seconds, or ``None`` when it is absent or not in that format."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _racily_clean(stored):
+    """True when a state entry's recorded stat cannot be trusted to show a
+    later change (R12, 2026-10-03): the newer of its recorded ctime and
+    mtime is not at least ``_RACY_WINDOW_SECONDS`` older than the moment
+    its bytes were read (``synced_at``), or either side is missing.
+
+    Why: on a kernel with coarse timestamps two writes inside one
+    timestamp tick get the same mtime and ctime. A file rewritten at the
+    same size right after this hook read it therefore keeps the exact
+    stat the entry recorded, and the fast path would skip its hash for
+    good -- the server keeps the old content until the file next changes
+    (plugin main CI run 1186 hit exactly this in
+    ``TestK21SameSizeContentRewrite``). Same problem and same fix as git's
+    "racy git": only a stat recorded clearly AFTER the file last changed
+    proves the file has not changed since. A racily clean file costs one
+    hash per round until its next real change is synced; an unchanged
+    hash is still ``unchanged``, never a wire call. A ctime / mtime NEWER
+    than ``synced_at`` (a clock step, an mtime set into the future) counts
+    as racy too."""
+    read_at = _synced_at_epoch(stored.get("synced_at"))
+    if read_at is None:
+        return True
+    stamps = []
+    ctime_ns = stored.get("ctime")
+    if isinstance(ctime_ns, int) and not isinstance(ctime_ns, bool):
+        stamps.append(ctime_ns / 1e9)
+    mtime = stored.get("mtime")
+    if isinstance(mtime, (int, float)) and not isinstance(mtime, bool):
+        stamps.append(float(mtime))
+    if not stamps:
+        return True
+    return max(stamps) >= read_at - _RACY_WINDOW_SECONDS
+
+
 def _dirty_check(path, stored, fingerprint):
     """``(dirty, file_hash)`` for an already-synced file (``stored`` is its
     existing state entry, never ``None``).
@@ -1025,12 +1078,17 @@ def _dirty_check(path, stored, fingerprint):
     chmod with no content change) costs one extra hash recompute, which
     then compares equal and is simply ``unchanged`` -- never an extra wire
     call.
+
+    R12 (2026-10-03, plugin main CI run 1186): a matching stat proves
+    nothing for an entry that is RACILY CLEAN (``_racily_clean``) -- the
+    fast path is skipped and the file hashed, exactly like a changed stat.
     """
     st = os.stat(path)
     same_stat = (
         st.st_mtime == stored.get("mtime")
         and st.st_size == stored.get("size")
         and getattr(st, "st_ctime_ns", None) == stored.get("ctime")
+        and not _racily_clean(stored)
     )
     if same_stat:
         file_hash = stored.get("file_hash")
