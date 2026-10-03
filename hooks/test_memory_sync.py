@@ -31,11 +31,15 @@ round, 2026-10-02: NOT "the whole real ~/.nexus is structurally unchanged"
 -- an earlier revision compared that wholesale and false-positived on a
 CONCURRENT Claude Code session's own hook legitimately rewriting its own,
 unrelated ledger while this module's tests were still running), and no
-`_hook_runner`-named worker thread is still alive (see setUpModule's own
-module cleanups, in the order they actually run, for why that order is
-itself load-bearing).
+thread this module's own test run started is still alive -- checked
+against a before/after snapshot (P2, adversarial review of b3bb60d,
+2026-10-03: a name-filtered check, `_hook_runner`'s own two thread names
+only, is structurally blind to a thread started under any OTHER name) --
+(see setUpModule's own module cleanups, in the order they actually run,
+for why that order is itself load-bearing).
 """
 
+import errno
 import glob
 import hashlib
 import http.server
@@ -78,6 +82,22 @@ _REAL_NEXUS_DIR = os.path.join(_REAL_HOME, ".nexus")
 _REAL_MEMORY_DIR_KEY = _identity.memory_dir_key
 _SEEN_MEMORY_DIR_KEYS_LOCK = threading.Lock()
 _SEEN_MEMORY_DIR_KEYS = set()
+
+# P2 (adversarial review of b3bb60d, 2026-10-03, finding 1): every thread
+# alive at the very top of `setUpModule`, before anything else in this
+# module's own run has had a chance to start one -- the BASELINE the
+# module-level worker-thread check (`_assert_no_untracked_thread_outlived_
+# the_module`, not `_assert_worker_threads_finished`, which stays
+# name-based for per-test use) diffs against, rather than filtering
+# `threading.enumerate()` by the two hardcoded `_hook_runner` thread names.
+# `None` until `setUpModule` runs; never read before then.
+_BASELINE_THREADS = None
+
+# P3 (adversarial review of b3bb60d, 2026-10-03, finding 3): populated by
+# `setUpModule`, in the REAL environment, before anything is patched --
+# see there. Keyed by the exact per-hook state-subdirectory path
+# (``<a state root>/memory-sync``) `_assert_no_new_state_subdir` checks.
+_REAL_STATE_SUBDIRS_EXISTED_BEFORE = {}
 
 
 def _recording_memory_dir_key(cwd):
@@ -124,28 +144,54 @@ def _restore_memory_dir_key():
     _identity.memory_dir_key = _REAL_MEMORY_DIR_KEY
 
 
-def _leaked_state_file_candidates(real_nexus_dir, keys):
+def _state_root_leak_candidates(state_subdir, keys):
     """Every path a worker thread resolving ``key`` against
-    ``real_nexus_dir`` as its state root would write to or lock: the
-    shape H1's own incident took (`_memory_state_path`'s own
-    ``<key>.json`` plus the sibling ``.lock`` `_hook_state._locked`
-    creates next to it), K09's ``<key>.run.lock`` (SF-1: the only one an
-    abandoned worker can still create with the current production code),
-    and any other entry named ``<key>.`` + anything that is present --
-    never anything else under ``real_nexus_dir``.
-    Narrowing to this (G1, second targeted review of the hygiene round,
-    2026-10-02) is what makes the guard built on this immune to a
-    concurrent session's own hook legitimately rewriting ITS OWN,
-    differently-keyed ledger or state while this module's tests run
-    (H2-5: the previous, whole-directory structural diff fired for
-    exactly that). A key only this module's own fixtures could ever have
-    produced (every one is derived from a freshly minted ``tempfile``
-    name -- see `_recording_memory_dir_key`) can never legitimately
-    collide with a real project's own key, so existence alone, with no
-    "before" snapshot, is already conclusive."""
-    state_subdir = os.path.join(real_nexus_dir, "hooks", _MOD.HOOK)
+    ``state_subdir`` would write to or lock: the shape H1's own incident
+    took (`_memory_state_path_under`'s own ``<key>.json`` plus the
+    sibling ``.lock`` `_hook_state._locked` creates next to it), K09's
+    ``<key>.run.lock`` (SF-1: the only one an abandoned worker can still
+    create with the current production code), and any other entry named
+    ``<key>.`` + anything that is present -- never anything else under
+    ``state_subdir``.
+
+    ``state_subdir`` is memory-sync's OWN per-hook directory -- ``<a
+    state root>/memory-sync`` -- not the bare state root itself, which
+    every OTHER hook also keys its own, differently-shaped state under
+    (P3, adversarial review of b3bb60d, 2026-10-03: this is the shared
+    primitive both `_leaked_state_file_candidates` below, which composes
+    ``state_subdir`` from a "nexus dir" one level up for
+    `TestRealHomeGuardIsPinned`'s own long-pinned call convention, and the
+    MODULE-level check, which composes it directly from
+    `_hook_state.state_root()` / `_hook_state.DEFAULT_STATE_DIR` -- the
+    SAME production helpers memory_sync.py itself resolves a leak's real
+    location from -- now share, so a mutation to either one's resolution
+    cannot drift silently out of what this guard checks).
+
+    Narrowing the per-key candidates to this exact set (G1, second
+    targeted review of the hygiene round, 2026-10-02) is what makes the
+    guard built on this immune to a concurrent session's own hook
+    legitimately rewriting ITS OWN, differently-keyed ledger or state
+    while this module's tests run (H2-5: the previous, whole-directory
+    structural diff fired for exactly that). A key only this module's own
+    fixtures could ever have produced (every one is derived from a
+    freshly minted ``tempfile`` name -- see `_recording_memory_dir_key`)
+    can never legitimately collide with a real project's own key, so
+    existence alone, with no "before" snapshot, is already conclusive
+    for the PER-KEY candidates below -- unlike the bare-directory signal
+    (finding 3, P3), which needs one (see
+    `_assert_no_new_state_subdir`).
+
+    P3 (finding 7, adversarial review of b3bb60d, 2026-10-03): a
+    directory-listing error that is NOT "the directory simply does not
+    exist" (``EACCES``, ``EIO``, ``ESTALE``, an unexpected ``ENOTDIR``,
+    ...) must not silently read as "nothing here, so no leak" -- the
+    exact K01 mistake production's own `_list_memory_files` was fixed to
+    stop making, one level up, about ITS OWN directory listing; this
+    guard must not make the identical mistake about its own. Raising
+    (rather than quietly returning no candidates) surfaces it as a guard
+    FAILURE, the same as a genuine leaked file would be."""
     # SF-1 (targeted review of the guard-pinning round, 2026-10-03): the
-    # fixed pair above missed K09's ``<key>.run.lock`` -- the ONLY file an
+    # fixed pair alone missed K09's ``<key>.run.lock`` -- the ONLY file an
     # abandoned worker can still create under the real home with the
     # current production code (`_acquire_run_lock` resolves the state root
     # again and O_CREATs the lock before any deadline check; every later
@@ -156,7 +202,13 @@ def _leaked_state_file_candidates(real_nexus_dir, keys):
     # missing directory lists as nothing, it is never created.
     try:
         present = os.listdir(state_subdir)
-    except OSError:
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            raise AssertionError(
+                f"could not list {state_subdir!r} to check it for a leak ({exc!r}) -- "
+                "treating an inconclusive listing as 'no leak' is the exact K01 mistake "
+                "production's own directory-listing guard exists to prevent, one level up"
+            ) from exc
         present = []
     for key in keys:
         state_path = os.path.join(state_subdir, f"{key}.json")
@@ -167,6 +219,45 @@ def _leaked_state_file_candidates(real_nexus_dir, keys):
         for name in present:
             if name.startswith(prefix):
                 yield os.path.join(state_subdir, name)
+
+
+def _leaked_state_file_candidates(real_nexus_dir, keys):
+    """Convenience, "nexus dir" (one level ABOVE the conventional "hooks"
+    subdirectory) form of `_state_root_leak_candidates` above, kept for
+    `TestRealHomeGuardIsPinned`'s own long-pinned call convention.
+    Delegates there so the two forms share ONE listing-error /
+    suffix-matching implementation and cannot drift apart (P3)."""
+    yield from _state_root_leak_candidates(os.path.join(real_nexus_dir, "hooks", _MOD.HOOK), keys)
+
+
+def _describe_leak(path):
+    """``path``, with its own mtime (P4, adversarial review of b3bb60d,
+    2026-10-03, finding 4): a reader's fastest way to tell "this just
+    happened, during this module's own run" from "this is a stale
+    leftover from long before it started" -- a question existence alone
+    cannot answer."""
+    try:
+        mtime = time.ctime(os.stat(path).st_mtime)
+    except OSError:
+        mtime = "unknown"
+    return f"{path!r} (mtime={mtime})"
+
+
+def _leak_message(leaked_paths, context=""):
+    """P4 (adversarial review of b3bb60d, 2026-10-03, finding 4): "found a
+    file named by a key this module resolved", not "a test wrote" (the
+    previous wording) -- this guard cannot tell a TEST'S own write apart
+    from a genuine PRIOR real run's leftover row filed under the same
+    key; both read identically from here, and claiming the former is a
+    claim this function has no way to back up. ``"REAL state root"``
+    stays verbatim: every existing caller's own `assertRaisesRegex`
+    matches that substring."""
+    described = ", ".join(_describe_leak(p) for p in leaked_paths)
+    return (
+        f"found a file named by a key this module resolved, under the REAL state "
+        f"root{context} (not the fake, per-module one this module otherwise points "
+        f"every hook at): {described}"
+    )
 
 
 def _assert_no_leaked_state_files(real_nexus_dir, keys, context=""):
@@ -183,6 +274,18 @@ def _assert_no_leaked_state_files(real_nexus_dir, keys, context=""):
     AND its ``.lock`` landed in the developer's real
     ``~/.nexus/hooks/memory-sync/``, created by a test whose OWN memory
     directory lived under ``/tmp``.
+
+    As of P1 (2026-10-03) this incident's own root cause is closed in
+    production -- the worker thread no longer reads the environment at
+    all, so it cannot resolve a DIFFERENT root once one has been restored
+    -- and P2 widens the module-level thread join this guard runs after
+    to cover any thread this module's run started, not only the two
+    `_hook_runner` names. This function is still a SINGLE, point-in-time
+    snapshot (``os.path.exists``, not a poll or a retry) -- an honest
+    limit this docstring restates rather than hides (P4, finding 1): what
+    makes that acceptable now is that, by the time it runs, P2's own join
+    has already waited out every thread this run could have started, so
+    there is nothing left that could still be concurrently writing.
 
     Only ever examines the paths `_leaked_state_file_candidates` names
     for ``keys`` -- never anything else under ``real_nexus_dir`` -- so a
@@ -206,9 +309,34 @@ def _assert_no_leaked_state_files(real_nexus_dir, keys, context=""):
         {p for p in _leaked_state_file_candidates(real_nexus_dir, keys) if os.path.exists(p)}
     )
     if leaked:
+        raise AssertionError(_leak_message(leaked, context))
+
+
+def _assert_no_new_state_subdir(state_subdir, existed_before, context=""):
+    """P3 (finding 3, adversarial review of b3bb60d, 2026-10-03):
+    ``_acquire_run_lock``'s own ``os.makedirs(..., exist_ok=True)`` can
+    succeed and leave a BARE, empty directory behind even when the very
+    next ``os.open`` call in the SAME function fails right after --
+    the directory is created strictly BEFORE the lock file is ever
+    opened. That is a real touch of the real filesystem under the real
+    state root with nothing inside it for the per-key candidate list in
+    `_state_root_leak_candidates` to find (there is no key-named file to
+    compare against), so the per-key check alone stays silent for it.
+
+    Reported whenever ``state_subdir`` exists now but ``existed_before``
+    (recorded by `setUpModule`, in the REAL, unpatched environment,
+    before this module's own run could have touched anything) says it did
+    not -- regardless of what, if anything, is inside it. Never creates
+    anything itself: ``os.path.isdir`` on a path that does not exist is
+    simply ``False``."""
+    if existed_before:
+        return
+    if os.path.isdir(state_subdir):
         raise AssertionError(
-            f"a test wrote under the REAL state root{context} (not the fake, "
-            f"per-module one this module otherwise points every hook at): {leaked}"
+            f"found a file named by a key this module resolved -- the REAL state "
+            f"root{context}'s own {state_subdir!r} did not exist before this module's "
+            "own test run and does now, even though nothing inside it matches one of "
+            "this run's own keys -- a worker thread touched the real filesystem anyway"
         )
 
 
@@ -218,8 +346,38 @@ def _assert_no_leaked_state_files_for_module():
     runs (every key any test this module ran could possibly have
     produced, by then) rather than at the moment it is merely registered
     (when the module has not run a single test yet) -- see
-    `_memory_dir_keys_seen` itself."""
-    _assert_no_leaked_state_files(_REAL_NEXUS_DIR, _memory_dir_keys_seen())
+    `_memory_dir_keys_seen` itself.
+
+    P3 (findings 2 + 3 + 7, adversarial review of b3bb60d, 2026-10-03):
+    checks against the SAME production helpers memory_sync.py itself
+    would resolve a leak's real location from --
+    ``_hook_state.state_root()`` (honouring ``NEXUS_HOOK_STATE_DIR``,
+    restored to its REAL value by the time this runs -- see setUpModule's
+    own registration order) -- AND the conventional default
+    (``_hook_state.DEFAULT_STATE_DIR``, expanded), rather than the
+    hardcoded ``_REAL_NEXUS_DIR`` constant this used to check alone. A
+    mutation to either production helper's OWN resolution (a typo in the
+    default, a wrong env var precedence) now shows up here automatically,
+    because this calls the SAME code -- it does not re-derive its own,
+    independent guess of where production would have gone wrong.
+    `TestRealHomeGuardRegistration.test_the_registered_entry_itself_
+    detects_a_run_lock_leak` pins this specifically by pointing
+    ``NEXUS_HOOK_STATE_DIR`` at a sentinel, not by patching
+    ``_REAL_NEXUS_DIR`` (the previous version of that test)."""
+    keys = _memory_dir_keys_seen()
+    production_root = _hook_state.state_root()
+    default_root = os.path.expanduser(_hook_state.DEFAULT_STATE_DIR)
+    checked = set()
+    for root in (production_root, default_root):
+        state_subdir = os.path.join(root, _MOD.HOOK)
+        if state_subdir in checked:
+            continue  # the common case: NEXUS_HOOK_STATE_DIR is unset, so the two agree
+        checked.add(state_subdir)
+        existed_before = _REAL_STATE_SUBDIRS_EXISTED_BEFORE.get(state_subdir, False)
+        _assert_no_new_state_subdir(state_subdir, existed_before)
+        leaked = sorted({p for p in _state_root_leak_candidates(state_subdir, keys) if os.path.exists(p)})
+        if leaked:
+            raise AssertionError(_leak_message(leaked))
 
 
 def _assert_home_untouched(home):
@@ -334,7 +492,89 @@ def _assert_worker_threads_finished(context="", join_seconds=None):
         )
 
 
+def _assert_no_untracked_thread_outlived_the_module(join_seconds):
+    """P2 (adversarial review of b3bb60d, 2026-10-03, finding 1): the
+    MODULE-level registration ONLY -- replaces the name-filtered
+    `_assert_worker_threads_finished(" (the module)", ...)` call
+    `setUpModule` used to register here.
+
+    The two-name filter missed a worker thread 20/20 times in the
+    review's own reproduction, and not as a timing race: `threading.
+    enumerate()` filtered to `{f"{HOOK}-work", f"{HOOK}-ledger"}` is
+    STRUCTURALLY blind to a thread started under any OTHER name -- a
+    `threading.Timer`'s own callback thread, or any other background
+    thread a future test starts to simulate "a worker that unblocks on
+    its own" -- whatever that thread goes on to do once released is
+    simply never looked at, every single time, not merely when the
+    timing happens to go against the check. Diffing against
+    `_BASELINE_THREADS` (every thread alive at the very top of
+    `setUpModule`, before this module's own run could have started any)
+    instead covers ANY thread this run starts, regardless of its name.
+
+    Safe ONLY at the MODULE level, run right before `patcher.stop` (see
+    `setUpModule`'s own registration order): by this point every
+    individual test's own tearDown/addCleanup chain has ALREADY run,
+    including each `_WriteCase`'s own `self.backend.close()` -- so there
+    is nothing else legitimately still alive to false-positive on. The
+    SAME snapshot-diff approach run as a PER-TEST check (in `_WriteCase.
+    setUp` or `_run_main`) would also catch that same test's own, still
+    -open `_Backend` HTTP server thread (a real background thread, named
+    by its default `threading.Thread` name, that does not close until
+    THAT test's own `addCleanup(self.backend.close)` runs) and fail every
+    single test for an unrelated reason -- which is exactly why the two
+    per-test registrations below keep using the name-filtered
+    `_assert_worker_threads_finished` instead, unchanged.
+
+    `join_seconds` is required, not defaulted, unlike `_assert_worker_
+    threads_finished`'s own optional one: there is exactly ONE caller
+    (the module cleanup, with `_MODULE_LINGER_JOIN_SECONDS`) plus this
+    function's own self-tests, and a silent "forgot to pass it" here is a
+    structural call-site bug, not a reasonable default to paper over."""
+    baseline = _BASELINE_THREADS or frozenset()
+    lingering = []
+    for t in threading.enumerate():
+        if t is threading.current_thread() or t in baseline:
+            continue
+        t.join(join_seconds)
+        if t.is_alive():
+            lingering.append(t.name)
+    if lingering:
+        raise AssertionError(
+            f"thread(s) started during this module's own test run outlived it: {lingering} -- "
+            "if any is still running, it may write for real into "
+            f"{os.path.join(_REAL_NEXUS_DIR, 'hooks', _MOD.HOOK)!r} (or wherever "
+            "NEXUS_HOOK_STATE_DIR now points once HOME is restored)"
+        )
+
+
 def setUpModule():
+    # P2 (adversarial review of b3bb60d, 2026-10-03, finding 1): the VERY
+    # FIRST thing this function does, before anything else in this
+    # module's own run could possibly start a thread of its own -- see
+    # `_assert_no_untracked_thread_outlived_the_module`'s own docstring
+    # for why this baseline, not the two-name filter, is what the
+    # MODULE-level worker-thread check now diffs against.
+    global _BASELINE_THREADS
+    _BASELINE_THREADS = frozenset(threading.enumerate())
+    # P3 (adversarial review of b3bb60d, 2026-10-03, finding 3): the REAL
+    # state (in the REAL, unpatched environment -- before `patcher.start()`
+    # below ever runs) of every per-hook subdirectory a leaking worker
+    # could possibly create, for both roots the module-level leak check
+    # examines (`_hook_state.state_root()`, honouring whatever
+    # NEXUS_HOOK_STATE_DIR the developer's own shell already has, and the
+    # conventional default) -- so that check can tell "this hook's own
+    # subdirectory already existed before this module ever ran" (normal:
+    # a real run of this very hook, before or after this test session)
+    # apart from "this module's own test run is what created it" (a leak,
+    # even when nothing INSIDE it matches one of this run's own keys --
+    # see `_assert_no_new_state_subdir`).
+    global _REAL_STATE_SUBDIRS_EXISTED_BEFORE
+    _production_root_before = _hook_state.state_root()
+    _default_root_before = os.path.expanduser(_hook_state.DEFAULT_STATE_DIR)
+    _REAL_STATE_SUBDIRS_EXISTED_BEFORE = {
+        os.path.join(root, _MOD.HOOK): os.path.isdir(os.path.join(root, _MOD.HOOK))
+        for root in {_production_root_before, _default_root_before}
+    }
     # G1 (second targeted review of the hygiene round, 2026-10-02):
     # installed before anything else runs, so every key any test in this
     # module ever resolves -- directly, or via the hook's own production
@@ -379,10 +619,12 @@ def setUpModule():
     # earlier revision of this comment claimed, "the mechanism by which
     # the other three would ever fire at all": each of the other three
     # fires from its own direct, independent check). Joins far longer
-    # than any per-test caller needs -- see `_MODULE_LINGER_JOIN_SECONDS`
-    # -- and names this registration `" (the module)"` in its own
-    # failure message, which the per-test registrations do not share.
-    unittest.addModuleCleanup(_assert_worker_threads_finished, " (the module)", _MODULE_LINGER_JOIN_SECONDS)
+    # than any per-test caller needs -- see `_MODULE_LINGER_JOIN_SECONDS`.
+    # P2: this is the snapshot-diff check (`_assert_no_untracked_thread_
+    # outlived_the_module`), not the name-filtered `_assert_worker_
+    # threads_finished` the two PER-TEST registrations above still use --
+    # see the former's own docstring for why the distinction matters.
+    unittest.addModuleCleanup(_assert_no_untracked_thread_outlived_the_module, _MODULE_LINGER_JOIN_SECONDS)
 
 
 def _load_module(path, name):
@@ -4442,6 +4684,20 @@ class TestR4C1ProductionTailRealKill(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.cwd = os.path.join(self.tmp.name, "proj")
         os.makedirs(self.cwd)
+        # P4 (finding 5, adversarial review of b3bb60d, 2026-10-03): this
+        # test's own key is resolved HERE, in-process, but the actual
+        # worker whose behaviour it exercises is a REAL SUBPROCESS (see
+        # the class docstring) that resolves ITS OWN key independently,
+        # for real -- `mock.patch.object(_identity, "_resolved_root",
+        # ...)` (the fix every OTHER ad-hoc temp dir in this module uses)
+        # would not reach it. `git init` instead (mirrors `TestK14Subdir
+        # ectoryStart`'s own pattern): without it, `git -C self.cwd
+        # rev-parse --show-toplevel` walks UP past `self.tmp.name` looking
+        # for the nearest `.git`, and a TMPDIR that happens to sit inside
+        # an ENCLOSING git work tree (this repository's own, say) would
+        # make BOTH resolutions -- this one and the subprocess's -- agree
+        # on that enclosing repo's key instead of a throwaway one.
+        subprocess.run(["git", "init", "-q", self.cwd], check=True)
         self.state_dir = os.path.join(self.tmp.name, "state")
         self.config_dir = os.path.join(self.tmp.name, "claude-config")
         self.key, _degraded = _identity.memory_dir_key(self.cwd)
@@ -4813,10 +5069,17 @@ class TestModuleCleanupOrdering(unittest.TestCase):
         it comes after one named predecessor. The previous version of
         this test only checked the latter, so it would have stayed green
         even the moment a new cleanup was appended after this one, no
-        longer actually last."""
+        longer actually last.
+
+        P2 (adversarial review of b3bb60d, 2026-10-03): the registered
+        name changed from `_assert_worker_threads_finished` to
+        `_assert_no_untracked_thread_outlived_the_module` (the
+        snapshot-diff form -- see its own docstring for why the
+        MODULE-level registration specifically needs that, not the
+        two-name filter the per-test registrations still use)."""
         import inspect
         source = inspect.getsource(setUpModule)
-        worker_pos = source.index("addModuleCleanup(_assert_worker_threads_finished")
+        worker_pos = source.index("addModuleCleanup(_assert_no_untracked_thread_outlived_the_module")
         rest = source[worker_pos + 1:]
         self.assertNotIn("addModuleCleanup(", rest)
 
@@ -4864,6 +5127,168 @@ class TestBackstopSelfTest(_WriteCase):
                     _assert_worker_threads_finished(" (self-test)")
         finally:
             self._join_hung_worker(release)
+
+
+class TestP1WorkerNeverRereadsEnvironmentAfterHandoff(_WriteCase):
+    """P1 (adversarial review of b3bb60d, 2026-10-03, finding 6): the
+    production root cause -- ``_collect`` read ``NEXUS_API_URL`` at its
+    own top, but ``NEXUS_API_TOKEN`` only much later, after the run lock
+    had already re-resolved ``_hook_state.state_root()`` -- so a worker
+    thread released after the CALLING thread's own environment had
+    already moved on would pick up whatever NEW values were current at
+    that point, not the ones the round actually started with.
+
+    Parks the REAL worker thread ``main()`` itself starts (via
+    ``_identity.project_root``, the EARLIEST point in ``_collect`` this
+    test can intercept without also mocking away the very call whose
+    env-dependent descendants -- ``_memory_dir``, ``_memory_state_path_
+    under``, ``_memory_run_lock_path_under``, the ``IngestClient``
+    construction -- it exists to pin), confirms it is genuinely blocked
+    there, THEN swaps ``NEXUS_API_TOKEN`` / ``NEXUS_HOOK_STATE_DIR`` /
+    ``HOME`` / ``CLAUDE_CONFIG_DIR`` to sentinels an unfixed worker would
+    read AFTER being released, and only then releases it. ``main()``
+    itself runs on its OWN thread (not this test's), with its real,
+    default work budget, so the round completes NORMALLY once released
+    -- this is not a timeout/abandonment scenario (``TestBackstopSelfTest``
+    already covers that shape); the point here is that the round
+    SUCCEEDS, using the environment it started with, while the sentinel
+    one sits in ``os.environ`` the whole time it does its real work."""
+
+    def test_a_parked_worker_completes_using_the_env_main_captured_not_a_later_swap(self):
+        self._write("f1")
+        self.backend.reply(*_empty_lookup())  # orphan reconciliation: nothing to see
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # upsert dedup lookup + POST
+
+        real_project_root = _identity.project_root
+        release_event = threading.Event()
+        hit_event = threading.Event()
+
+        def parked_project_root(cwd, _real=real_project_root):
+            hit_event.set()
+            release_event.wait(10.0)
+            return _real(cwd)
+
+        original_token = "original-token-must-be-the-one-sent"
+        env = {
+            "NEXUS_API_URL": self.backend.url,
+            "NEXUS_HOOK_STATE_DIR": self.state_dir,
+            "NEXUS_DEFAULT_USER_ID": USER,
+            "CLAUDE_CONFIG_DIR": self.config_dir,
+            "NEXUS_API_TOKEN": original_token,
+        }
+        clean = {k: os.environ[k] for k in _BASE_ENV_KEYS if k in os.environ}
+        clean.update(_NO_PROXY)
+        clean.update(env)
+
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps({"cwd": self.cwd}))
+
+        def drive_main():
+            with mock.patch.dict(os.environ, clean, clear=True), \
+                    mock.patch.object(sys, "stderr", sys.stderr), \
+                    mock.patch.object(_identity, "project_root", side_effect=parked_project_root):
+                _MOD.main()
+
+        driver = threading.Thread(target=drive_main, name="test-p1-main-driver", daemon=True)
+        driver.start()
+        try:
+            self.assertTrue(hit_event.wait(5.0), "the parked worker never even started")
+            # drive_main's own env patch, installed on ITS thread, is still
+            # the active process environment here -- os.environ is
+            # process-wide, not per-thread, and neither main() nor its own
+            # worker thread has returned yet. Swapping it now, from THIS
+            # (the test's own) thread, models the calling environment
+            # having moved on behind the parked worker's back -- exactly
+            # the shape the adversarial review's own reproduction used.
+            sentinel_root = os.path.join(self.tmp.name, "sentinel-state-root")
+            sentinel_home = os.path.join(self.tmp.name, "sentinel-home")
+            sentinel_config = os.path.join(self.tmp.name, "sentinel-config")
+            os.makedirs(sentinel_home, exist_ok=True)
+            with mock.patch.dict(os.environ, {
+                "NEXUS_API_TOKEN": "sentinel-token-must-never-be-sent",
+                "NEXUS_HOOK_STATE_DIR": sentinel_root,
+                "HOME": sentinel_home,
+                "CLAUDE_CONFIG_DIR": sentinel_config,
+            }):
+                release_event.set()
+                # Wait for the ROUND'S OWN WORK -- _collect's own thread,
+                # by name -- to finish WHILE the sentinel env is still
+                # active, so anything it does mid-work is observed under
+                # the sentinel (it must do nothing: P1's whole point).
+                # main()'s OWN ledger write, which follows on `driver`'s
+                # thread once this worker rejoins it, is a SEPARATE,
+                # pre-existing, cross-hook mechanism this fix does not
+                # touch (every hook's ledger write resolves its own path
+                # fresh when IT runs) -- it must run AFTER the sentinel
+                # env is gone, not while it is still up, so it is
+                # deliberately left OUTSIDE this `with` block.
+                work_name = f"{_MOD.HOOK}-work"
+                for t in threading.enumerate():
+                    if t.name == work_name and t is not threading.current_thread():
+                        t.join(10.0)
+                        self.assertFalse(t.is_alive(), "the round's own worker did not finish in time")
+            self.assertFalse(os.path.exists(sentinel_root), "must never touch the sentinel state root")
+            self.assertFalse(os.path.exists(sentinel_config), "must never touch the sentinel config dir")
+            driver.join(10.0)
+            self.assertFalse(driver.is_alive(), "main() did not return after its own worker finished")
+        finally:
+            release_event.set()
+            sys.stdin = old_stdin
+            driver.join(5.0)
+
+        posts = [r for r in self.requests if r["method"] == "POST"]
+        self.assertEqual(len(posts), 1, self.requests)
+        self.assertEqual(
+            posts[0]["headers"].get("x-api-key"), original_token,
+            "the POST must carry the token main() captured, never the sentinel",
+        )
+        state = self._state()  # reads back from self.state_dir -- the ORIGINAL root
+        self.assertIn("f1", state.get("files", {}))
+
+
+class TestP2ModuleThreadCheckCoversUntrackedThreads(unittest.TestCase):
+    """P2 (adversarial review of b3bb60d, 2026-10-03, finding 1): pins
+    `_assert_no_untracked_thread_outlived_the_module` against the exact
+    gap the review's own `threading.Timer` reproduction exploited -- a
+    thread under ANY name other than the two `_hook_runner` ones was
+    structurally invisible to the OLD, name-filtered
+    `_assert_worker_threads_finished` check, every single time
+    ("missed 20/20" in the review's own words -- a structural blind spot,
+    not a flaky timing race that widening the join window could fix)."""
+
+    def test_it_raises_for_a_thread_under_an_arbitrary_name(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        def spin():
+            started.set()
+            release.wait(10.0)
+
+        intruder = threading.Thread(target=spin, name="not-a-tracked-hook-thread-name", daemon=True)
+        intruder.start()
+        try:
+            self.assertTrue(started.wait(5.0), "the intruder thread never even started")
+            with self.assertRaisesRegex(AssertionError, "outlived"):
+                _assert_no_untracked_thread_outlived_the_module(0.05)
+        finally:
+            release.set()
+            intruder.join(5.0)
+            self.assertFalse(intruder.is_alive(), "the intruder thread outlived this test")
+
+    def test_it_stays_silent_once_the_untracked_thread_has_actually_finished(self):
+        done = threading.Event()
+        t = threading.Thread(target=done.set, name="short-lived-arbitrary-name", daemon=True)
+        t.start()
+        t.join(5.0)
+        self.assertFalse(t.is_alive())
+        _assert_no_untracked_thread_outlived_the_module(0.5)  # must not raise
+
+    def test_a_thread_already_alive_at_setupmodule_time_is_never_flagged(self):
+        """The current thread (every test in this module runs on the one
+        `unittest` itself drives tests from) was alive when `setUpModule`
+        took its baseline snapshot, and must never be mistaken for one
+        this module's OWN test run started."""
+        self.assertIn(threading.current_thread(), _BASELINE_THREADS)
 
 
 class TestRealHomeGuardIsPinned(unittest.TestCase):
@@ -5012,23 +5437,98 @@ class TestRealHomeGuardRegistration(unittest.TestCase):
         # NEXUS_HOOK_STATE_DIR, so the guard looks at the real root.
         after = cleanups[guard_at + 1]
         self.assertEqual(getattr(after, "__name__", None), "stop")
-        self.assertEqual(type(getattr(after, "__self__", None)).__name__, "_patch_dict")
+        patcher = getattr(after, "__self__", None)
+        self.assertEqual(type(patcher).__name__, "_patch_dict")
+        # P4 (finding 4, adversarial review of b3bb60d, 2026-10-03): "some
+        # _patch_dict.stop at this exact LIFO position" is not enough on
+        # its own (mutant V4: ANY mock.patch.dict call placed at this
+        # same spot would satisfy the two checks above) -- it must be the
+        # SPECIFIC patcher that installed setUpModule's own fake HOME.
+        # `os.environ["HOME"]` is readable here precisely BECAUSE
+        # `_BASE_ENV_KEYS` always carries "HOME" through every
+        # `_run_main` call this module makes (see there), restoring it
+        # after each one -- so at this exact point in this module's run
+        # it is still whatever value setUpModule's own patcher installed.
+        self.assertIs(patcher.in_dict, os.environ)
+        self.assertIs(patcher.clear, True)
+        self.assertEqual(patcher.values.get("HOME"), os.environ["HOME"])
         # and the temp root is removed only after the guard ran
         rmtree_at = [i for i, fn in enumerate(cleanups) if fn is shutil.rmtree]
         self.assertTrue(rmtree_at and max(rmtree_at) < guard_at, (rmtree_at, guard_at))
 
     def test_the_registered_entry_itself_detects_a_run_lock_leak(self):
-        this_module = sys.modules[__name__]
+        """P3 (finding 2, adversarial review of b3bb60d, 2026-10-03): the
+        guard's own root used to be a hardcoded constant (`_REAL_NEXUS_
+        DIR`, disconnected from `_hook_state.state_root()` /
+        `NEXUS_HOOK_STATE_DIR` precedence) -- a mutant that broke
+        production's OWN root resolution (a ".nexus" typo, or swapping
+        the real default for `tempfile.gettempdir()`) would therefore
+        SURVIVE, because the guard's own idea of "the real root" never
+        moved with it. Pointing NEXUS_HOOK_STATE_DIR at a sentinel
+        directory here, rather than patching this test file's own
+        `_REAL_NEXUS_DIR` constant (the previous version of this test),
+        exercises the SAME production helper (`_hook_state.state_root()`)
+        the registered entry now calls, so a regression in either
+        direction shows up here (kills V1 / V2).
+
+        P4 (finding 5): `project` is patched via `_resolved_root` (like
+        every OTHER ad-hoc temp dir in this module -- see `_WriteCase.
+        setUp`) rather than resolved against whatever real git toplevel
+        happens to enclose it: `tempfile.TemporaryDirectory()` can land
+        anywhere TMPDIR points, including inside THIS repository's own
+        git work tree, in which case an unpatched `_identity.memory_dir_
+        key(project)` would silently record the ENCLOSING repo's own key
+        instead of a throwaway one -- a legitimate, pre-existing
+        ``<repo key>.run.lock`` under the real home would then trip this
+        guard for a reason that has nothing to do with this test."""
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as sentinel:
-            key, _degraded = _identity.memory_dir_key(project)  # recorded via the wrapper
+            with mock.patch.object(_identity, "_resolved_root", return_value=(project, False)):
+                key, _degraded = _identity.memory_dir_key(project)  # recorded via the wrapper
             self.assertIn(key, _memory_dir_keys_seen())
-            state_dir = os.path.join(sentinel, "hooks", _MOD.HOOK)
+            state_dir = os.path.join(sentinel, _MOD.HOOK)
             os.makedirs(state_dir)
             with open(os.path.join(state_dir, f"{key}.run.lock"), "w"):
                 pass
-            with mock.patch.object(this_module, "_REAL_NEXUS_DIR", sentinel):
+            with mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": sentinel}):
                 with self.assertRaisesRegex(AssertionError, "REAL state root"):
                     _assert_no_leaked_state_files_for_module()
+
+    def test_the_default_root_is_also_checked_even_when_NEXUS_HOOK_STATE_DIR_points_elsewhere(self):
+        """P3 ("and also the default ~/.nexus root"): a leak under the
+        CONVENTIONAL default must be caught even while NEXUS_HOOK_STATE_DIR
+        is, at the same time, set to a completely unrelated location with
+        nothing leaked under it -- the module-level check examines BOTH
+        roots, not only whichever one NEXUS_HOOK_STATE_DIR happens to
+        resolve to right now."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as unrelated_root:
+            with mock.patch.object(_identity, "_resolved_root", return_value=(project, False)):
+                key, _degraded = _identity.memory_dir_key(project)
+            self.assertIn(key, _memory_dir_keys_seen())
+            default_root = os.path.expanduser(_hook_state.DEFAULT_STATE_DIR)
+            state_dir = os.path.join(default_root, _MOD.HOOK)
+            # Tracks the OUTERMOST directory this test is about to create
+            # under the fake HOME (".nexus" itself, not just memory-sync's
+            # own subdirectory under "hooks") so cleanup can remove the
+            # WHOLE thing afterward -- an empty ".nexus"/"hooks" left
+            # behind would itself trip `_assert_home_untouched` (a
+            # DIFFERENT guard, checking the fake HOME is empty on exit),
+            # even once memory-sync's own subdirectory is gone.
+            home_dir = os.environ["HOME"]
+            created_top = os.path.join(home_dir, ".nexus")
+            pre_existing_top = os.path.isdir(created_top)
+            os.makedirs(state_dir, exist_ok=True)
+            leak_path = os.path.join(state_dir, f"{key}.run.lock")
+            with open(leak_path, "w"):
+                pass
+            try:
+                with mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": unrelated_root}):
+                    with self.assertRaisesRegex(AssertionError, "REAL state root"):
+                        _assert_no_leaked_state_files_for_module()
+            finally:
+                if pre_existing_top:
+                    shutil.rmtree(state_dir, ignore_errors=True)
+                else:
+                    shutil.rmtree(created_top, ignore_errors=True)
 
 
 if __name__ == "__main__":

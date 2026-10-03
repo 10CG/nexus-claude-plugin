@@ -177,21 +177,59 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     will not be there to delete again, so if a same-run higher-priority
     failure (an ``http_error`` on a later file, say) wins the scalar slot,
     ``orphans_deleted`` would otherwise vanish from the record for good.
-  - **H1 (hygiene round before merge, 2026-10-02): ``_memory_state_path
-    (key)`` is resolved ONCE per round.** ``_collect`` resolves it a
-    single time and threads the result down to ``_sync_file`` /
-    ``_delete_file`` as ``state_path``, rather than each of them calling
-    ``_memory_state_path``/``_hook_state.state_root()`` again per file --
-    cheap hardening against re-reading ``NEXUS_HOOK_STATE_DIR`` mid-round
-    (this module's own test suite found a worker thread abandoned past
-    its OWN test's work budget, then resolving a state path a second
-    time after that test's ``tearDown`` had already restored HOME /
-    NEXUS_HOOK_STATE_DIR, and landing a stray state file + lock in the
-    developer's real ``~/.nexus``). The real fix for that incident is on
-    the TEST side (``_hang_point`` / ``_WriteCase._join_hung_worker`` in
-    ``test_memory_sync.py``: no thread may outlive the test that started
-    it, full stop) -- this module-side change is the belt the task also
-    asked for, alongside that buckle.
+  - **H1 (hygiene round before merge, 2026-10-02; corrected and superseded
+    by P1 below): ``_memory_state_path(key)`` is resolved ONCE per
+    round.** This paragraph is kept for the historical record (the
+    incident it describes is real and is what motivated P1), but as
+    originally written it no longer matches the code: ``_collect`` does
+    not call ``_memory_state_path``/``_hook_state.state_root()`` AT ALL
+    any more (P1 moved that resolution to ``main()``), so there is no
+    "once per round, inside ``_collect``" call left to describe. The
+    incident itself: this module's own test suite found a worker thread
+    abandoned past its OWN test's work budget, then resolving a state
+    path a SECOND time after that test's ``tearDown`` had already
+    restored HOME / NEXUS_HOOK_STATE_DIR, landing a stray state file +
+    lock in the developer's real ``~/.nexus``. The ORIGINAL fix (resolve
+    once, in ``_collect``, before the per-file loop) narrowed the window
+    but did not close it -- see P1.
+  - **P1 (root-cause fix, adversarial review of commit b3bb60d, 2026-10-03,
+    finding 6): every environment input the work needs is read EXACTLY
+    ONCE, on the CALLING thread, in ``main()``, strictly BEFORE
+    ``run_with_deadline`` starts the worker thread -- ``NEXUS_API_URL``,
+    ``NEXUS_API_TOKEN``, the state root (``_hook_state.state_root()``,
+    which itself resolves ``NEXUS_HOOK_STATE_DIR`` / falls back to a
+    HOME-relative default), ``CLAUDE_CONFIG_DIR`` (or the HOME-relative
+    ``~/.claude`` fallback) for the on-disk memory directory, and the two
+    identity overrides ``_identity.user_id``/``_identity.container_id``
+    read from the environment (``NEXUS_DEFAULT_USER_ID``,
+    ``NEXUS_CONTAINER_ID``) -- and handed down through ``run``.
+    ``_collect`` (and everything it calls: ``_memory_dir``,
+    ``_memory_state_path_under``, ``_memory_run_lock_path_under``, the
+    ``IngestClient`` construction) reads these back OUT OF ``run``;
+    NONE of them calls ``os.environ.get`` or ``_hook_state.state_root()``
+    itself any more. H1's own fix (resolve the state path once, INSIDE
+    ``_collect``) was a real improvement but did not close the window it
+    was trying to close: ``_collect`` runs on a daemon worker thread
+    ``run_with_deadline`` can only ABANDON, never kill, so a thread stuck
+    past its own test's (or, in production, its own PROCESS's) budget
+    keeps running, unobserved, and H1's "resolve once" call still sat
+    INSIDE that thread, reading whatever ``os.environ`` had become by the
+    time the thread actually got there -- which, in the adversarial
+    review's own reproduction, was a developer's real, already-restored
+    environment, not the one the round started with. Resolving every
+    input on the CALLING thread, before the worker exists at all, removes
+    the window entirely rather than narrowing it: there is no later point
+    at which the worker COULD read a different environment, because it
+    never reads one at all. ``_memory_state_path(key)`` /
+    ``_memory_run_lock_path(key)`` (the no-argument, env-reading forms)
+    still exist, unchanged, for this module's own tests and any other
+    caller OUTSIDE the worker path -- they are simply never called from
+    ``_collect`` any more; see ``_memory_state_path_under`` /
+    ``_memory_run_lock_path_under``, the round-safe forms that take the
+    already-resolved root instead. Production behaviour is otherwise
+    identical: the SAME values are used, just read at a different,
+    strictly-earlier point in the SAME thread of control that used to
+    read them lazily.
   - **Frontmatter: two structures, both accepted** (flat top-level keys, or
     one level of indentation under a top-level ``metadata:`` block -- real
     Claude Code memory files on this machine split roughly 42:60 between
@@ -438,11 +476,18 @@ _ASSEMBLY_VERSION = 2
 
 # ── on-disk memory directory ─────────────────────────────────────────────
 
-def _memory_dir(key):
-    """``<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<key>/memory`` -- where
-    Claude Code itself keeps this project's auto-memory files, under the
-    SAME key (X1) this hook's external_id prefix and state file use."""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+def _memory_dir(config_dir, key):
+    """``<config_dir>/projects/<key>/memory`` -- where Claude Code itself
+    keeps this project's auto-memory files, under the SAME key (X1) this
+    hook's external_id prefix and state file use.
+
+    P1: ``config_dir`` is the round's OWN, already-resolved value
+    (``CLAUDE_CONFIG_DIR`` or the ``~/.claude`` fallback) -- resolved once
+    in ``main()``, before the worker thread starts, and handed down via
+    ``run``. This function itself reads no environment variable any
+    more (it used to resolve ``CLAUDE_CONFIG_DIR`` fresh on every call,
+    which is exactly the kind of worker-thread environment read P1
+    removes -- see the module docstring's own P1 paragraph)."""
     return os.path.join(config_dir, "projects", key, "memory")
 
 
@@ -768,26 +813,49 @@ def _build_memory_metadata(key, project_name, slug, frontmatter, modified):
 
 # ── memory-sync's own state file (X1 corollary: keyed by memory dir key) ─
 
+def _memory_state_path_under(state_root, key):
+    """``<state_root>/memory-sync/<memory dir key>.json`` -- the ROUND-SAFE
+    form (P1): ``state_root`` is the caller's OWN, already-resolved value
+    (``_hook_state.state_root()``, called ONCE in ``main()`` before the
+    worker thread starts), never re-resolved here. ``_collect`` calls
+    THIS form, with ``run["state_root"]`` -- never ``_memory_state_path``
+    below, which re-reads the environment and exists for this module's
+    own tests (and any other non-worker caller) instead.
+
+    NOT ``_hook_state.state_path(HOOK, cwd)`` (keyed by ``project_dir
+    (cwd)``'s basename-derived slug): the X1 corollary (owner 2026-10-01)
+    requires this file be keyed by the SAME string as the external_id
+    prefix and the on-disk memory directory, so two working directories
+    that happen to share a basename cannot read and write the same state
+    file -- see ``_identity.memory_dir_key``'s own docstring for the
+    mass-deletion shape that keying-by-basename would otherwise
+    reproduce. The directory is ``_STATE_SUBDIR`` (``== HOOK``, i.e. the
+    literal ``"memory-sync"`` the owner ruling's own corollary gives this
+    path as) -- see that constant's own docstring (K25) for a real,
+    REPORTED-not-fixed collision this literal name has with the ledger
+    directory namespace for a project whose own slug happens to be
+    "memory-sync"."""
+    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.json")
+
+
 def _memory_state_path(key):
-    """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.json`` -- NOT
-    ``_hook_state.state_path(HOOK, cwd)`` (keyed by ``project_dir(cwd)``'s
-    basename-derived slug): the X1 corollary (owner 2026-10-01) requires
-    this file be keyed by the SAME string as the external_id prefix and the
-    on-disk memory directory, so two working directories that happen to
-    share a basename cannot read and write the same state file -- see
-    ``_identity.memory_dir_key``'s own docstring for the mass-deletion
-    shape that keying-by-basename would otherwise reproduce. The directory
-    is ``_STATE_SUBDIR`` (``== HOOK``, i.e. the literal ``"memory-sync"``
-    the owner ruling's own corollary gives this path as) -- see that
-    constant's own docstring (K25) for a real, REPORTED-not-fixed
-    collision this literal name has with the ledger directory namespace
-    for a project whose own slug happens to be "memory-sync"."""
-    return _hook_state.state_path_at(os.path.join(_STATE_SUBDIR, f"{key}.json"))
+    """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.json`` --
+    the CONVENIENCE form: resolves ``_hook_state.state_root()`` itself,
+    fresh, on every call. For this module's own tests and any other
+    caller OUTSIDE the worker path ONLY (P1) -- ``_collect`` must never
+    call this; see ``_memory_state_path_under`` above, which it calls
+    instead, fed from the state root ``main()`` captured once before
+    starting the worker."""
+    return _memory_state_path_under(_hook_state.state_root(), key)
 
 
-def _memory_run_lock_path(key):
-    """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.run.lock`` --
-    a per-memory-dir-key, whole-ROUND mutual-exclusion lock (K09): two
+def _memory_run_lock_path_under(state_root, key):
+    """``<state_root>/memory-sync/<memory dir key>.run.lock`` -- the
+    ROUND-SAFE form (P1), mirroring ``_memory_state_path_under`` above:
+    ``state_root`` is the caller's own, already-resolved value, never
+    re-resolved here. ``_collect`` calls THIS form.
+
+    A per-memory-dir-key, whole-ROUND mutual-exclusion lock (K09): two
     SessionEnd runs for the SAME memory directory (two sessions in the same
     project ending within the same short window) each start from the same
     unlocked state snapshot and would otherwise both select, and both POST,
@@ -795,12 +863,21 @@ def _memory_run_lock_path(key):
     de-duplicates on the FOLLOWING run's lookup, so the steady state
     (zero-call once everything is synced, orphan reconciliation retired
     after one state lifetime) never naturally re-visits the pair to merge
-    it. Deliberately a SEPARATE file from ``_memory_state_path``'s own
+    it. Deliberately a SEPARATE file from ``_memory_state_path_under``'s own
     per-write ``.lock`` (``_hook_state._locked`` already takes that one for
     each individual read-modify-write): this one is held for the WHOLE
     network-making portion of one round, which ``_locked`` is not shaped
     for and must not be repurposed to do."""
-    return _hook_state.state_path_at(os.path.join(_STATE_SUBDIR, f"{key}.run.lock"))
+    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.run.lock")
+
+
+def _memory_run_lock_path(key):
+    """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.run.lock`` --
+    the CONVENIENCE form (see ``_memory_state_path``'s own docstring):
+    resolves ``_hook_state.state_root()`` itself, fresh, on every call.
+    For this module's own tests and any other caller OUTSIDE the worker
+    path ONLY -- ``_collect`` calls ``_memory_run_lock_path_under`` instead."""
+    return _memory_run_lock_path_under(_hook_state.state_root(), key)
 
 
 _NO_RUN_LOCK = -1  # sentinel: the lock could not even be ATTEMPTED; proceed unlocked
@@ -1204,10 +1281,13 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
     ``(reasons, aborts, calls)``. Tallies into ``run["extra"]`` as it goes
     (K08) -- see ``_tally_result``.
 
-    ``state_path`` (H1 hygiene round, 2026-10-02): the caller's own,
-    already-resolved ``_memory_state_path(key)`` -- see ``_delete_file``'s
-    own docstring for why this is now resolved once, by ``_collect``, and
-    passed down rather than re-resolved by every file this round touches.
+    ``state_path`` (H1 hygiene round, 2026-10-02; P1, 2026-10-03): the
+    caller's own, already-resolved ``_memory_state_path_under(state_root,
+    key)`` -- see ``_delete_file``'s own docstring for why this is now
+    resolved once, by ``_collect``, from the round's OWN ``run["state_
+    root"]`` (itself resolved once in ``main()``, before any worker
+    thread exists -- P1), and passed down rather than re-resolved by
+    every file this round touches.
 
     On a non-aborting, COMPLETED write (created / updated / unchanged /
     stale_local) this ALSO persists the file's own state entry immediately
@@ -1350,14 +1430,17 @@ def _delete_file(client, key, slug, run, state_path):
     file. Returns ``(reasons, aborts, calls, cleared)``. Tallies into
     ``run["extra"]`` as it goes (K08) -- see ``_tally_result``.
 
-    ``state_path`` (H1 hygiene round, 2026-10-02): the caller's own,
-    already-resolved ``_memory_state_path(key)`` -- resolved ONCE per run
-    rather than this function (and ``_sync_file``) each separately calling
-    ``_memory_state_path``/``state_root()`` again, which re-reads
-    ``NEXUS_HOOK_STATE_DIR`` from the environment every time. Cheap
-    hardening, not a behaviour change under normal operation (``key`` and
-    the environment do not change mid-round) -- see the module docstring's
-    H1 paragraph for the incident this closes off.
+    ``state_path`` (H1 hygiene round, 2026-10-02; P1, 2026-10-03): the
+    caller's own, already-resolved ``_memory_state_path_under(state_root,
+    key)`` -- resolved ONCE per run rather than this function (and
+    ``_sync_file``) each separately calling ``_memory_state_path_under``/
+    ``state_root()`` again. As of P1, ``state_root`` itself is no longer
+    re-readable from inside this round at all: it is ``run["state_root"]``,
+    resolved in ``main()`` before any worker thread exists, so there is no
+    code path left here that COULD re-read ``NEXUS_HOOK_STATE_DIR`` from
+    the environment mid-round -- see the module docstring's H1 and P1
+    paragraphs for the incident this closes off and why H1's own fix
+    narrowed, rather than closed, the window.
 
     On confirmed deletion (or an honest "nothing_to_do" -- the row was
     already gone) this ALSO clears the file's local state entry; on any
@@ -1799,7 +1882,11 @@ def _collect(run):
         run["cwd"] = event["cwd"]
     cwd = run["cwd"] or os.getcwd()
 
-    base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
+    # P1: every one of these is read ONCE, by main(), on the calling
+    # thread, strictly before this function's own worker thread was ever
+    # started -- never re-read from os.environ here. See the module
+    # docstring's own P1 paragraph for why (adversarial review finding 6).
+    base_url = run["base_url"]
     if not base_url:
         return "not_configured"  # the default for a fresh install; do nothing else
 
@@ -1809,7 +1896,7 @@ def _collect(run):
     toplevel, _ = _identity.project_root(cwd)
     project_name = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
 
-    local_files, indeterminate, list_reason = _list_memory_files(_memory_dir(key))
+    local_files, indeterminate, list_reason = _list_memory_files(_memory_dir(run["config_dir"], key))
     run["extra"]["local_files"] = len(local_files)
     if indeterminate:
         # R3-T04 (post_implementation R3): written the INSTANT this fact
@@ -1823,7 +1910,7 @@ def _collect(run):
         # `_collect` got, but nothing wrote this key into it yet.
         run["extra"]["unresolved_files"] = sorted(indeterminate)[:5]
 
-    state_path = _memory_state_path(key)
+    state_path = _memory_state_path_under(run["state_root"], key)
     state, reasons = _hook_state.read_state_at(state_path)
     run["reasons"] = reasons  # K02: the SAME list, mutated as this round goes
     # R4-C3: captured BEFORE `reasons` can grow any further below -- this is
@@ -1881,7 +1968,7 @@ def _collect(run):
         run["calls"] = 0
         return _hook_state.worst_reason(reasons)
 
-    lock_fd = _acquire_run_lock(_memory_run_lock_path(key))
+    lock_fd = _acquire_run_lock(_memory_run_lock_path_under(run["state_root"], key))
     if lock_fd is None:
         # K09: a concurrent SessionEnd run for this SAME memory directory
         # already holds the round lock -- both runs would otherwise start
@@ -1926,9 +2013,19 @@ def _collect(run):
         # is recorded in extra, never in reasons.
         run["extra"]["run_lock"] = "unavailable"
     try:
-        token = os.environ.get("NEXUS_API_TOKEN", "")
+        # P1: `token` and `run["container_id"]` were read once in main(),
+        # before this thread started (NEXUS_API_TOKEN / NEXUS_CONTAINER_ID
+        # -- the latter via `_identity.container_id()`, called there, not
+        # here). `user_id` inlines `_identity.user_id`'s own two-line body
+        # (`NEXUS_DEFAULT_USER_ID or project_slug(cwd)`) using that
+        # pre-captured override instead of a fresh os.environ read --
+        # `project_slug(cwd)` itself reads no environment variable (cwd
+        # comes from this round's own stdin payload, read above, which is
+        # not an environment input P1 is about).
+        token = run["token"]
+        user_id = run["default_user_id"] or _identity.project_slug(cwd)
         client = _ingest_client.IngestClient(
-            base_url, token, _identity.user_id(cwd), _identity.container_id(), SOURCE_NAME,
+            base_url, token, user_id, run["container_id"], SOURCE_NAME,
             timeout=_HTTP_TIMEOUT_SECONDS, bulk=True, deadline=run["deadline"],
             identity_degraded=degraded,
         )
@@ -2242,6 +2339,28 @@ def main():
     # guard_stderr() is idempotent, so repeated in-process main() calls
     # within the same test process do not double-wrap.
     _hook_runner.guard_stderr()
+
+    # P1 (adversarial review of b3bb60d, 2026-10-03, finding 6): every
+    # environment input the work below needs is read HERE, on THIS
+    # (the calling) thread, strictly before run_with_deadline starts the
+    # worker -- never inside _collect, which runs on a daemon thread
+    # run_with_deadline can only ABANDON, never kill (see the module
+    # docstring's own P1 paragraph for the incident this closes). The
+    # worker reads every one of these back out of `run`; none of it
+    # touches os.environ, _hook_state.state_root(), or
+    # _identity.container_id() itself.
+    base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
+    token = os.environ.get("NEXUS_API_TOKEN", "")
+    state_root = _hook_state.state_root()
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    # Raw env value (None if unset, possibly ""), not yet folded with the
+    # cwd-derived fallback: `_identity.user_id`'s own `or project_slug(cwd)`
+    # half needs `cwd`, which is not known until _collect reads this
+    # round's own stdin payload (not an environment input -- see P1's own
+    # docstring paragraph for why that stays inside _collect).
+    default_user_id = os.environ.get("NEXUS_DEFAULT_USER_ID")
+    container_id = _identity.container_id()  # NEXUS_CONTAINER_ID or the hostname; no cwd needed
+
     run = {
         "cwd": None,
         "calls": 0,
@@ -2251,6 +2370,12 @@ def main():
         # request it could not finish in time rather than this whole worker
         # thread being abandoned mid-call with nothing recorded.
         "deadline": started + _WORK_BUDGET_SECONDS - _DEADLINE_SLACK_SECONDS,
+        "base_url": base_url,
+        "token": token,
+        "state_root": state_root,
+        "config_dir": config_dir,
+        "default_user_id": default_user_id,
+        "container_id": container_id,
     }
 
     outcome, left_behind = _hook_runner.run_with_deadline(
