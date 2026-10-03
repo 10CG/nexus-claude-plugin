@@ -1213,6 +1213,55 @@ class TestR12RacilyCleanEntries(unittest.TestCase):
         entry = self._entry(_iso_at(future - 3600))
         self.assertTrue(_MOD._racily_clean(entry))
 
+    # R12 review F1 / F3 / F7 (2026-10-03): the rule's parameters, pinned on
+    # whole-second stamps. Everything above runs on real ext4 / tmpfs stamps,
+    # which always carry a fractional part -- so none of it could tell a
+    # window of 0, 1 or 2 apart, nor ">=" from ">", nor whether ctime is
+    # looked at at all once mtime is: five non-equivalent mutants survived
+    # the whole module, three of them reproduced end to end as "the server
+    # keeps the old content for good". The reviewer's own tests, verbatim
+    # in substance.
+
+    _T = 1_790_000_000  # an even whole second: the start of a FAT 2-second slot
+
+    def _stamps(self, mtime, ctime_seconds, read_at):
+        return {"mtime": float(mtime), "ctime": int(round(ctime_seconds * 1e9)), "synced_at": _iso_at(read_at)}
+
+    def test_whole_second_stamps_two_seconds_before_the_read_are_still_racy(self):
+        """FAT / whole-second filesystems: a same-slot rewrite can land after
+        the read while ``synced_at`` already reads stamp + 2. Pins a window
+        of at least 2 AND ``>=`` rather than ``>``; the second assertion
+        pins the upper bound."""
+        self.assertTrue(_MOD._racily_clean(self._stamps(self._T, self._T, self._T + 2)))
+        self.assertFalse(_MOD._racily_clean(self._stamps(self._T, self._T, self._T + 3)))
+
+    def test_a_read_straddling_one_whole_second_boundary_is_racy(self):
+        self.assertTrue(_MOD._racily_clean(self._stamps(self._T + 0.999, self._T + 0.999, self._T + 1)))
+
+    def test_ctime_alone_can_make_an_entry_racy(self):
+        """mtime restored to a month ago (cp -p, rsync -t, a K21-style
+        script); only ctime says the inode changed just now."""
+        self.assertTrue(_MOD._racily_clean(self._stamps(self._T - 30 * 86400, self._T, self._T)))
+
+    def test_now_iso_round_trips_through_synced_at_epoch(self):
+        """F3: what ``_sync_file`` writes must be what ``_racily_clean`` can
+        read back -- otherwise every real entry is silently racy for good
+        (the fast path gone, every read error reported)."""
+        before = time.time()
+        parsed = _MOD._synced_at_epoch(_MOD._now_iso())
+        self.assertIsNotNone(parsed)
+        self.assertLessEqual(abs(parsed - before), 2)
+
+    def test_synced_at_is_read_as_utc_whatever_the_local_zone(self):
+        """F7: this machine and CI both run in UTC, where parsing as local
+        time happens to give the same answer."""
+        try:
+            with mock.patch.dict(os.environ, {"TZ": "Asia/Shanghai"}):
+                time.tzset()
+                self.assertEqual(_MOD._synced_at_epoch("1970-01-01T00:00:10Z"), 10.0)
+        finally:
+            time.tzset()
+
 
 class TestMetadataBuilding(unittest.TestCase):
     def test_includes_x1_keys_and_slug_and_modified_always(self):
@@ -3838,6 +3887,43 @@ class TestK21SameSizeContentRewrite(_WriteCase):
         patches = [r for r in self.requests if r["method"] == "PATCH"]
         self.assertEqual(len(patches), 1, self.requests)
         self.assertIn("version-TWO", patches[0]["json"]["content"])
+
+
+class TestR12StampTakenBeforeTheFileIsOpened(_WriteCase):
+    """R12 review F2 (2026-10-03): ``synced_at`` is the reference
+    ``_racily_clean`` measures the recorded stat against. Stamped AFTER the
+    read (the first R12 version), a pause between the read and the stamp
+    -- a slow read, a suspended machine -- could push it past a same-tick
+    rewrite that landed right after the read: the entry is then trusted
+    with the OLD content's hash, and the server keeps the old content for
+    good (reproduced on ramfs with a 2.2 s pause). Stamped right before the
+    open, no pause can do that."""
+
+    def test_synced_at_is_stamped_before_the_file_is_opened(self):
+        self._write("f1")
+        self.backend.reply(*_empty_lookup())  # orphan reconciliation: nothing to see
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # upsert dedup lookup + POST
+        events = []
+        real_now_iso = _MOD._now_iso
+
+        def now_iso_spy():
+            events.append("stamp")
+            return real_now_iso()
+
+        def open_spy(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)) and os.path.basename(os.fsdecode(file)) == "f1.md":
+                events.append("open f1.md")
+            return open(file, *args, **kwargs)
+
+        with mock.patch.object(_MOD, "_now_iso", now_iso_spy), \
+                mock.patch.object(_MOD, "open", open_spy, create=True):
+            self._run()
+        self.assertIn("open f1.md", events, "the file was never opened -- nothing was checked")
+        first_open = events.index("open f1.md")
+        self.assertGreater(first_open, 0, events)
+        self.assertEqual(events[first_open - 1], "stamp", events)
+        self.assertEqual(self._last_entry()["reason"], "none")
+
 
 
 class TestK22ReconciliationRegistersMatchedSlugs(_WriteCase):
