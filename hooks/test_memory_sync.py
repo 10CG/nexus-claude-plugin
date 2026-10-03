@@ -81,6 +81,10 @@ _NO_PROXY = {"no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost
 # round, 2026-10-03: the previous ``~/.nexus`` constants pointed those
 # messages at the wrong place whenever NEXUS_HOOK_STATE_DIR was set).
 _REAL_STATE_ROOT = _hook_state.state_root()
+# R10-3 (review of 60b93b3): the conventional default under the REAL HOME,
+# also captured at import -- the second of the two roots setUpModule
+# records "did memory-sync's subdirectory exist before this run" for.
+_REAL_DEFAULT_STATE_ROOT = os.path.expanduser(_hook_state.DEFAULT_STATE_DIR)
 
 # G1 (second targeted review of the hygiene round, 2026-10-02): the real
 # `_identity.memory_dir_key`, captured before `setUpModule` wraps the
@@ -1227,6 +1231,26 @@ class _WriteCase(unittest.TestCase):
     def _ext(self, slug):
         return f"{self.key}/{slug}"
 
+    def _seed_synced_state(self, slug, path):
+        """Merges one more synced entry into state (preserving any other
+        slug a previous call already seeded), rather than replacing the
+        whole file -- several tests seed more than one slug."""
+        st = os.stat(path)
+        entry = {
+            "mtime": st.st_mtime, "size": st.st_size,
+            "ctime": getattr(st, "st_ctime_ns", None),
+            "file_hash": _MOD._whole_file_hash(path),
+            "synced_at": "2026-01-01T00:00:00Z",
+            "redaction_fingerprint": _MOD._current_fingerprint(),
+        }
+        _hook_state.update_state_at(
+            _MOD._memory_state_path(self.key),
+            lambda s, slug=slug, entry=entry: {
+                **s, "cursor": s.get("cursor", 0), "reconciled": True,
+                "files": {**(s.get("files") or {}), slug: entry},
+            },
+        )
+
     def _join_hung_worker(self, release, timeout=5.0):
         """Releases a thread parked in ``_hang_point``'s ``wait`` and
         BLOCKS until it has actually finished, before returning -- so it
@@ -1630,26 +1654,6 @@ class TestBatchingAndCursor(_WriteCase):
 
 
 class TestDeletion(_WriteCase):
-    def _seed_synced_state(self, slug, path):
-        """Merges one more synced entry into state (preserving any other
-        slug a previous call already seeded), rather than replacing the
-        whole file -- several tests below seed more than one slug."""
-        st = os.stat(path)
-        entry = {
-            "mtime": st.st_mtime, "size": st.st_size,
-            "ctime": getattr(st, "st_ctime_ns", None),
-            "file_hash": _MOD._whole_file_hash(path),
-            "synced_at": "2026-01-01T00:00:00Z",
-            "redaction_fingerprint": _MOD._current_fingerprint(),
-        }
-        _hook_state.update_state_at(
-            _MOD._memory_state_path(self.key),
-            lambda s, slug=slug, entry=entry: {
-                **s, "cursor": s.get("cursor", 0), "reconciled": True,
-                "files": {**(s.get("files") or {}), slug: entry},
-            },
-        )
-
     def test_a_vanished_file_is_deleted_and_the_mapping_clears(self):
         # K01 (post_implementation R1): zero local files no longer deletes
         # anything on its own (see TestZeroLocalFilesDuringPendingDelete) --
@@ -5158,19 +5162,17 @@ class TestBackstopSelfTest(_WriteCase):
 
 # ── P1: the worker reads no configuration from the environment ──────────
 
-# Every way a function can read (or rewrite) the process environment
-# without going through a helper: attribute chains, matched on the dotted
-# name (``os.environ.get(...)`` contains ``os.environ``), and the same
-# names imported bare via ``from os import ...`` / ``from os.path import ...``.
+# The environment accessors the static check below recognises, as dotted
+# names -- see `_environment_reads_reachable_from` for every spelling of
+# them it matches, and the ones it does not.
 _ENV_READS = (
     "os.environ", "os.environb", "os.getenv", "os.getenvb", "os.putenv", "os.unsetenv",
     "os.path.expanduser", "os.path.expandvars",
 )
-# The other hook modules a worker-path function can call into. The
-# standard library is deliberately NOT followed: it does read os.environ
-# on the worker thread (PATH for the git subprocess, proxy variables in
-# urllib) -- see memory_sync.py's own P1 paragraph.
-_SIBLING_MODULES = ("_hook_runner", "_hook_state", "_identity", "_ingest_client", "_redact")
+# Method names that read HOME or the environment whatever they are called
+# on (`Path("~").expanduser()`), and dotted endings that do (`Path.home()`).
+_ENV_METHODS = ("expanduser", "expandvars")
+_ENV_SUFFIXES = (".home",)
 
 
 def _dotted_name(node):
@@ -5198,17 +5200,96 @@ def _top_level_defs(tree):
     }
 
 
-def _env_aliases(tree):
-    """Local names a ``from os import ...`` / ``from os.path import ...``
-    binds to one of ``_ENV_READS``, mapped to the dotted name they stand for."""
-    aliases = {}
+def _is_hook_module(name, trees):
+    """A plain module name that is one of the hook modules: a ``.py`` file
+    next to this one (or, for a self-test, a module it substitutes)."""
+    return "." not in name and (name in trees or os.path.exists(os.path.join(_HOOKS_DIR, f"{name}.py")))
+
+
+def _canonical(dotted, os_aliases):
+    """``dotted`` with a leading alias of ``os`` / ``os.path`` spelled out."""
+    if dotted is None:
+        return None
+    head, _, rest = dotted.partition(".")
+    if head in os_aliases:
+        return os_aliases[head] + ("." + rest if rest else "")
+    return dotted
+
+
+def _env_read_in(node, os_aliases, env_names):
+    """The environment read ``node`` itself is, as a dotted name, or ``None``.
+    Looks at this one node only; callers walk."""
+    if isinstance(node, ast.Attribute):
+        dotted = _canonical(_dotted_name(node), os_aliases)
+        if dotted in _ENV_READS:
+            return dotted
+        if node.attr in _ENV_METHODS:
+            return f"<any>.{node.attr}"
+        if dotted and dotted.endswith(_ENV_SUFFIXES) and dotted.split(".")[-2:-1] == ["Path"]:
+            return dotted
+    elif isinstance(node, ast.Name) and node.id in env_names:
+        return env_names[node.id]
+    elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+          and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+          and isinstance(node.args[1].value, str)):
+        target = _canonical(_dotted_name(node.args[0]), os_aliases)
+        if target in ("os", "os.path") and f"{target}.{node.args[1].value}" in _ENV_READS:
+            return f"getattr({target}, {node.args[1].value!r})"
+    return None
+
+
+def _module_bindings(tree, trees):
+    """What a module's own names stand for, read from its imports and its
+    top-level assignments -- never from a hardcoded list (R10-1, review of
+    60b93b3: a hardcoded list of hook modules silently stops covering the
+    next one added, and five were added in ten days).
+
+    Returns ``(os_aliases, env_names, hook_refs)``:
+      * ``os_aliases``: a local name for ``os`` / ``os.path`` (``import os
+        as o``, ``import os.path as osp``, ``from os import path as p``).
+      * ``env_names``: a local name that IS an environment accessor --
+        ``from os import environ as E``, or a top-level assignment whose
+        value is one (``_E = os.environ``), or a lambda / ``partial(...)``
+        that uses one. A top-level assignment of a value merely COMPUTED
+        from the environment at import time (``_X = os.environ.get(...)``)
+        is not one: reading ``_X`` later reads nothing.
+      * ``hook_refs``: a local name bound to a hook module (``import X`` /
+        ``import X as Y`` -> ``(X, None)``) or to one of its attributes
+        (``from X import a as b`` -> ``(X, "a")``)."""
+    os_aliases, env_names, hook_refs = {"os": "os"}, {}, {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module in ("os", "os.path"):
+        if isinstance(node, ast.Import):
             for alias in node.names:
-                dotted = f"{node.module}.{alias.name}"
-                if dotted in _ENV_READS:
-                    aliases[alias.asname or alias.name] = dotted
-    return aliases
+                if alias.name in ("os", "os.path"):
+                    if alias.asname:
+                        os_aliases[alias.asname] = alias.name
+                elif _is_hook_module(alias.name, trees):
+                    hook_refs[alias.asname or alias.name] = (alias.name, None)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if node.module == "os" and alias.name == "path":
+                    os_aliases[local] = "os.path"
+                elif node.module in ("os", "os.path") and f"{node.module}.{alias.name}" in _ENV_READS:
+                    env_names[local] = f"{node.module}.{alias.name}"
+                elif _is_hook_module(node.module, trees):
+                    hook_refs[local] = (node.module, alias.name)
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        value = getattr(node, "value", None)
+        if value is None:
+            continue
+        accessor = _env_read_in(value, os_aliases, env_names)
+        if accessor is None and (isinstance(value, ast.Lambda) or (
+                isinstance(value, ast.Call) and (_dotted_name(value.func) or "").endswith("partial"))):
+            accessor = next(
+                (r for r in (_env_read_in(sub, os_aliases, env_names) for sub in ast.walk(value)) if r), None
+            )
+        if accessor is not None:
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    env_names[target.id] = accessor
+    return os_aliases, env_names, hook_refs
 
 
 def _worker_entry_points(tree):
@@ -5229,24 +5310,63 @@ def _worker_entry_points(tree):
 
 def _environment_reads_reachable_from(entry_points, trees=None):
     """Every environment read reachable from ``entry_points`` -- ``(module,
-    top-level name)`` pairs -- following bare-name references to that
-    module's own top-level functions and classes and ``<sibling>.<name>``
-    references into the other hook modules, transitively. A class is
-    walked whole (every method), since a call through an instance cannot
-    be resolved statically.
+    top-level name)`` pairs -- in the hook modules.
+
+    Recognised (``_env_read_in``): the accessors in ``_ENV_READS`` spelled
+    as attribute chains, also through an alias of ``os`` / ``os.path``;
+    the same names imported bare; ``getattr(os, "<one of them>")``; a
+    module-level name bound to one of them, or to a lambda / ``partial``
+    using one; any ``.expanduser()`` / ``.expandvars()`` call, whatever
+    the receiver; ``Path.home()``.
+
+    Followed: bare names of the module's own top-level functions and
+    classes (a class is walked whole, every method, since a call through
+    an instance cannot be resolved statically); every hook module the
+    module imports, derived from its imports (``_module_bindings``), by
+    attribute (``_identity.container_id``), by from-import
+    (``from _identity import container_id``) and through a hook module
+    another hook module imports (``_hook_state._identity.container_id``).
+
+    NOT recognised or followed, by design -- the runtime test below is the
+    net for these: an environment reached through data (``sys.modules
+    ["os"]``, ``vars(os)``), a function reached only through data (a value
+    in a dict, such as ``run`` -- the runtime test asserts ``run`` carries
+    no callable), and the standard library's own reads (PATH for the git
+    subprocess, proxy variables in urllib; see memory_sync.py's own P1
+    paragraph).
 
     Returns ``(reads, visited)``: ``reads`` is a sorted list of ``(module,
     function, read, lineno)``; ``visited`` is every ``(module, name)``
     actually examined, so a caller can check the walk was not vacuous.
-    ``trees`` lets a self-test substitute a mutated module."""
+    ``trees`` lets a self-test substitute a mutated or an extra module."""
     trees = dict(trees or {})
     cache = {}
 
     def module_info(module):
         if module not in cache:
             tree = trees.get(module) or _parse_hook_module(module)
-            cache[module] = (_top_level_defs(tree), _env_aliases(tree))
+            cache[module] = (_top_level_defs(tree),) + _module_bindings(tree, trees)
         return cache[module]
+
+    def hook_target(module, dotted):
+        """The ``(hook module, name)`` a dotted reference inside ``module``
+        resolves to through imported hook modules, or ``None``."""
+        parts = dotted.split(".")
+        _defs, _os, _env, refs = module_info(module)
+        if parts[0] not in refs:
+            return None
+        target_module, attr = refs[parts[0]]
+        rest = parts[1:]
+        if attr is not None:
+            return (target_module, attr)
+        while rest:
+            name = rest.pop(0)
+            inner = module_info(target_module)[3].get(name)
+            if inner is not None and inner[1] is None and rest:
+                target_module = inner[0]
+                continue
+            return inner if inner is not None and inner[1] is not None else (target_module, name)
+        return None
 
     reads, visited = set(), set()
     stack = list(entry_points)
@@ -5255,77 +5375,130 @@ def _environment_reads_reachable_from(entry_points, trees=None):
         if (module, name) in visited:
             continue
         visited.add((module, name))
-        defs, aliases = module_info(module)
+        defs, os_aliases, env_names, refs = module_info(module)
         node = defs.get(name)
         if node is None:
-            continue  # a module-level constant, or not defined here: nothing to walk
+            if name in env_names:
+                reads.add((module, name, env_names[name], 0))  # a module attribute that IS an accessor
+            elif name in refs and refs[name][1] is not None:
+                stack.append(refs[name])  # re-exported from another hook module
+            continue  # otherwise a module-level constant: nothing to walk
         for sub in ast.walk(node):
+            read = _env_read_in(sub, os_aliases, env_names)
+            if read is not None:
+                reads.add((module, name, read, sub.lineno))
+                continue
             if isinstance(sub, ast.Attribute):
                 dotted = _dotted_name(sub)
-                if dotted in _ENV_READS:
-                    reads.add((module, name, dotted, sub.lineno))
-                elif isinstance(sub.value, ast.Name) and sub.value.id in _SIBLING_MODULES:
-                    stack.append((sub.value.id, sub.attr))
+                target = hook_target(module, dotted) if dotted else None
+                if target is not None:
+                    stack.append(target)
             elif isinstance(sub, ast.Name):
-                if sub.id in aliases:
-                    reads.add((module, name, aliases[sub.id], sub.lineno))
+                if sub.id in refs and refs[sub.id][1] is not None:
+                    stack.append(refs[sub.id])
                 elif sub.id in defs:
                     stack.append((module, sub.id))
     return sorted(reads), visited
 
 
+def _callables_in(value, path="run"):
+    """Every path under ``value`` that holds something callable. R10-1:
+    ``main()`` must hand the worker DATA -- a function handed down through
+    ``run`` would read whatever it reads when the WORKER calls it, which is
+    exactly what P1 moved out of the worker, and no static walk of the
+    worker's own code can see where such a function came from."""
+    found = []
+    if callable(value):
+        found.append(path)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            found.extend(_callables_in(item, f"{path}[{key!r}]"))
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for index, item in enumerate(value):
+            found.extend(_callables_in(item, f"{path}[{index}]"))
+    return found
+
+
+def _tree_snapshot(root):
+    """Every directory and file under ``root``, relative -- order-free."""
+    found = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        found.add(("dir", rel))
+        found.update(("file", os.path.join(rel, name)) for name in filenames)
+    return found
+
+
 class TestP1WorkerReadsNoConfigurationFromTheEnvironment(_WriteCase):
     """P1 (adversarial review of b3bb60d, 2026-10-03, finding 6), re-pinned
-    by F1 + F5 (review of the env-once round, 2026-10-03): main() reads all
-    seven environment inputs once, on the calling thread, before the
-    worker starts; the worker uses only what was captured.
+    by F1 + F5 (review of 49709b6) and R10-1 / R10-2 (review of 60b93b3):
+    main() reads all seven environment inputs once, on the calling
+    thread, before the worker starts; the worker uses only what was
+    captured.
 
-    Replaces the earlier version of this test, which parked the REAL
-    worker thread, swapped four variables from the test thread and then
-    released it. main()'s own ledger write -- another thread, resolving
-    its path when it runs -- raced that swap: a false red under load (up
-    to 11/40 on this machine), and a narrow window in which the ledger
-    row could land under the developer's real HOME. It also swapped only
-    four of the seven inputs and checked only the token (L5-L8 survived).
+    Replaces an earlier version that parked the REAL worker thread,
+    swapped four variables from the test thread and then released it:
+    main()'s own ledger write -- another thread, resolving its path when
+    it runs -- raced that swap (a false red under load, up to 11/40 on
+    this machine, and a narrow window in which the ledger row could land
+    under the developer's real HOME), and it swapped only four of the
+    seven inputs and checked only the token (L5-L8 survived).
 
     Here nothing runs concurrently. ``_hook_runner.run_with_deadline`` is
     replaced for the WORK call only (the ledger write still goes through
     the real one): the round's own work runs inline, on this thread,
     inside a window in which all seven inputs are sentinels, and that
     window is closed again before main() goes on to its ledger write.
-    Every sentinel has a way to show it was read: a second backend that
-    must receive nothing, a token / user / container that must never
-    appear on a request, a state root that must never be created, a HOME
-    that must stay empty, and a config directory holding a memory file of
-    its own that would be posted if it were listed."""
 
-    def test_the_round_uses_what_main_captured_while_every_input_is_a_sentinel(self):
-        self._write("f1")
-        self.backend.reply(*_empty_lookup())  # orphan reconciliation: nothing to see
-        self.backend.reply(*_empty_lookup()).reply(*_created())  # upsert dedup lookup + POST
+    What each sentinel can and cannot show (R10-2): a second backend that
+    must receive nothing, and a token / user / container that must never
+    appear on a request, expose a late READ of URL, token, user and
+    container directly. A memory file planted under the sentinel config
+    directory AND under ``~/.claude`` in the sentinel HOME exposes a late
+    read of either as a request naming it. The sentinel state root and the
+    sentinel HOME only expose WRITES by themselves; a late READ of the
+    state root shows up only where reading an empty root changes what the
+    round sends -- which is what the steady-state and pending-delete
+    scenarios are for. One scripted round reaches only one set of
+    branches, hence five scenarios (the review's own witnesses W1-W5).
+    Every scenario also checks that ``run``, as the worker receives it,
+    carries no callable (``_callables_in``)."""
 
-        sentinel_backend = _Backend()
-        self.addCleanup(sentinel_backend.close)
-        sentinel_root = os.path.join(self.tmp.name, "sentinel-state-root")
-        sentinel_home = os.path.join(self.tmp.name, "sentinel-home")
-        os.makedirs(sentinel_home)
+    ORIGINAL_TOKEN = "original-token-must-be-the-one-sent"
+
+    def _sentinel_env(self):
+        self.sentinel_backend = _Backend()
+        self.addCleanup(self.sentinel_backend.close)
+        self.sentinel_root = os.path.join(self.tmp.name, "sentinel-state-root")
+        self.sentinel_home = os.path.join(self.tmp.name, "sentinel-home")
         sentinel_config = os.path.join(self.tmp.name, "sentinel-config")
-        sentinel_memory_dir = os.path.join(sentinel_config, "projects", self.key, "memory")
-        os.makedirs(sentinel_memory_dir)
-        _write_memory_file(sentinel_memory_dir, "sentinel-only")
-        sentinel_env = {
-            "NEXUS_API_URL": sentinel_backend.url,
+        for memory_dir in (
+            os.path.join(sentinel_config, "projects", self.key, "memory"),
+            os.path.join(self.sentinel_home, ".claude", "projects", self.key, "memory"),
+        ):
+            os.makedirs(memory_dir)
+            _write_memory_file(memory_dir, "sentinel-only")
+        self.sentinel_home_before = _tree_snapshot(self.sentinel_home)
+        return {
+            "NEXUS_API_URL": self.sentinel_backend.url,
             "NEXUS_API_TOKEN": "sentinel-token-must-never-be-sent",
-            "NEXUS_HOOK_STATE_DIR": sentinel_root,
-            "HOME": sentinel_home,
+            "NEXUS_HOOK_STATE_DIR": self.sentinel_root,
+            "HOME": self.sentinel_home,
             "CLAUDE_CONFIG_DIR": sentinel_config,
             "NEXUS_DEFAULT_USER_ID": "sentinel-user",
             "NEXUS_CONTAINER_ID": "sentinel-box",
         }
 
+    def _run_with_sentinels(self, **original_env):
+        sentinel_env = self._sentinel_env()
         work_name = f"{_MOD.HOOK}-work"
         real_run_with_deadline = _hook_runner.run_with_deadline
-        inline_runs = []
+        real_collect = _MOD._collect
+        inline_runs, callables_handed_down = [], []
+
+        def collect_spy(run):
+            callables_handed_down.extend(_callables_in(run))
+            return real_collect(run)
 
         def work_inline_under_sentinels(target, budget, name):
             if name != work_name:
@@ -5339,47 +5512,123 @@ class TestP1WorkerReadsNoConfigurationFromTheEnvironment(_WriteCase):
                     outcome["error"] = exc
             return outcome, False
 
-        original_token = "original-token-must-be-the-one-sent"
+        env = {"NEXUS_API_TOKEN": self.ORIGINAL_TOKEN, "NEXUS_CONTAINER_ID": CONTAINER}
+        env.update(original_env)
         with mock.patch.object(_identity, "container_id", _REAL_CONTAINER_ID), \
+                mock.patch.object(_MOD, "_collect", collect_spy), \
                 mock.patch.object(_hook_runner, "run_with_deadline", work_inline_under_sentinels):
-            self._run(NEXUS_API_TOKEN=original_token, NEXUS_CONTAINER_ID=CONTAINER)
-
+            self._run(**env)
         self.assertEqual(inline_runs, [work_name], "the round's own work did not run inside the sentinel window")
-        self.assertEqual(sentinel_backend.requests, [], "a request followed a URL read after main() captured its own")
-        self.assertTrue(self.requests, "the round made no request at all -- nothing below would be checked")
+        self.assertEqual(callables_handed_down, [], "main() handed the worker a callable through run")
+
+    def _assert_only_captured_values_were_used(self, token):
+        self.assertEqual(self.sentinel_backend.requests, [], "a request followed a URL read after main() captured its own")
         for request in self.requests:
-            self.assertEqual(request["headers"].get("x-api-key"), original_token, request)
+            self.assertEqual(request["headers"].get("x-api-key"), token, request)
             if request["method"] == "GET":
                 self.assertEqual(request["query"].get("user_id"), USER, request)
                 self.assertEqual(request["query"].get("container_id"), CONTAINER, request)
+            elif request["method"] == "POST":
+                self.assertEqual(request["json"]["user_id"], USER, request)
+                self.assertEqual(request["json"]["metadata"]["container_id"], CONTAINER, request)
+        self.assertNotIn("sentinel-only", json.dumps(self.requests), "a sentinel memory directory was listed")
+        self.assertFalse(os.path.exists(self.sentinel_root), "must never touch the sentinel state root")
+        self.assertEqual(_tree_snapshot(self.sentinel_home), self.sentinel_home_before,
+                         "must never write under the sentinel HOME")
+
+    def test_a_first_sync_uses_what_main_captured_while_every_input_is_a_sentinel(self):
+        self._write("f1")
+        self.backend.reply(*_empty_lookup())  # orphan reconciliation: nothing to see
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # upsert dedup lookup + POST
+        self._run_with_sentinels()
+        self.assertTrue(self.requests, "the round made no request at all -- nothing below would be checked")
+        self._assert_only_captured_values_were_used(self.ORIGINAL_TOKEN)
         posts = [r for r in self.requests if r["method"] == "POST"]
         self.assertEqual(len(posts), 1, self.requests)
-        self.assertEqual(posts[0]["json"]["user_id"], USER)
-        self.assertEqual(posts[0]["json"]["metadata"]["container_id"], CONTAINER)
         self.assertEqual(posts[0]["json"]["metadata"]["external_id"], self._ext("f1"))
-        self.assertFalse(os.path.exists(sentinel_root), "must never touch the sentinel state root")
-        self.assertEqual(os.listdir(sentinel_home), [], "must never write under the sentinel HOME")
         self.assertIn("f1", self._state().get("files", {}))  # written under the ORIGINAL root
         self.assertEqual(self._last_entry()["reason"], "none")
 
+    def test_a_pending_delete_uses_the_captured_root_and_token(self):
+        """W1: a late read of the state root finds no synced entry there,
+        so nothing is queued for deletion; a late token read in the delete
+        path shows up on the DELETE."""
+        self._seed_synced_state("kept", self._write("kept"))
+        path = self._write("gone")
+        self._seed_synced_state("gone", path)
+        os.remove(path)
+        self.backend.reply(200, _page(_row(self._ext("gone")))).reply(204, None)
+        self._run_with_sentinels()
+        self.assertEqual(len([r for r in self.requests if r["method"] == "DELETE"]), 1, self.requests)
+        self._assert_only_captured_values_were_used(self.ORIGINAL_TOKEN)
+        self.assertNotIn("gone", self._state().get("files", {}))
+        self.assertEqual(self._last_entry()["reason"], "none")
+
+    def test_a_steady_state_round_stays_silent(self):
+        """W2: with everything already synced under the captured root, a
+        late read of the (empty) sentinel root would make the round sync
+        again."""
+        self._seed_synced_state("f1", self._write("f1"))
+        self._run_with_sentinels()
+        self.assertEqual(self.requests, [], "steady state must make no request at all")
+        self._assert_only_captured_values_were_used(self.ORIGINAL_TOKEN)
+
+    def test_an_empty_captured_token_is_never_replaced_by_the_environment(self):
+        """W4: a fallback that re-reads the environment only when the
+        captured token is empty never runs while the captured one is set."""
+        self._write("f1")
+        self.backend.reply(*_empty_lookup())
+        self.backend.reply(*_empty_lookup()).reply(*_created())
+        self._run_with_sentinels(NEXUS_API_TOKEN="")
+        self.assertTrue(self.requests)
+        self._assert_only_captured_values_were_used(None)
+
+    def test_an_orphan_delete_uses_the_captured_token(self):
+        """W5: orphan reconciliation's own requests -- the listing and the
+        DELETE -- are a different code path from a file's own sync."""
+        self._write("kept")
+        orphan = _row(self._ext("a"), row_id="aaaaaaaa-1111-4111-8111-111111111111")
+        self.backend.reply(200, _page(orphan))  # reconciliation listing, page 1
+        self.backend.reply(200, _page())  # page 2: empty, the listing is complete
+        self.backend.reply(200, _page(orphan)).reply(204, None)  # the orphan's own lookup + DELETE
+        self.backend.reply(*_empty_lookup()).reply(*_created())  # "kept": lookup + POST
+        self._run_with_sentinels()
+        self.assertEqual(len([r for r in self.requests if r["method"] == "DELETE"]), 1, self.requests)
+        self._assert_only_captured_values_were_used(self.ORIGINAL_TOKEN)
+
+    def test_the_callable_check_finds_a_function_anywhere_in_run(self):
+        """The check every scenario above relies on, against data it must
+        flag and data it must not."""
+        self.assertEqual(_callables_in({"token": "t", "extra": {"n": [1, "x"]}}), [])
+        self.assertEqual(_callables_in({"token": os.getcwd}), ["run['token']"])
+        self.assertEqual(_callables_in({"extra": {"later": [lambda: None]}}), ["run['extra']['later'][0]"])
+
 
 class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
-    """The static half of P1 (F1 + F5, review of the env-once round,
-    2026-10-03). The runtime test above only sees the branches one
-    scripted round takes; this walks EVERY function the worker can reach
-    -- in memory_sync.py and, transitively, in the other hook modules --
-    and fails on an environment read in any of them, taken or not.
-    Deterministic: no thread, no environment change, nothing written."""
+    """The static half of P1 (F1 + F5, review of 49709b6; R10-1, review of
+    60b93b3). The runtime test above only sees the branches its scripted
+    rounds take; this walks every function the worker can reach -- in
+    memory_sync.py and, transitively, in every hook module it imports --
+    and fails on an environment read in any of them, taken or not, for
+    the spellings `_environment_reads_reachable_from` recognises (its
+    docstring lists them, and the ones it does not). Deterministic: no
+    thread, no environment change, nothing written."""
 
     def setUp(self):
         self.roots = _worker_entry_points(_parse_hook_module("memory_sync"))
 
-    def _reads(self, tree=None):
-        trees = {"memory_sync": tree} if tree is not None else None
+    def _reads(self, tree=None, extra=None):
+        trees = dict(extra or {})
+        if tree is not None:
+            trees["memory_sync"] = tree
         return _environment_reads_reachable_from([("memory_sync", r) for r in self.roots], trees)
 
-    def _mutated(self, function, statement):
+    def _mutated(self, function, statement, prelude=None):
+        """memory_sync.py with ``statement`` added to ``function``'s body,
+        and ``prelude`` (module-level statements) added at the top."""
         tree = _parse_hook_module("memory_sync")
+        if prelude:
+            tree.body[0:0] = ast.parse(prelude).body
         _top_level_defs(tree)[function].body.insert(1, ast.parse(statement).body[0])
         return tree
 
@@ -5395,6 +5644,15 @@ class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
         self.assertIn(("_ingest_client", "IngestClient"), visited)
         self.assertIn(("_identity", "memory_dir_key"), visited)
 
+    def test_the_hook_modules_followed_are_derived_from_the_imports(self):
+        """R10-1: the modules followed are read from memory_sync.py's own
+        imports, not from a list -- every hook module it imports is one the
+        walk can enter."""
+        tree = _parse_hook_module("memory_sync")
+        _os, _env, refs = _module_bindings(tree, {})
+        imported = {module for module, attr in refs.values()}
+        self.assertLessEqual({"_hook_runner", "_hook_state", "_identity", "_ingest_client", "_redact"}, imported)
+
     def test_the_same_walk_does_find_main_s_own_reads(self):
         """The control: main() -- on the calling thread -- is where the
         reads moved to, and the same analysis that finds none on the
@@ -5407,25 +5665,51 @@ class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
 
     def test_each_way_back_in_is_caught(self):
         cases = (
-            ("_sync_file", 'os.environ.get("NEXUS_API_TOKEN")'),  # L1-shaped: a late token read
-            ("_collect", 'os.environ.get("NEXUS_API_URL")'),  # L7/L8-shaped: the URL read back
-            ("_delete_file", "_identity.container_id()"),  # L6-shaped
-            ("_sync_file", '_identity.user_id("/x")'),  # L5-shaped
-            ("_reconcile_orphans", "_hook_state.state_root()"),  # L2/L3-shaped
-            ("_collect", '_memory_state_path("k")'),  # only transitively: the convenience form resolves the root
-            ("_list_memory_files", 'os.path.expanduser("~/.claude")'),  # L4-shaped
+            # (function, statement, module-level prelude)
+            ("_sync_file", 'os.environ.get("NEXUS_API_TOKEN")', None),  # L1-shaped: a late token read
+            ("_collect", 'os.environ.get("NEXUS_API_URL")', None),  # L7/L8-shaped: the URL read back
+            ("_delete_file", "_identity.container_id()", None),  # L6-shaped
+            ("_sync_file", '_identity.user_id("/x")', None),  # L5-shaped
+            ("_reconcile_orphans", "_hook_state.state_root()", None),  # L2/L3-shaped
+            ("_collect", '_memory_state_path("k")', None),  # only transitively: the convenience form resolves the root
+            ("_list_memory_files", 'os.path.expanduser("~/.claude")', None),  # L4-shaped
+            # R10-1 (review of 60b93b3): spellings the first version of this walk missed
+            ("_delete_file", 'getattr(os, "environ").get("NEXUS_API_TOKEN")', None),  # E1 / E6 / E9
+            ("_collect", '_LIVE_ENV.get("NEXUS_API_TOKEN")', "_LIVE_ENV = os.environ"),  # E2
+            ("_reconcile_orphans", "_late_token()", '_late_token = lambda: os.environ.get("T")'),
+            ("_reconcile_orphans", "_late_token()", 'import functools\n_late_token = functools.partial(os.getenv, "T")'),
+            ("_sync_file", '_o.environ.get("X")', "import os as _o"),
+            ("_sync_file", '_osp.expanduser("~")', "import os.path as _osp"),
+            ("_delete_file", "_cid()", "from _identity import container_id as _cid"),  # E3
+            ("_delete_file", "_hook_state._identity.container_id()", None),  # through a module _hook_state imports
+            ("_list_memory_files", 'pathlib.Path.home()', "import pathlib"),  # E11
+            ("_list_memory_files", 'pathlib.Path("~").expanduser()', "import pathlib"),
         )
-        for function, statement in cases:
-            with self.subTest(function=function, statement=statement):
-                reads, _ = self._reads(self._mutated(function, statement))
+        for function, statement, prelude in cases:
+            with self.subTest(function=function, statement=statement, prelude=prelude):
+                reads, _ = self._reads(self._mutated(function, statement, prelude))
                 self.assertTrue(reads, f"{statement} in {function} went unnoticed")
 
+    def test_a_new_hook_module_is_followed_without_being_listed(self):
+        """E4 / E13 (review of 60b93b3): a hook module added later, imported
+        by memory_sync.py and read on the worker path, is caught without
+        anyone adding it to a list first."""
+        extra = {"_settings_probe": ast.parse('import os\n\ndef user():\n    return os.environ.get("U")\n')}
+        tree = self._mutated("_sync_file", "_settings_probe.user()", "import _settings_probe")
+        reads, _ = self._reads(tree, extra)
+        self.assertIn(("_settings_probe", "user", "os.environ"), {r[:3] for r in reads})
+
     def test_a_bare_alias_imported_from_os_is_caught_too(self):
-        tree = _parse_hook_module("memory_sync")
-        tree.body.insert(0, ast.parse("from os import getenv as g").body[0])
-        _top_level_defs(tree)["_acquire_run_lock"].body.insert(1, ast.parse('g("X")').body[0])
-        reads, _ = self._reads(tree)
+        reads, _ = self._reads(self._mutated("_acquire_run_lock", 'g("X")', "from os import getenv as g"))
         self.assertIn(("memory_sync", "_acquire_run_lock", "os.getenv"), {r[:3] for r in reads})
+
+    def test_a_value_computed_at_import_is_not_a_late_read(self):
+        """A top-level ``_X = os.environ.get(...)`` is read once, at import;
+        using ``_X`` later reads nothing -- not flagged, unlike an alias of
+        the accessor itself."""
+        baseline, _ = self._reads()
+        reads, _ = self._reads(self._mutated("_sync_file", "_X", '_X = os.environ.get("X")'))
+        self.assertEqual(reads, baseline)
 
     def test_an_os_call_that_reads_no_environment_is_not_flagged(self):
         """Compared with the unmutated walk, not with ``[]``: this pins
@@ -5839,20 +6123,70 @@ class TestRealHomeGuardBranchesArePinnedSeparately(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "did not exist before"):
                 self._check(sentinel, existed_before=False)
 
+    def test_bare_directory_at_the_default_root_is_caught_too(self):
+        """G4 (review of 60b93b3): the bare-directory check runs for the
+        conventional default root as well, not only for whatever
+        NEXUS_HOOK_STATE_DIR names -- here it names an unrelated root, and
+        the new, empty directory appears under the default one."""
+        home_dir = os.environ["HOME"]  # this module's own fake HOME
+        created_top = os.path.join(home_dir, ".nexus")
+        self.assertFalse(os.path.exists(created_top), "the fake HOME must start without .nexus")
+        state_dir = os.path.join(os.path.expanduser(_hook_state.DEFAULT_STATE_DIR), _MOD.HOOK)
+        os.makedirs(state_dir)
+        try:
+            with tempfile.TemporaryDirectory() as unrelated_root:
+                with mock.patch.dict(_REAL_STATE_SUBDIRS_EXISTED_BEFORE, {state_dir: False}), \
+                        mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": unrelated_root}):
+                    with self.assertRaisesRegex(AssertionError, "did not exist before"):
+                        _assert_no_leaked_state_files_for_module()
+        finally:
+            shutil.rmtree(created_top, ignore_errors=True)
+
     def test_a_listing_error_alone_is_not_read_as_no_leak(self):
-        with tempfile.TemporaryDirectory() as sentinel:
-            state_dir = os.path.join(sentinel, _MOD.HOOK)
-            os.makedirs(state_dir)
-            real_listdir = os.listdir
+        """Every errno except ENOENT -- not only EACCES (G2, review of
+        60b93b3: an errno allow-list that read ENOTDIR / EIO as "absent"
+        survived the EACCES-only version of this test)."""
+        for code in (errno.EACCES, errno.EIO, errno.ENOTDIR, errno.ESTALE):
+            with self.subTest(errno=errno.errorcode[code]), tempfile.TemporaryDirectory() as sentinel:
+                state_dir = os.path.join(sentinel, _MOD.HOOK)
+                os.makedirs(state_dir)
+                real_listdir = os.listdir
 
-            def listdir_denied_for_the_state_dir(path="."):
-                if os.fspath(path) == state_dir:
-                    raise PermissionError(errno.EACCES, "simulated", state_dir)
-                return real_listdir(path)
+                def listdir_failing_for_the_state_dir(path=".", _code=code, _dir=state_dir):
+                    if os.fspath(path) == _dir:
+                        raise OSError(_code, os.strerror(_code), _dir)
+                    return real_listdir(path)
 
-            with mock.patch.object(os, "listdir", listdir_denied_for_the_state_dir):
-                with self.assertRaisesRegex(AssertionError, "could not list"):
-                    self._check(sentinel, existed_before=True)
+                with mock.patch.object(os, "listdir", listdir_failing_for_the_state_dir):
+                    with self.assertRaisesRegex(AssertionError, "could not list"):
+                        self._check(sentinel, existed_before=True)
+
+
+class TestRealHomeGuardRecordingIsPinned(unittest.TestCase):
+    """R10-3 (review of 60b93b3): every guard pin above patches
+    `_REAL_STATE_SUBDIRS_EXISTED_BEFORE` itself, so the RECORDING of that
+    table in setUpModule was pinned by nothing -- recording True for
+    everything (mutant G9) left all of them green while the real module
+    cleanup stopped reporting a new, bare memory-sync directory at all.
+    These check the table setUpModule actually recorded."""
+
+    def test_it_covers_exactly_the_two_real_roots(self):
+        self.assertEqual(
+            set(_REAL_STATE_SUBDIRS_EXISTED_BEFORE),
+            {os.path.join(_REAL_STATE_ROOT, _MOD.HOOK), os.path.join(_REAL_DEFAULT_STATE_ROOT, _MOD.HOOK)},
+        )
+
+    def test_a_subdirectory_absent_now_was_recorded_as_absent(self):
+        """Nothing in this module's run deletes a real directory, so one
+        that does not exist now did not exist when it was recorded either.
+        (Where it does exist -- a machine that has run this hook for real
+        -- this cannot tell a right recording from a wrong one; on this
+        machine and in CI it does not exist.)"""
+        for subdir, existed in _REAL_STATE_SUBDIRS_EXISTED_BEFORE.items():
+            with self.subTest(subdir=subdir):
+                self.assertIsInstance(existed, bool)
+                if not os.path.isdir(subdir):
+                    self.assertIs(existed, False, "recorded as existing before this run, but it does not exist")
 
 
 if __name__ == "__main__":

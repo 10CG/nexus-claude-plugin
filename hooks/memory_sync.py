@@ -234,8 +234,11 @@ ingestion`` workflow C; Amendment A8 / A8-2; X1, owner 2026-10-01):
     closed; in-process tests strip the proxy variables for exactly this
     reason. Pinned by ``TestP1WorkerReadsNoConfigurationFromTheEnvironment``
     (every one of the seven values swapped for a sentinel for the whole
-    of the worker's run) and by a static check that no function the
-    worker can reach reads the environment itself. The reads in ``main()``
+    of the worker's run, in five scenarios, plus a check that ``run``
+    hands the worker no callable) and by a static check of every function
+    the worker can reach, in this module and the hook modules it imports,
+    for the spellings of an environment read that check recognises (its
+    own docstring lists them, and the ones it does not). The reads in ``main()``
     sit inside the SAME failure net as the worker (F3, same review): an
     exception there is recorded exactly like one raised by the worker.
     ``_memory_state_path(key)`` /
@@ -2395,14 +2398,27 @@ def main():
             container_id=_identity.container_id(),  # NEXUS_CONTAINER_ID or the hostname; no cwd needed
         )
     except Exception as exc:  # noqa: BLE001 - recorded below, exactly like a worker exception
-        # F3 (review of the env-once round, 2026-10-03): these reads used
-        # to sit inside _collect, so a failure here (today: only
-        # socket.gethostname(), when NEXUS_CONTAINER_ID is unset) reached
-        # run_with_deadline's own net and was recorded as `unknown` with a
-        # stderr line. Moving them in front of that net must not turn the
-        # same failure into an unrecorded, silent exit through
-        # __main__'s blanket `except Exception: pass` -- so it takes the
-        # SAME path below a worker exception takes.
+        # F3 (review of the env-once round, 2026-10-03): moving these reads
+        # in front of run_with_deadline's own net must not turn a failure
+        # in them (today: only socket.gethostname(), when
+        # NEXUS_CONTAINER_ID is unset) into an unrecorded, silent exit
+        # through __main__'s blanket `except Exception: pass` -- so it
+        # takes the SAME path below a worker exception takes: an `unknown`
+        # row plus a stderr line.
+        #
+        # R10-4 (review of 60b93b3, accepted as is): that row is not the
+        # one the same failure produced before P1. Then it surfaced only
+        # where _collect built the client -- a configured round that got
+        # past the run lock and the listing guard -- as `unknown` carrying
+        # the round's own context. Now it surfaces before stdin is read:
+        # no memory_dir / local_files in the row, filed under the process
+        # cwd rather than the payload's, and also written for an
+        # unconfigured round (before: not_configured) and for a round that
+        # lost the run lock (before: no row). Accepted because
+        # gethostname() failing is practically impossible; the exact old
+        # behaviour would need main() to hand the exception to the worker
+        # to re-raise at the old position, one more path for a case that
+        # does not occur.
         outcome, left_behind = {"error": exc}, False
     else:
         outcome, left_behind = _hook_runner.run_with_deadline(
