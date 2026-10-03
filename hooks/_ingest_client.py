@@ -173,7 +173,49 @@ class Outcome:
         self.redacted = 0
         self.dedup_merged = 0
         self.deleted = 0
-        self.status = None  # last HTTP status seen
+        # How many rows `delete()`'s own lookup found on its ONE page (set
+        # only by `delete()`; `upsert()` never touches it). Lets a caller
+        # (memory-sync's own pending-delete bookkeeping, K20) tell "every
+        # row this call could see is now gone" apart from "some rows were
+        # deleted" -- `deleted > 0` alone also covers a PARTIAL success (one
+        # row of several non-abort-rejected) and a FULL page (more
+        # duplicates than `LOOKUP_LIMIT` holds), neither of which this
+        # client itself retries beyond the next run's own lookup.
+        self.found = 0
+        # The RAW row count the lookup page actually carried, before
+        # `_is_ours` verification (R2-C11; set only by `_lookup`). `found`
+        # (above) is the VERIFIED count, which can be smaller than the page
+        # a caller needs to know was FULL -- a page with LOOKUP_LIMIT raw
+        # rows where one fails verification still means more duplicates may
+        # exist beyond it, even though `found` alone reads as "not full".
+        self.page_rows = 0
+        self.status = None  # last HTTP status seen (ANY call on this outcome, e.g. a dedup DELETE)
+        # The status the upsert's OWN write (POST or PATCH) received, set
+        # only by `upsert` right after that call -- never by `_lookup`'s own
+        # GET or `_dedup`'s own DELETE (R2-C04). `status` above is clobbered
+        # by every `_call`, so a caller deciding "did the WRITE itself get a
+        # 404" must read this, not `status` -- a dedup delete that happens
+        # to 404 (counted as success) must not be mistaken for the write.
+        # `None` when the write call never got a response at all (a
+        # transport failure/timeout), distinct from a real 404.
+        self.write_status = None
+        # R4-C4 (memory_sync post_implementation R4): the status of
+        # whichever call actually DECIDED this outcome -- a LOOKUP's own
+        # GET when the lookup itself is what failed (`_refused`, "2xx but
+        # not a memory list", `filter_suspect` -- none of which ever reach
+        # a write call at all), or the SAME value as `write_status` when a
+        # write (`upsert`'s own POST/PATCH) or `_delete_row` is what
+        # decided it. `write_status` itself keeps its own narrower,
+        # unchanged meaning ("the write call's own response") --
+        # `_upsert_retrying_404` depends on exactly that narrow meaning for
+        # its own 404-retry judgment, so it reads `write_status`, never
+        # this field. Set explicitly at each site that KNOWS it is the
+        # deciding call, never computed as a fallback from `status` at read
+        # time (that was R2-C04's own bug one field over: `status` is the
+        # last call SEEN on this outcome, which a dedup DELETE or the
+        # lookup's own GET can leave stale once the real decider gets no
+        # response at all).
+        self.decided_status = None
         self.retry_after = None
         self.detail = None  # last error body / message, for stderr
 
@@ -414,7 +456,14 @@ class IngestClient:
     def _lookup(self, outcome, layer, external_id):
         """The page of rows for ``(layer, container_id, external_id)``, or
         ``None`` after a failure. Rows come back verified: a page that had rows
-        and none of them was ours is ``filter_suspect``."""
+        and none of them was ours is ``filter_suspect``.
+
+        R4-C4: each of this method's three failure returns sets
+        ``outcome.decided_status`` to THIS call's own response status before
+        returning -- this is, by construction, the call that decided the
+        outcome in each of those three cases (a transport failure with no
+        response at all, caught before any of them, leaves it at its
+        default ``None`` instead: there is no status to attribute)."""
         response = self._call(
             outcome,
             "GET",
@@ -427,16 +476,22 @@ class IngestClient:
                 "limit": LOOKUP_LIMIT,
             },
         )
-        if response is None or self._refused(outcome, response, "lookup"):
+        if response is None:
+            return None
+        if self._refused(outcome, response, "lookup"):
+            outcome.decided_status = response.status
             return None
         body = response.json()
         rows = body.get("memories") if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             outcome.fail("http_error", "lookup: 2xx but not a memory list")
+            outcome.decided_status = response.status
             return None
+        outcome.page_rows = len(rows)  # R2-C11: the RAW count, before verification
         verified = [r for r in rows if self._is_ours(r, layer, external_id)]
         if rows and not verified:
             outcome.fail("filter_suspect", f"lookup returned {len(rows)} row(s), none with our keys")
+            outcome.decided_status = response.status
             return None
         if len(rows) >= LOOKUP_LIMIT:
             # More duplicates than one page holds: dedup keeps the earliest
@@ -475,8 +530,27 @@ class IngestClient:
     def _delete_row(self, outcome, memory_id, what):
         """Soft-delete one row. Only the route's own answer counts: 204, or
         404 for a row that is already gone. A 200 with a body is somebody
-        else's page, not a deletion (A8-5)."""
+        else's page, not a deletion (A8-5).
+
+        R3-T06 (memory_sync post_implementation R3): sets ``outcome.
+        write_status`` on every attempt, exactly like ``upsert``'s own
+        POST/PATCH already does -- generalising a name that used to mean
+        "upsert's own write call" to "the write call this Outcome is
+        actually about", covering ``delete()``'s own calls through here
+        too. A caller attributing a DELETE-origin failure (memory_sync's
+        pending-delete / orphan-reconciliation bookkeeping) previously had
+        only ``status`` to read -- the last status ANY call on this
+        outcome received, which an earlier row in the SAME delete loop
+        (when several duplicate rows are found for one external_id) could
+        leave stale once a LATER row's own call got no response at all.
+        Harmless for ``upsert``'s own use of this method (``_dedup``, run
+        BEFORE the real write): ``upsert`` overwrites ``write_status``
+        again right after its own POST/PATCH call, so a dedup delete's
+        value set here is simply superseded, never read in between.
+        """
         response = self._call(outcome, "DELETE", "/memories/" + urllib.parse.quote(memory_id, safe=""))
+        outcome.write_status = response.status if response is not None else None
+        outcome.decided_status = outcome.write_status  # R4-C4: this write/delete call decided it
         if response is None:
             return False
         if response.status in (204, 404):
@@ -564,6 +638,8 @@ class IngestClient:
                 "/memories",
                 body={"user_id": self.user_id, "content": content, "memory_type": "semantic", "metadata": meta},
             )
+            outcome.write_status = response.status if response is not None else None
+            outcome.decided_status = outcome.write_status  # R4-C4: this write/delete call decided it
             if response is None or self._refused(outcome, response, "create"):
                 return outcome
             body = response.json()
@@ -604,6 +680,8 @@ class IngestClient:
             "/memories/" + urllib.parse.quote(row["memory_id"], safe=""),
             body=patch,
         )
+        outcome.write_status = response.status if response is not None else None
+        outcome.decided_status = outcome.write_status  # R4-C4: this write/delete call decided it
         if response is None or self._refused(outcome, response, "update"):
             return outcome
         body = response.json()
@@ -628,6 +706,7 @@ class IngestClient:
         rows = self._lookup(outcome, layer, external_id)
         if rows is None:
             return outcome
+        outcome.found = len(rows)
         if not rows:
             outcome.reasons.append("nothing_to_do")
             return outcome

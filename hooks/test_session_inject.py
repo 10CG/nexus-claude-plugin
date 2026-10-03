@@ -1662,15 +1662,21 @@ class _ReportCase(_LedgerCase):
     """A project whose session-inject ledger already holds one clean run, so
     this is not the very first session start (a missing capture ledger is only
     news after a SessionEnd has had the chance to fire). handoff-sync (change
-    2 TASK-005, the second _EXPECTED_LEDGERS member) is seeded clean too, so
-    existing tests that assert quiet stay quiet by default; a test that wants
-    to exercise handoff-sync's own reporting overwrites this with its own
-    _write_ledger("handoff-sync", ...) call."""
+    2 TASK-005, the second _EXPECTED_LEDGERS member) and memory-sync (change 2
+    TASK-006, the third) are each seeded clean too, so existing tests that
+    assert quiet stay quiet by default; a test that wants to exercise one of
+    them reporting overwrites this with its own _write_ledger(...) call.
+    Without this, every test here that calls _system_message() more than
+    once would start seeing "memory-sync has never recorded a run" from the
+    SECOND call onward: the grace period (A9-9) only silences a newly
+    _EXPECTED_LEDGERS member for the one SessionStart before it is first
+    persisted into seen_expected_ledgers, not forever."""
 
     def setUp(self):
         super().setUp()
         self._write_ledger("session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")])
         self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
+        self._write_ledger("memory-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="memory-sync")])
 
     def _write_ledger(self, hook, entries):
         path = _hook_state.ledger_path(hook, self.cwd)
@@ -1974,6 +1980,51 @@ class TestUpgradeGracePeriod(_LedgerCase):
         state, reasons = _hook_state.read_state("session-inject", self.cwd)
         self.assertEqual(reasons, [])
         self.assertEqual(state.get(_MOD._SEEN_EXPECTED_LEDGERS_KEY), list(_MOD._EXPECTED_LEDGERS))  # repaired
+
+
+class TestR3T02PersistentStateReadFailureSelfHeals(_LedgerCase):
+    """R3-T02 (memory_sync post_implementation R3): ``_hook_state._update_
+    state_file``'s read-before-write used to treat EVERY non-ENOENT read
+    failure (EACCES included) as "could not even confirm this is
+    corrupt, refuse to write" -- for a PERMISSION failure that is
+    genuinely permanent for this uid (unlike a transient EIO), that
+    refusal is what MADE it permanent: the write that would self-heal it
+    (a plain atomic rename, which needs no READ permission on the file
+    being replaced) never ran, so ``seen_expected_ledgers`` never
+    persisted and this hook fell back to the LEGACY expected set
+    forever -- memory-sync (not a legacy member) could then never be
+    reported missing, however many real sessions ran without it."""
+
+    def test_an_eacces_state_file_self_heals_and_memory_sync_is_eventually_reported(self):
+        _hook_state.record_run("session-capture", ok=True, reason="none", cwd=self.cwd)
+        _hook_state.record_run("session-inject", ok=True, reason="none", cwd=self.cwd)
+        path = _hook_state.state_path("session-inject", self.cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        real_open = open
+        real_replace = os.replace
+        blocked = {"on": True}
+
+        def flaky_open(target, *a, **kw):
+            if target == path and blocked["on"]:
+                raise PermissionError(13, "Permission denied")
+            return real_open(target, *a, **kw)
+
+        def spying_replace(src, dst, *a, **kw):
+            result = real_replace(src, dst, *a, **kw)
+            if dst == path:
+                blocked["on"] = False
+            return result
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
+                mock.patch.object(_hook_state.os, "replace", side_effect=spying_replace):
+            self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # round 1: read fails, self-heals
+            out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # round 2: healed
+        parsed = json.loads(out) if out else None
+        self.assertIsNotNone(parsed, "memory-sync's missing ledger must be reported once state has healed")
+        self.assertIn("memory-sync", parsed["systemMessage"])
+        self.assertIn("never", parsed["systemMessage"])
 
 
 class TestExpectedLedgersMatchTheManifest(unittest.TestCase):

@@ -582,6 +582,186 @@ class TestUpdateState(_TempStateDir):
         self.assertEqual(data, {"cursor": 3}, "caller must see what is on disk")
 
 
+class TestExplicitPathState(_TempStateDir):
+    """X1 corollary (owner 2026-10-01): memory-sync's state file is keyed by
+    the memory-dir key, not by project_dir(cwd)'s basename-derived slug --
+    the *_at functions below bypass that keying entirely. Behaviour must be
+    identical to the (name, cwd)-keyed functions; only the path source
+    differs (shared bodies, _read_state_file / _write_state_file /
+    _update_state_file)."""
+
+    def _path(self, *parts):
+        return _hook_state.state_path_at(os.path.join(*parts))
+
+    def test_state_path_at_is_rooted_under_the_overridable_state_root(self):
+        path = _hook_state.state_path_at("memory-sync/-home-dev-nexus.json")
+        self.assertEqual(path, os.path.join(self.root, "memory-sync/-home-dev-nexus.json"))
+
+    def test_round_trips_like_the_name_cwd_api(self):
+        path = self._path("memory-sync", "-x-y.json")
+        self.assertEqual(_hook_state.read_state_at(path), ({}, []))
+        reasons = _hook_state.write_state_at(path, {"cursor": 1})
+        self.assertEqual(reasons, [])
+        self.assertEqual(_hook_state.read_state_at(path), ({"cursor": 1}, []))
+
+    def test_update_state_at_locks_the_read_modify_write(self):
+        path = self._path("memory-sync", "-x-y.json")
+        new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 7})
+        self.assertEqual((new, reasons), ({"cursor": 7}, []))
+        new, _ = _hook_state.update_state_at(path, lambda s: {**s, "n": s.get("cursor", 0) + 1})
+        self.assertEqual(new, {"cursor": 7, "n": 8})
+
+    def test_a_corrupt_file_rebuilds_from_empty_and_reports_unknown(self):
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(_hook_state.read_state_at(path), ({}, ["unknown"]))
+
+    def test_a_transient_read_failure_during_update_does_not_overwrite_healthy_state(self):
+        """R2-C06: a read-side OSError that is NOT corruption (EIO, ESTALE,
+        too many open files, ...) must not be treated as "nothing here,
+        safe to rebuild" -- update_state_at must refuse to write at all,
+        leaving the file's real (healthy) content on disk untouched, and
+        report the genuine failure as state_write_failed. The previous
+        behaviour silently overwrote a HEALTHY file with data derived from
+        an empty dict, because the read side folded "could not even read
+        it" and "read it, it is corrupt" into the same unknown reason."""
+        path = self._path("memory-sync", "-x-y.json")
+        healthy = {"cursor": 7, "files": {"f1": {"file_hash": "sha256:ok"}}}
+        reasons = _hook_state.write_state_at(path, healthy)
+        self.assertEqual(reasons, [])
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == path:
+                raise OSError(5, "Input/output error")
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
+                mock.patch("sys.stderr"):
+            new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 99})
+        # The read side also reports its own `unknown` (it could not even
+        # open the file) alongside the genuine `state_write_failed` --
+        # callers that only react to `state_write_failed` (every
+        # memory_sync.py call site, via `_fold_persist_reasons`) are
+        # unaffected either way; this assertion is about the failure
+        # actually being there, not about it being the ONLY one.
+        self.assertIn("state_write_failed", reasons)
+        # Read it back for REAL, outside the patch: the file on disk must
+        # be exactly what it was before the failed update, not {} and not
+        # a mutation applied to {}.
+        on_disk, read_reasons = _hook_state.read_state_at(path)
+        self.assertEqual(on_disk, healthy)
+        self.assertEqual(read_reasons, [])
+
+    def test_an_eacces_read_failure_during_update_self_heals_via_rename(self):
+        """R3-T02: EACCES/EPERM are NOT the same shape as a transient EIO
+        -- this uid cannot read this file now and will not be able to
+        later either (the permission bits, or the owner, are what is
+        wrong), so the file's CONTENT is already useless to this process,
+        exactly like a missing or corrupt one. The normal atomic-rename
+        write only needs write+execute on the DIRECTORY, not on the file
+        being replaced, so it still succeeds even though this open()
+        itself cannot -- self-healing the condition instead of refusing
+        to write forever (which is what made the condition permanent:
+        R2-C06 treated EVERY non-ENOENT OSError, EACCES included, as
+        "could not confirm safe, refuse")."""
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"cursor": 1}')
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == path:
+                raise PermissionError(13, "Permission denied")
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
+                mock.patch("sys.stderr") as stderr:
+            new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 99})
+        self.assertNotIn("state_write_failed", reasons)
+        self.assertEqual(new, {"cursor": 99})
+        self.assertTrue(stderr.write.called, "the read failure must still be diagnosed on stderr")
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn(path, printed)
+        # Read it back for REAL, outside the patch: the rename genuinely landed.
+        on_disk, read_reasons = _hook_state.read_state_at(path)
+        self.assertEqual(on_disk, {"cursor": 99})
+        self.assertEqual(read_reasons, [])
+
+    def test_an_eio_read_failure_during_update_still_refuses_with_a_diagnostic(self):
+        """The other half of the same split: a TRANSIENT failure (EIO and
+        friends) stays NOT rebuildable, unchanged from R2-C06 -- but now
+        prints a distinct "refusing to overwrite" diagnostic alongside
+        the read-side one, where the previous code printed nothing at all
+        on this branch."""
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"cursor": 1}')
+        real_open = open
+
+        def flaky_open(target, *a, **kw):
+            if target == path:
+                raise OSError(5, "Input/output error")
+            return real_open(target, *a, **kw)
+
+        with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
+                mock.patch("sys.stderr") as stderr:
+            new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 99})
+        self.assertIn("state_write_failed", reasons)
+        self.assertTrue(stderr.write.called)
+        printed = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn(path, printed)
+        self.assertIn("refusing", printed.lower())
+
+    def test_corrupt_json_during_an_update_still_rebuilds_and_is_not_a_failure(self):
+        """The other half of the same split: a file that reads fine at the
+        OS level but is not valid JSON (or not a JSON object) is genuine
+        corruption, not a transient failure -- update_state_at may rebuild
+        from empty exactly as before, and that rebuild is NOT itself
+        state_write_failed (ruling item 4: a repaired corrupt file whose
+        write still lands is not a failure)."""
+        path = self._path("memory-sync", "-x-y.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        new, reasons = _hook_state.update_state_at(path, lambda s: {**s, "cursor": 1})
+        self.assertEqual(new, {"cursor": 1})
+        self.assertNotIn("state_write_failed", reasons)
+        self.assertIn("unknown", reasons)
+        self.assertEqual(_hook_state.read_state_at(path), ({"cursor": 1}, []))
+
+    def test_two_cwds_sharing_a_basename_get_distinct_paths(self):
+        """The exact X1 corollary failure shape: two worktrees both named
+        "nexus" must not resolve to the same state file the way
+        state_path(name, cwd) -- keyed by project_dir's basename slug --
+        would."""
+        key_a = "-home-dev-nexus"
+        key_b = "-home-dev-worktrees-nexus"
+        path_a = _hook_state.state_path_at(f"memory-sync/{key_a}.json")
+        path_b = _hook_state.state_path_at(f"memory-sync/{key_b}.json")
+        self.assertNotEqual(path_a, path_b)
+        _hook_state.write_state_at(path_a, {"files": {"f1": 1}})
+        _hook_state.write_state_at(path_b, {"files": {"f1": 2}})
+        self.assertEqual(_hook_state.read_state_at(path_a)[0], {"files": {"f1": 1}})
+        self.assertEqual(_hook_state.read_state_at(path_b)[0], {"files": {"f1": 2}})
+
+    def test_write_failure_returns_state_write_failed(self):
+        path = self._path("memory-sync", "-x-y.json")
+        with mock.patch.object(_hook_state, "_atomic_write", side_effect=OSError("read-only fs")):
+            reasons = _hook_state.write_state_at(path, {"cursor": 1})
+        self.assertEqual(reasons, ["state_write_failed"])
+
+    def test_refuses_a_non_dict(self):
+        path = self._path("memory-sync", "-x-y.json")
+        with mock.patch("sys.stderr"):
+            reasons = _hook_state.write_state_at(path, ["not", "a", "dict"])
+        self.assertEqual(reasons, ["state_write_failed"])
+
+
 class TestStateWriteFailure(_TempStateDir):
     def test_write_state_returns_a_reason_instead_of_raising(self):
         """Propagating here is the quietest option, not the loudest.
@@ -721,6 +901,48 @@ class TestWorstReason(_TempStateDir):
         self.assertEqual(
             _hook_state.worst_reason(["unchanged", "no_handoff"]), "unchanged"
         )
+
+
+class TestAlsoFailed(unittest.TestCase):
+    """A9-20's new shared helper (memory-sync, TASK-006, is its first
+    caller): what worst_reason's single-scalar collapse would otherwise
+    bury, recovered for a ledger entry's own extra['also_failed']."""
+
+    def test_the_reason_worst_reason_buried_comes_back(self):
+        reasons = ["dedup_merged", "http_error"]
+        chosen = _hook_state.worst_reason(reasons)
+        self.assertEqual(chosen, "http_error")  # priority table beats dedup_merged
+        self.assertEqual(_hook_state.also_failed(reasons, chosen), ["dedup_merged"])
+
+    def test_the_chosen_reason_is_never_repeated_even_if_it_recurs(self):
+        reasons = ["http_error", "dedup_merged", "http_error"]
+        self.assertEqual(_hook_state.also_failed(reasons, "http_error"), ["dedup_merged"])
+
+    def test_skip_reasons_are_never_included(self):
+        """A skip sitting next to a real failure is already correctly
+        silent; also_failed must not turn into a second, uncurated dump of
+        everything that happened this round."""
+        reasons = ["unchanged", "not_owner", "http_error"]
+        self.assertEqual(_hook_state.also_failed(reasons, "http_error"), [])
+
+    def test_duplicates_are_deduplicated_in_first_seen_order(self):
+        reasons = ["orphan_guard", "rejected_422", "orphan_guard", "timeout"]
+        chosen = _hook_state.worst_reason(reasons)
+        self.assertEqual(chosen, "timeout")
+        self.assertEqual(
+            _hook_state.also_failed(reasons, chosen), ["orphan_guard", "rejected_422"]
+        )
+
+    def test_a_single_reason_run_has_nothing_also_failed(self):
+        self.assertEqual(_hook_state.also_failed(["unchanged"], "unchanged"), [])
+        self.assertEqual(_hook_state.also_failed(["http_error"], "http_error"), [])
+
+    def test_empty_and_none_are_empty(self):
+        self.assertEqual(_hook_state.also_failed([], "unknown"), [])
+        self.assertEqual(_hook_state.also_failed(None, "unknown"), [])
+
+    def test_a_bare_string_is_not_iterated_per_character(self):
+        self.assertEqual(_hook_state.also_failed("timeout", "unknown"), ["timeout"])
 
 
 def _http_error(code):
