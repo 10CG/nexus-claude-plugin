@@ -388,7 +388,7 @@ class _TranscriptCase(unittest.TestCase):
 class TestGate4DroppedCountsAddUp(_TranscriptCase):
 
     def test_by_action_sums_to_total_across_several_actions(self):
-        selected, stats = sc._parse_transcript(self._transcript(self._overflow_lines()))
+        selected, stats, _p, _r = sc._parse_transcript(self._transcript(self._overflow_lines()))
         dropped = stats["dropped"]
         self.assertEqual(set(dropped), {"total", "by_action", "strategy"})
         self.assertEqual(dropped["total"], 280 - sc._MAX_ACTIVITIES)
@@ -414,7 +414,7 @@ class TestGate5UntruncatedRunsStillCarryTheKey(_TranscriptCase):
     def test_zero_drops_are_written_not_omitted(self):
         lines = [_tool_line("Edit", {"file_path": "/a/1.py"}), _user_line("hello"),
                  _tool_line("Bash", {"command": "git push"})]
-        selected, stats = sc._parse_transcript(self._transcript(lines))
+        selected, stats, _p, _r = sc._parse_transcript(self._transcript(lines))
         self.assertEqual(len(selected), 3)
         self.assertEqual(stats["dropped"], {"total": 0, "by_action": {}, "strategy": "layered"})
         self.assertIsNone(stats["tiering_error"])
@@ -434,7 +434,7 @@ class TestGate5UntruncatedRunsStillCarryTheKey(_TranscriptCase):
 
     def test_each_activity_gets_its_own_payload_object(self):
         lines = [_tool_line("Edit", {"file_path": f"/a/{i}.py"}) for i in range(4)]
-        selected, stats = sc._parse_transcript(self._transcript(lines))
+        selected, stats, _p, _r = sc._parse_transcript(self._transcript(lines))
         activities = sc._build_activities(selected, "c1", None, "s1", stats["dropped"])
         payloads = [item["activity_data"]["internal"]["capture_dropped"] for item in activities]
         self.assertEqual(len({id(p) for p in payloads}), len(activities), "injected per activity, not shared")
@@ -444,7 +444,7 @@ class TestGate5UntruncatedRunsStillCarryTheKey(_TranscriptCase):
         """stats["dropped"]["strategy"] is the selector's verdict (3 values);
         telemetry_failed exists only on the wire, written by _build_activities."""
         for lines in (self._overflow_lines(), [_tool_line("Edit", {"file_path": "/a/1.py"})]):
-            _, stats = sc._parse_transcript(self._transcript(lines))
+            _, stats, _p, _r = sc._parse_transcript(self._transcript(lines))
             self.assertIn(stats["dropped"]["strategy"], {"layered", "degenerate", "fallback_tail"})
 
 

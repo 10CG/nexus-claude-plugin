@@ -11,13 +11,13 @@
 | Field | Value |
 |-------|-------|
 | **Plugin name** | `nexus-memory` (per `.claude-plugin/plugin.json` `name` field) |
-| **Plugin version** | `0.2.5` |
+| **Plugin version** | `0.6.0` |
 | **Backing npm package** | [`@nexusm/mcp-server@0.1.4`](https://www.npmjs.com/package/@nexusm/mcp-server) (`.mcp.json` pin; 0.1.4 = NEXUS_API_URL `/v1` auto-normalize + opt-in `NEXUS_DEFAULT_USER_ID` server-side user_id pin) |
 | **Capabilities** | 4 MCP tools (`nexus.context_retrieve` / `memory_search` / `memory_create` / `memory_feedback`) **+ a `UserPromptSubmit` hook** that deterministically routes write intent → `memory_create` and cross-session recall → `context_retrieve` (the SKILL.md discrimination layer is now hook-backed, not prose-only) |
 | **Canonical source** | GitHub mirror at https://github.com/10CG/nexus-claude-plugin (auto-synced from Forgejo `10CG/nexus-claude-plugin`; HEAD `2b4d6fe`) |
 | **Forgejo origin** | https://forgejo.10cg.pub/10CG/nexus-claude-plugin (issues/PRs land here; GitHub is mirror only) |
 | **Submission status** | ✅ **Shipped** via the GitHub marketplace model (same as 10CG aria/aether) — install: `/plugin marketplace add 10CG/nexus-claude-plugin`. No Anthropic form/approval. Optional community-catalog listing not pursued. |
-| **Last update** | 2026-06-21 — dogfood 5/5; marketplace.json aligned to 10CG pattern (0.2.5) |
+| **Last update** | 2026-10-22 — 0.6.0: SessionEnd capture per-session send watermark (plugin#49, sends only transcript delta; backend dedup as the net) |
 
 ---
 

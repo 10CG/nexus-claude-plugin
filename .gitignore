@@ -1,3 +1,6 @@
 # Python bytecode cache (hook is stdlib Python, no build artifacts tracked)
 __pycache__/
 *.py[cod]
+
+# Aria coordination runtime artifacts (claim telemetry / context cache -- written by the aria plugin into whatever repo it coordinates, never source)
+.aria/
