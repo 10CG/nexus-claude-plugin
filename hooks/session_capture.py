@@ -48,6 +48,22 @@ Design contract (proposal nexus-replace-claude-mem workflow C):
     strategy}; ``internal`` is the key the backend keeps out of the LLM
     prompt). If the selector itself raises, the run falls back to the plain
     tail and is recorded / reported as ``capture_tiering_degraded``.
+  - PER-SESSION SEND WATERMARK (plugin#49 / nexus#468 layer 1): a resumed
+    SessionEnd used to re-POST the whole bounded list, so a session that ends
+    twice sent its tail twice (71% of prod's duplicate rows). Each successful
+    run now persists, per session_id, how many RAW transcript lines it
+    consumed plus a sha256 over them (``_hook_state`` "session-capture"
+    state, bounded to the newest 64 sessions); the next run verifies the
+    prefix hash and sends ONLY what the transcript gained. Anything that
+    invalidates the watermark -- first run of a session, no session_id in
+    the payload, a rewritten/shortened prefix (compaction edits transcripts
+    in place), eviction, another machine -- costs one full resend, which the
+    backend's idempotent ingestion folds (nexus #468 A); a non-zero
+    ``deduped`` in the response is logged on stderr as the watermark's own
+    self-check signal. The watermark advances only after a successful POST
+    (or after a run that found nothing new to send); a failed POST leaves it
+    where it was, so the delta retries at the next SessionEnd. Adjacent
+    identical payloads are folded before selection (polling-command bursts).
       * assistant message tool_use block -> mapped action via _classify_tool:
           Edit  -> edit_file        Write -> create_file      Read  -> read_file
           Bash 'git commit'  -> commit
@@ -93,6 +109,7 @@ Design contract (proposal nexus-replace-claude-mem workflow C):
 """
 
 import collections
+import hashlib
 import json
 import os
 import sys
@@ -227,9 +244,18 @@ _WORK_BUDGET_SECONDS = 20.0
 # quiet session, it is a format this parser no longer understands. Below the
 # threshold it is just a session that was opened and closed.
 _SHAPE_SUSPECT_MIN_LINES = 20
-_USER_AGENT = "nexus-session-capture-hook/0.4"
+_USER_AGENT = "nexus-session-capture-hook/0.5"
 _SUMMARY_CAP = 200  # max chars of a command / path summary
 _USER_TEXT_CAP = 500  # max chars of a captured user message
+
+# ── Per-session send watermark (plugin#49) ──────────────────────────────────────
+# State file name (via _hook_state.state_path -> "<name>.state.json", a
+# DIFFERENT file from the "<hook>.json" ledger) and the bound on how many
+# sessions' watermarks are kept. Eviction is the designed degradation: a
+# session that resumes after falling out of the map pays one full resend,
+# which the backend folds (nexus #468 A).
+_WATERMARK_STATE = "session-capture"
+_WATERMARK_SESSIONS_MAX = 64
 
 # Bash command substring -> run_test classification markers.
 _TEST_MARKERS = ("pytest", "jest", "go test", "npm test", "vitest")
@@ -606,40 +632,84 @@ def _extract_from_entry(entry):
     return
 
 
-def read_activities(path):
-    """Read a JSONL transcript into its FULL activity pool. Returns ``(full, stats)``.
+def _hash_prefix(path, n):
+    """sha256 over the first ``n`` RAW lines of ``path``. Returns
+    ``(hexdigest, lines_seen)``; ``lines_seen < n`` means the file is shorter
+    than the watermark remembers (rewritten / compacted). No buffering: the
+    prefix of a long transcript is streamed and discarded.
 
-    ``full`` is every (action, activity_data_partial) pair that survives the
-    low-signal source filter, in session order and with NO cap -- the cap is
-    _parse_transcript's job (select_activities). Defensive: each line is
-    JSON-decoded independently; a bad/blank/non-dict line is skipped, never
-    fatal. An unreadable FILE, on the other hand, raises: this function is
-    deliberately wrapped in no try/except, because its OSError is the one
-    path by which _collect tells ``file_unparsable`` (a reported failure)
-    from ``nothing_to_do`` (a quiet skip).
-
-    ``stats`` counts non-blank ``lines``, lines that ``parsed`` as JSON and
-    ``messages`` (user / assistant entries) -- what _unreadable reads -- and
-    carries ``tiering_error`` (None here; _parse_transcript fills it with an
-    exception class name when the selector fails). Downstream reads these
-    keys by index, so every key is present from the start.
-
-    Public surface, no underscore on purpose: imported across repos by
-    nexus:scripts/replay_session_capture.py (with select_activities,
-    _MAX_ACTIVITIES and _HIGH_VALUE_ACTIONS) so the offline replay runs the
-    production reader rather than a copy of it. Renaming or re-shaping it
-    means updating that script.
+    The unit is the RAW line, blank lines included, hashed exactly as read
+    (text mode with errors="replace": the same bytes produce the same
+    replacement characters and the same digest next run). A watermark keyed
+    on non-blank lines or parsed entries could not detect a rewrite that
+    only shuffles blank lines / formatting.
     """
-    full = []
-    stats = {"lines": 0, "parsed": 0, "messages": 0, "tiering_error": None}
+    digest = hashlib.sha256()
+    seen = 0
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            line = line.strip()
-            if not line:
+            if seen >= n:
+                break
+            digest.update(line.encode("utf-8", "replace"))
+            seen += 1
+    return digest.hexdigest(), seen
+
+
+def read_activities_incremental(path, resume=None):
+    """Read a JSONL transcript into its activity pool, optionally resuming
+    past an already-sent prefix. Returns ``(full, stats, prefix, resumed)``.
+
+    ``resume`` is a previous run's watermark, ``{"lines": N, "sha256": hex}``.
+    When the first ``N`` raw lines hash to ``sha256`` the prefix is confirmed
+    intact, extraction starts AFTER it and ``resumed`` is True -- only what
+    the transcript gained since the last successful run is returned. Anything
+    else (no resume, a shorter file, a rewritten prefix, a malformed
+    watermark) reads the whole file with ``resumed`` False: a lost watermark
+    costs one full resend, which the backend's idempotent ingestion folds
+    (nexus #468 A). ``resume["lines"] == 0`` is a valid trivial watermark
+    (nothing sent yet) and always matches.
+
+    ``prefix`` is THIS run's watermark: the total RAW line count consumed and
+    a running sha256 over all of them -- extraction position and consumption
+    position coincide by the time the read finishes, so the caller persists
+    ``prefix`` as the next run's resume point. It is computed even on a
+    resume miss (the whole file was consumed), which is exactly right.
+
+    ``full`` / ``stats`` are read_activities's own contract (below): the
+    low-signal-filtered pool in session order with no cap, and the same four
+    counters. Defensive per line; the unreadable FILE still raises, for the
+    same ``file_unparsable`` split as read_activities.
+
+    This is the ONE reader; ``read_activities`` is its no-resume view.
+    """
+    skip = -1
+    if isinstance(resume, dict):
+        n, sha = resume.get("lines"), resume.get("sha256")
+        if type(n) is int and n >= 0 and isinstance(sha, str) and sha:
+            try:
+                got, seen = _hash_prefix(path, n)
+            except OSError:
+                got, seen = "", -1  # let the main pass below raise the real error
+            if seen == n and got == sha:
+                skip = n
+    resumed = skip >= 0
+
+    full = []
+    stats = {"lines": 0, "parsed": 0, "messages": 0, "tiering_error": None}
+    digest = hashlib.sha256()
+    count = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            digest.update(line.encode("utf-8", "replace"))
+            count += 1
+            if count <= skip:
+                continue
+            stripped = line.strip()
+            if not stripped:
                 continue
             stats["lines"] += 1
             try:
-                entry = json.loads(line)
+                entry = json.loads(stripped)
             except Exception:
                 continue  # malformed line -> skip
             stats["parsed"] += 1
@@ -656,6 +726,37 @@ def read_activities(path):
                 except Exception:
                     pass
                 full.append((action, ad))
+    return full, stats, {"lines": count, "sha256": digest.hexdigest()}, resumed
+
+
+def read_activities(path):
+    """Read a JSONL transcript into its FULL activity pool. Returns ``(full, stats)``.
+
+    The no-resume view of ``read_activities_incremental`` (same reader, whole
+    file, no watermark): ``full`` is every (action, activity_data_partial)
+    pair that survives the low-signal source filter, in session order and
+    with NO cap -- the cap is _parse_transcript's job (select_activities).
+    Defensive: each line is JSON-decoded independently; a bad/blank/non-dict
+    line is skipped, never fatal. An unreadable FILE, on the other hand,
+    raises: this function is deliberately wrapped in no try/except, because
+    its OSError is the one path by which _collect tells ``file_unparsable``
+    (a reported failure) from ``nothing_to_do`` (a quiet skip).
+
+    ``stats`` counts non-blank ``lines``, lines that ``parsed`` as JSON and
+    ``messages`` (user / assistant entries) -- what _unreadable reads -- and
+    carries ``tiering_error`` (None here; _parse_transcript fills it with an
+    exception class name when the selector fails). _parse_transcript adds
+    ``folded`` / ``dropped`` on top; this pure view stays exactly what its
+    cross-repo importers expect. Downstream reads these keys by index, so
+    every key is present from the start.
+
+    Public surface, no underscore on purpose: imported across repos by
+    nexus:scripts/replay_session_capture.py (with select_activities,
+    _MAX_ACTIVITIES and _HIGH_VALUE_ACTIONS) so the offline replay runs the
+    production reader rather than a copy of it. Renaming or re-shaping it
+    means updating that script.
+    """
+    full, stats, _, _ = read_activities_incremental(path)
     return full, stats
 
 
@@ -664,15 +765,58 @@ def _count_actions(items):
     return dict(collections.Counter(action for action, _ in items))
 
 
-def _parse_transcript(path):
-    """Parse a JSONL transcript. Returns ``(extracted, stats)``.
+def _fold_consecutive(pool):
+    """Collapse ADJACENT identical (action, activity_data_partial) pairs to
+    their first occurrence. Returns ``(folded_pool, folded_count)``.
+
+    plugin#49: the polling-command burst -- the same ``nomad job status``
+    run five times in a row yields five byte-identical payloads, and the
+    backend folds identical payloads within one batch anyway (nexus #468 A,
+    ``deduped{reason="within_batch"}``); folding here first saves the wire
+    bytes and the batch slots. ADJACENT ONLY: the same command an hour apart
+    is two events and stays two.
+
+    The comparison is over the semantic fields alone (provenance and the
+    capture_dropped telemetry are injected later, by _build_activities).
+    A partial that will not serialise never folds (kept as-is) -- folding
+    must not cost the activity.
+    """
+    folded = []
+    count = 0
+    prev_key = object()  # unique sentinel: never equal to any real key
+    for item in pool:
+        try:
+            key = (item[0], json.dumps(item[1], sort_keys=True, ensure_ascii=False))
+        except Exception:
+            key = None  # malformed / unserialisable element: keep, never fold
+        if key is not None and key == prev_key:
+            count += 1
+            continue
+        folded.append(item)
+        prev_key = key
+    return folded, count
+
+
+def _parse_transcript(path, resume=None):
+    """Parse a JSONL transcript, optionally past an already-sent prefix.
+    Returns ``(extracted, stats, prefix, resumed)``.
+
+    ``prefix``/``resumed`` come from read_activities_incremental (the
+    caller's next watermark / whether it matched); ``stats["folded"]`` is
+    the adjacent-duplicate fold count (_fold_consecutive runs here, on the
+    delta-only pool when a resume matched). NOTE the watermark interaction:
+    what the cap drops out of a DELTA pool is dropped for good -- the
+    watermark advances past those lines. The pre-watermark behaviour was the
+    same loss per run (the selection is deterministic), so nothing
+    regresses; the backend fold makes the de-facto retry moot.
 
     ``extracted`` is at most _MAX_ACTIVITIES (action, activity_data_partial)
     pairs chosen by select_activities: the high-value tiers protected, both
     ends kept when a tier overflows, session order preserved. ``stats`` is
     read_activities's dict plus ``dropped`` = {total, by_action, strategy}:
-    ``total`` counts what the CAP dropped -- len(full) - len(extracted); the
-    pool is already past _is_low_signal, so source-filter drops are never in
+    ``total`` counts what the CAP dropped -- len(pool) - len(extracted); the
+    pool is already past _is_low_signal and the adjacent-duplicate fold, so
+    neither's drops are ever in
     it -- ``by_action`` sums to ``total`` under ``layered`` / ``degenerate``
     and is ``{}`` when ``total`` is 0; under ``fallback_tail`` it is
     best-effort (``{}`` when the pool itself cannot be broken down, see
@@ -689,9 +833,11 @@ def _parse_transcript(path):
     complete dict (block 3), and ``stats["tiering_error"]`` carries the
     exception class name -- outside ``dropped``, which is copied onto the
     wire whole. The reader call itself stays OUTSIDE the try: see
-    read_activities.
+    read_activities_incremental.
     """
-    full, stats = read_activities(path)
+    full, stats, prefix, resumed = read_activities_incremental(path, resume)
+    full, folded = _fold_consecutive(full)
+    stats["folded"] = folded
     try:
         extracted, strategy, by_action = select_activities(full)
     except Exception as exc:  # fail-open block 1: never lose the capture to the selector
@@ -706,11 +852,11 @@ def _parse_transcript(path):
             # the upload is not. `total` below still counts.
             by_action = {}
     stats["dropped"] = {
-        "total": len(full) - len(extracted),  # cap drops only: the pool is past _is_low_signal
+        "total": len(full) - len(extracted),  # cap drops only: past _is_low_signal and the fold
         "by_action": by_action,
         "strategy": strategy,
     }
-    return extracted, stats
+    return extracted, stats, prefix, resumed
 
 
 def _unreadable(stats):
@@ -791,8 +937,8 @@ def _build_activities(extracted, container_id, branch, session_id, dropped):
 
 
 def _post(base_url, token, agent_id, activities):
-    """POST the ActivityStreamRequest to /activities/stream. Returns how many
-    activities the backend acknowledged; raises on failure (caller is wrapped in
+    """POST the ActivityStreamRequest to /activities/stream. Returns
+    ``(accepted, deduped)``; raises on failure (caller is wrapped in
     fail-open).
 
     The response used to be drained and ignored, so ANY 2xx counted as a
@@ -800,6 +946,11 @@ def _post(base_url, token, agent_id, activities):
     by urllib as a GET, comes back 200 text/html, and was recorded as a clean
     run with nothing captured. The backend's answer is 201 with an integer
     `accepted`; anything else is not an acknowledgement.
+
+    ``deduped`` (nexus #468 A) counts identical payloads the backend folded
+    -- resent past the client's watermark or repeated within the batch. A
+    backend older than #468 omits the field; that is not an error, and the
+    count reads 0. `type is`, so True is never 1.
     """
     body = {"agent_id": agent_id, "activities": activities}
     data = json.dumps(body).encode("utf-8")
@@ -823,7 +974,95 @@ def _post(base_url, token, agent_id, activities):
     accepted = answer.get("accepted") if isinstance(answer, dict) else None
     if type(accepted) is not int or accepted <= 0:  # `type is`, so True is not 1
         raise _BadResponse(f"no activities acknowledged (accepted={accepted!r})")
-    return accepted
+    deduped = answer.get("deduped") if isinstance(answer, dict) else None
+    if type(deduped) is not int or deduped < 0:
+        deduped = 0  # absent/negative = a backend older than nexus #468: not an error
+    return accepted, deduped
+
+
+def _load_watermark(session_id, cwd):
+    """The persisted send watermark for this session, or None. Read side.
+
+    Called from the WORK thread: ``_hook_state.read_state`` is read-only and
+    its only stderr path is an OSError on open (corrupt JSON and a missing
+    file are silent by contract -- ``_read_state_file_detailed``), so the
+    thread's stay-off-stdio rule is bent for a rare, diagnostic print
+    rather than duplicating the shared reader's corruption handling here.
+    A watermark that fails to load is simply no watermark: one full resend,
+    folded by the backend (nexus #468 A).
+    """
+    if not session_id or _hook_state is None:
+        return None
+    try:
+        state, _reasons = _hook_state.read_state(_WATERMARK_STATE, cwd)
+    except Exception:
+        return None
+    if not isinstance(state, dict):
+        return None
+    entry = state.get("sessions", {}).get(session_id)
+    return entry if isinstance(entry, dict) else None
+
+
+def _advance_watermark(session_id, cwd, prefix):
+    """Persist the new send watermark. Returns ``(left_behind, reasons)``.
+
+    Runs in the MAIN thread (after the work thread joined): the write's
+    failure prints go to stderr, which the work thread stays off; same
+    pattern and same 2 s budget as the ledger write in _record. Never
+    raises -- ``update_state`` does not raise by contract, and the net
+    under it turns anything else into an ``unknown`` reason. A write that
+    had to be abandoned counts as ``state_write_failed``: this session's
+    watermark is not confirmed persisted, and that is the honest signal
+    (the next run resends and the backend folds -- visible via ``deduped``).
+    """
+    reasons = []
+    if not session_id or _hook_state is None or not isinstance(prefix, dict):
+        return False, reasons
+
+    def mutate(state):
+        sessions = state.get("sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+        sessions[session_id] = {
+            "lines": prefix.get("lines"),
+            "sha256": prefix.get("sha256"),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        # Bound the map: newest _WATERMARK_SESSIONS_MAX sessions by ts (ISO
+        # strings sort lexicographically). Eviction is the designed
+        # degradation -- one full resend, folded by the backend.
+        if len(sessions) > _WATERMARK_SESSIONS_MAX:
+            keep = sorted(
+                sessions.items(), key=lambda kv: kv[1].get("ts") or "", reverse=True
+            )[:_WATERMARK_SESSIONS_MAX]
+            sessions = dict(keep)
+        state["sessions"] = sessions
+        return state
+
+    def write():
+        try:
+            _, write_reasons = _hook_state.update_state(_WATERMARK_STATE, cwd, mutate)
+        except Exception as exc:  # update_state does not raise by contract; the net under it
+            print(f"[{HOOK}] could not advance watermark: {exc!r}", file=sys.stderr)
+            write_reasons = ["unknown"]
+        reasons.extend(write_reasons)
+
+    left_behind = _hook_runner.write_with_budget(
+        write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-watermark"
+    )
+    if left_behind:
+        reasons.append("state_write_failed")
+    return left_behind, reasons
+
+
+def _with_watermark(reason, wm_reasons):
+    """Fold watermark-write failures into the run's reason (they are
+    ``state_write_failed`` / ``unknown`` -- both FAILURE-class, both already
+    in _hook_state's tables, so worst_reason surfaces them at the next
+    SessionStart while it is still this hook's latest entry)."""
+    if wm_reasons and _hook_state:
+        return _hook_state.worst_reason([reason, *wm_reasons])
+    return reason
 
 
 def _collect(run):
@@ -854,34 +1093,57 @@ def _collect(run):
     container_id = _identity.container_id()
     branch = _current_branch(cwd)
     session_id = event.get("session_id")
+    resume = _load_watermark(session_id, cwd)
 
     try:
-        extracted, stats = _parse_transcript(transcript_path)
+        extracted, stats, prefix, resumed = _parse_transcript(transcript_path, resume)
     except OSError:
         # It is a file (checked above) and it would not open. Not a quiet session.
+        # The watermark is deliberately NOT advanced: retry the read next end.
         return "file_unparsable"
     # (4a) The budget's health goes into the ledger extra right here -- before
     # the builder, the two early returns and the POST -- so a POST that fails
     # (or a builder that raises) cannot lose it. Two-valued like the wire key:
     # "ok" is written too, so a clean run is told apart from a run that never
-    # got this far. Flattened into the ledger entry by record_run.
+    # got this far. Flattened into the ledger entry by record_run. The
+    # watermark's view of the run rides along (resumed/folded); main() writes
+    # the state, after this thread has joined (see run["advance"]).
     run["extra"].update(
         tiering="ok" if stats["tiering_error"] is None else "degraded",
         exc=stats["tiering_error"],
+        resumed=resumed,
+        folded=stats["folded"],
     )
     activities = _build_activities(extracted, container_id, branch, session_id, stats["dropped"])
     run["extra"].update(activities=len(activities), lines=stats["lines"], parsed=stats["parsed"])
     if not activities:
         if _unreadable(stats):
             return "file_unparsable"  # a failure already: not folded, the detail is in the extra
-        # Nothing to send -> no request. A degraded selection on an EMPTY pool
-        # cannot happen on its own (the selector returns early below the
-        # limit); it is reachable by patching, and is folded like the clean
-        # run so the fold has no hole.
+        # Nothing NEW to send -> no request, but the consumed lines are done:
+        # advance the watermark so the next end starts past them. main() does
+        # the write (work thread stays off stdio); a degraded selection on an
+        # EMPTY pool cannot happen on its own (the selector returns early
+        # below the limit); it is reachable by patching, and is folded like
+        # the clean run so the fold has no hole.
+        run["advance"] = {"session_id": session_id, "cwd": cwd, "prefix": prefix}
         return _with_tiering_verdict("nothing_to_do", stats)
 
     run["calls"] += 1  # counted before the call: a call that fails was still made
-    run["extra"]["accepted"] = _post(base_url, token, agent_id, activities)
+    accepted, deduped = _post(base_url, token, agent_id, activities)
+    run["extra"]["accepted"] = accepted
+    if deduped:
+        # Watermark self-check signal (plugin#49): NOT printed here -- the
+        # work thread must stay off stdio -- but handed to main() as a
+        # ready-to-print line, alongside the extra entry below.
+        run["extra"]["deduped"] = deduped
+        run["warn"] = (
+            f"[{HOOK}] backend folded {deduped} identical payload(s) -- "
+            f"watermark miss (rewrite/eviction/other machine) or double SessionEnd"
+        )
+    # Advance only after a successful POST: a failed one leaves the watermark
+    # where it was, so the whole delta retries at the next SessionEnd and the
+    # backend folds whatever it has already seen (at-least-once).
+    run["advance"] = {"session_id": session_id, "cwd": cwd, "prefix": prefix}
     # SessionEnd injects no context -> no stdout on success.
     return _with_tiering_verdict(_hook_state.NO_REASON if _hook_state else "none", stats)
 
@@ -1020,6 +1282,23 @@ def main():
     else:
         reason = outcome["result"]
 
+    # (wm) The send watermark advances only on the paths that CONSUMED the
+    # transcript with nothing new to send, or after a successful POST --
+    # _collect marks exactly those runs with run["advance"] (never set by a
+    # failed POST or an unopenable transcript, so the delta retries). The
+    # write happens here, in the main thread after the work thread joined:
+    # its failure prints belong to a thread that is allowed to print, and a
+    # failure folds into the reason (state_write_failed surfaces at the
+    # next SessionStart) without costing the capture that already succeeded.
+    wm_reasons = []
+    if not left_behind and "result" in outcome and isinstance(run.get("advance"), dict):
+        adv = run["advance"]
+        _, wm_reasons = _advance_watermark(
+            adv.get("session_id"), adv.get("cwd"), adv.get("prefix")
+        )
+    if wm_reasons:
+        reason = _with_watermark(reason, wm_reasons)
+
     # _record (the ledger row for THIS run) runs BEFORE the diagnostic
     # print, not after (R2-c05, mirrored from handoff_sync.py): the old
     # order printed first, and a stderr write that fails -- a closed pipe,
@@ -1033,6 +1312,11 @@ def main():
     record_left_behind = _record(reason, started, run)
     if diagnostic is not None:
         print(diagnostic, file=sys.stderr)
+    # The work thread never prints (a thread that may be abandoned stays off
+    # stdio); the deduped self-check warning it produced rides on run["warn"]
+    # and is printed here, only when the thread completed.
+    if not left_behind and "result" in outcome and run.get("warn"):
+        print(run["warn"], file=sys.stderr)
     return record_left_behind or left_behind
 
 

@@ -9,6 +9,43 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-22
+
+### Added
+- **`SessionEnd` capture hook — per-session send watermark**
+  (`hooks/session_capture.py`, plugin#49 / nexus#468 layer 1): a session that
+  ends more than once (resume-then-exit, double trigger) used to re-POST its
+  whole bounded activity list every time — 71% of prod's duplicate activity
+  rows and ~14% re-sent payloads. Each successful run now persists, per
+  `session_id`, the count of RAW transcript lines consumed plus a sha256 over
+  them (`_hook_state` "session-capture" state, bounded to the newest 64
+  sessions); the next run re-hashes the prefix and sends **only what the
+  transcript gained**.
+  - **Degradation is designed, not accidental**: first run of a session, no
+    `session_id` in the payload, a rewritten/shortened transcript prefix
+    (compaction edits transcripts in place), eviction from the 64-session
+    map, or a different machine each cost **one full resend**, which the
+    backend's idempotent ingestion folds (nexus #468 A, `deduped` in the
+    response) — never a rejection, never a lost capture.
+  - **The watermark advances only after a successful POST** (or after a run
+    that found nothing new); a failed POST leaves it in place so the whole
+    delta retries at the next SessionEnd — at-least-once, deduplicated
+    server-side.
+  - **Adjacent identical payloads are folded client-side** before selection
+    (the polling-command burst: the same `nomad job status` five times in a
+    row is one payload on the wire); non-adjacent repeats stay distinct
+    events. Backend folding (nexus #468 `within_batch`) remains the net.
+  - **Watermark self-check**: a non-zero `deduped` in the ingest response is
+    logged on stderr (one line) and recorded in the run ledger (`deduped`
+    key) — the designed signal that a watermark missed (rewrite, eviction,
+    another machine) or two SessionEnds raced. A watermark state write that
+    fails records `state_write_failed` (surfaced at the next SessionStart)
+    without costing the capture that already succeeded.
+  - `read_activities` keeps its exact 2-tuple public contract
+    (nexus `scripts/replay_session_capture.py` imports it); the incremental
+    reader is `read_activities_incremental`, of which it is the no-resume
+    view. `_USER_AGENT` bumped to `nexus-session-capture-hook/0.5`.
+
 ## [0.5.0] — 2026-06-22
 
 ### Changed

@@ -21,6 +21,7 @@ Coverage maps to workflow C acceptance:
 """
 
 import glob
+import hashlib
 import http.server
 import importlib.util
 import inspect
@@ -1682,7 +1683,7 @@ class TestCaptureBudgetFailsOpen(_LedgerCase):
         builder cannot KeyError on the very run that is already degraded."""
         path = self._transcript(_overflow_edits())
         with mock.patch.object(_MOD, "select_activities", side_effect=RuntimeError("boom")):
-            extracted, stats = _MOD._parse_transcript(path)
+            extracted, stats, _prefix, _resumed = _MOD._parse_transcript(path)
         self.assertEqual(set(stats["dropped"]), {"total", "by_action", "strategy"})
         self.assertEqual(stats["dropped"], {"total": 50, "by_action": {"edit_file": 50}, "strategy": "fallback_tail"})
         self.assertEqual(stats["tiering_error"], "RuntimeError")
@@ -1721,10 +1722,12 @@ class TestCaptureBudgetFailsOpen(_LedgerCase):
         self.assertEqual(entry["tiering"], "degraded")
 
     def test_an_unopenable_transcript_is_file_unparsable_through_read_activities(self):
-        """read_activities is wrapped in no try/except of its own: its OSError
-        has to reach the caller's guard, which is the only file_unparsable path."""
+        """read_activities_incremental (the reader _collect actually goes
+        through; read_activities is its no-resume view) is wrapped in no
+        try/except of its own: its OSError has to reach the caller's guard,
+        which is the only file_unparsable path."""
         urlopen = mock.Mock()
-        with mock.patch.object(_MOD, "read_activities", side_effect=PermissionError("denied")):
+        with mock.patch.object(_MOD, "read_activities_incremental", side_effect=PermissionError("denied")):
             self._main(urlopen)
         urlopen.assert_not_called()
         entry = self._entries()[-1]
@@ -1775,8 +1778,9 @@ class TestCaptureBudgetFailsOpen(_LedgerCase):
         pool = [("edit_file", {"tool": "Edit", "summary": f"/a/{i}.py"}) for i in range(205)]
         pool.insert(3, "not-a-pair")  # in the head, so the tail fallback drops it
         stats = {"lines": 206, "parsed": 206, "messages": 206, "tiering_error": None}
-        with mock.patch.object(_MOD, "read_activities", return_value=(pool, stats)):
-            extracted, stats = _MOD._parse_transcript("/ignored")
+        with mock.patch.object(_MOD, "read_activities_incremental",
+                               return_value=(pool, stats, {"lines": 0, "sha256": ""}, False)):
+            extracted, stats, _prefix, _resumed = _MOD._parse_transcript("/ignored")
         self.assertEqual(len(extracted), _MOD._MAX_ACTIVITIES)
         self.assertEqual(stats["tiering_error"], "ValueError")
         self.assertEqual(stats["dropped"]["strategy"], "fallback_tail")
@@ -1821,6 +1825,226 @@ class TestReadActivitiesIsTheSharedReader(unittest.TestCase):
         self.assertEqual(set(stats), {"lines", "parsed", "messages", "tiering_error"})
         self.assertEqual((stats["lines"], stats["parsed"], stats["messages"], stats["tiering_error"]), (251, 251, 251, None))
         self.assertTrue(all(isinstance(item, tuple) and len(item) == 2 for item in full))
+
+
+class _RecordingReplies:
+    """urlopen double that answers every POST with one fixed payload AND
+    records each request body -- the watermark tests assert on WHAT was
+    sent (the delta), not just that something was."""
+
+    def __init__(self, payload=None):
+        self.payload = payload or {"accepted": 1, "request_id": "r1"}
+        self.bodies = []
+
+    def __call__(self, req, timeout=None):
+        if req.data:
+            self.bodies.append(json.loads(req.data.decode("utf-8")))
+        return _FakeResponse(self.payload)
+
+
+class TestSessionWatermark(_LedgerCase):
+    """plugin#49 / nexus#468 layer 1: a resumed SessionEnd used to re-POST
+    the whole bounded list, so a session that ended twice sent its tail
+    twice (71% of prod's duplicate rows). Each run now persists, per
+    session, how many raw transcript lines it consumed plus a sha256 over
+    them; the next run verifies the prefix and sends only what the
+    transcript gained. Every degradation (first run, no session_id, a
+    rewritten prefix, eviction, another machine, a failed POST) costs at
+    most one full resend, which the backend folds (nexus #468 A)."""
+
+    def _watermark_state(self):
+        state, reasons = _hook_state.read_state(_MOD._WATERMARK_STATE, self.cwd)
+        self.assertEqual(reasons, [])
+        return state
+
+    def _run(self, replies, transcript_path, session_id="s1"):
+        return self._main(replies, event={
+            "cwd": self.cwd, "session_id": session_id, "transcript_path": transcript_path,
+        })
+
+    def _append(self, path, *lines):
+        with open(path, "a", encoding="utf-8") as fh:
+            for ln in lines:
+                fh.write((ln if isinstance(ln, str) else json.dumps(ln)) + "\n")
+
+    def test_second_end_sends_only_the_delta(self):
+        replies = _RecordingReplies()
+        path = self._transcript()  # Edit /r/a.py + Bash git commit
+        self._run(replies, path)
+        self._append(path, _assistant_tool_use("Edit", {"file_path": "/r/b.py"}))
+        out, err = self._run(replies, path)
+
+        self.assertEqual(len(replies.bodies), 2)
+        self.assertEqual(len(replies.bodies[0]["activities"]), 2)
+        self.assertEqual(len(replies.bodies[1]["activities"]), 1)
+        summaries = [a["activity_data"].get("summary") for a in replies.bodies[1]["activities"]]
+        self.assertEqual(summaries, ["/r/b.py"], "only the appended line is re-sent")
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"], entry["resumed"]), (True, "none", True))
+        session = self._watermark_state()["sessions"]["s1"]
+        self.assertEqual(session["lines"], 3)  # raw lines: 2 sent + 1 appended
+
+    def test_first_run_records_resumed_false_and_advances(self):
+        replies = _RecordingReplies()
+        self._run(replies, self._transcript())
+        entry = self._entries()[-1]
+        self.assertEqual(entry["resumed"], False)
+        self.assertIn("s1", self._watermark_state()["sessions"])
+
+    def test_no_session_id_means_no_watermark_and_a_full_resend(self):
+        replies = _RecordingReplies()
+        path = self._transcript()
+        self._main(replies, event={"cwd": self.cwd, "transcript_path": path})
+        self._main(replies, event={"cwd": self.cwd, "transcript_path": path})
+        self.assertEqual(len(replies.bodies), 2)
+        for body in replies.bodies:
+            self.assertEqual(len(body["activities"]), 2)
+        self.assertEqual(self._watermark_state(), {}, "no session_id -> nothing persisted")
+
+    def test_a_rewritten_prefix_resends_everything(self):
+        replies = _RecordingReplies()
+        path = self._transcript()
+        self._run(replies, path)
+        # Compaction rewrites the transcript in place: line 1 differs, plus
+        # one appended line. The stored hash no longer matches the prefix.
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_assistant_tool_use("Bash", {"command": "git commit -m final"})) + "\n")
+            fh.write(json.dumps(_assistant_tool_use("Edit", {"file_path": "/r/a.py"})) + "\n")
+            fh.write(json.dumps(_assistant_tool_use("Edit", {"file_path": "/r/b.py"})) + "\n")
+        self._run(replies, path)
+        self.assertEqual(len(replies.bodies[1]["activities"]), 3)
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["resumed"]), ("none", False))
+
+    def test_a_failed_post_leaves_the_watermark_for_a_retry(self):
+        replies = _RecordingReplies()
+        path = self._transcript()
+        self._run(replies, path)
+        before = self._watermark_state()["sessions"]["s1"]
+        self._append(path, _assistant_tool_use("Edit", {"file_path": "/r/b.py"}))
+        self._main(_raising(_http_error(500)), event={
+            "cwd": self.cwd, "session_id": "s1", "transcript_path": path,
+        })
+        self.assertEqual(self._entries()[-1]["reason"], "http_error")
+        self.assertEqual(self._watermark_state()["sessions"]["s1"], before,
+                         "a failed POST must not advance the watermark")
+        # The next successful end retries the WHOLE delta since the last
+        # success -- the appended activity, in one POST.
+        self._run(replies, path)
+        self.assertEqual(len(replies.bodies), 2)
+        self.assertEqual(len(replies.bodies[1]["activities"]), 1)
+
+    def test_a_run_with_nothing_new_advances_quietly_and_skips_are_consumed(self):
+        replies = _RecordingReplies()
+        path = self._transcript()
+        self._run(replies, path)
+        self._run(replies, path)  # nothing appended -> nothing_to_do, no POST
+        self.assertEqual(len(replies.bodies), 1)
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"]), (True, "nothing_to_do"))
+        # A blank line and a low-signal Read are consumed WITHOUT a POST;
+        # the watermark must advance past them, proven by the next delta.
+        self._append(path, "", _assistant_tool_use("Read", {"file_path": "/r/c.py"}),
+                     _assistant_tool_use("Edit", {"file_path": "/r/d.py"}))
+        self._run(replies, path)
+        self.assertEqual(len(replies.bodies), 2)
+        summaries = [a["activity_data"].get("summary") for a in replies.bodies[1]["activities"]]
+        self.assertEqual(summaries, ["/r/d.py"])
+
+    def test_consecutive_identical_payloads_fold_before_the_post(self):
+        lines = [_assistant_tool_use("Bash", {"command": "alembic upgrade head"})] * 3
+        lines.append(_assistant_tool_use("Bash", {"command": "git commit -m wip"}))
+        replies = _RecordingReplies()
+        self._run(replies, self._transcript(lines))
+        self.assertEqual(len(replies.bodies[0]["activities"]), 2)
+        summaries = [a["activity_data"].get("summary") for a in replies.bodies[0]["activities"]]
+        self.assertEqual(summaries, ["alembic upgrade head", "git commit -m wip"])
+        entry = self._entries()[-1]
+        self.assertEqual((entry["reason"], entry["folded"]), ("none", 2))
+
+    def test_non_adjacent_repeats_are_two_events(self):
+        lines = [
+            _assistant_tool_use("Bash", {"command": "alembic upgrade head"}),
+            _assistant_tool_use("Edit", {"file_path": "/r/a.py"}),
+            _assistant_tool_use("Bash", {"command": "alembic upgrade head"}),
+        ]
+        replies = _RecordingReplies()
+        self._run(replies, self._transcript(lines))
+        self.assertEqual(len(replies.bodies[0]["activities"]), 3)
+        self.assertEqual(self._entries()[-1]["folded"], 0)
+
+    def test_backend_deduped_is_reported_as_a_watermark_self_check(self):
+        replies = _RecordingReplies({"accepted": 1, "deduped": 7, "request_id": "r1"})
+        out, err = self._run(replies, self._transcript())
+        self.assertIn("folded 7 identical payload", err)
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"], entry["deduped"]), (True, "none", 7),
+                         "deduped is the designed degradation, not a failure")
+
+    def test_backend_without_deduped_still_acknowledges(self):
+        replies = _RecordingReplies({"accepted": 2, "request_id": "r1"})  # pre-#468 backend
+        self._run(replies, self._transcript())
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"], entry["accepted"]), (True, "none", 2))
+
+    def test_a_watermark_write_failure_surfaces_but_costs_nothing(self):
+        replies = _RecordingReplies()
+        with mock.patch.object(_hook_state, "update_state",
+                               return_value=({}, ["state_write_failed"])):
+            self._run(replies, self._transcript())
+        entry = self._entries()[-1]
+        # The capture itself succeeded (accepted recorded from the reply);
+        # the run is reported as a failure so the lost watermark is seen at
+        # the next SessionStart (the next run resends, the backend folds).
+        self.assertEqual((entry["ok"], entry["reason"], entry["accepted"]),
+                         (False, "state_write_failed", 1))
+
+    def test_the_session_map_is_bounded_to_the_newest_sessions(self):
+        sessions = {
+            f"s{i:03d}": {"lines": 1, "sha256": "x",
+                          "ts": f"2026-10-01T01:{i // 60:02d}:{i % 60:02d}Z"}
+            for i in range(_MOD._WATERMARK_SESSIONS_MAX)
+        }
+        _hook_state.write_state(_MOD._WATERMARK_STATE, {"sessions": sessions}, self.cwd)
+        _MOD._advance_watermark("s-new", self.cwd, {"lines": 1, "sha256": "n"})
+        kept = self._watermark_state()["sessions"]
+        self.assertEqual(len(kept), _MOD._WATERMARK_SESSIONS_MAX)
+        self.assertIn("s-new", kept)
+        self.assertIn("s001", kept)
+        self.assertNotIn("s000", kept, "the oldest session is evicted")
+
+    def test_read_activities_incremental_resume_match_miss_and_wrapper(self):
+        path = self._transcript()
+        full, stats, prefix, resumed = _MOD.read_activities_incremental(path)
+        self.assertEqual(len(full), 2)
+        self.assertFalse(resumed)
+        self.assertEqual(set(stats), {"lines", "parsed", "messages", "tiering_error"})
+        self.assertEqual(prefix["lines"], 2)
+
+        full2, stats2, prefix2, resumed2 = _MOD.read_activities_incremental(path, prefix)
+        self.assertEqual(full2, [])
+        self.assertTrue(resumed2)
+        self.assertEqual(prefix2, prefix)
+
+        tampered = dict(prefix, sha256="0" * 64)
+        full3, _, _, resumed3 = _MOD.read_activities_incremental(path, tampered)
+        self.assertEqual(len(full3), 2)
+        self.assertFalse(resumed3)
+
+        # read_activities stays the no-resume 2-tuple view (public surface:
+        # nexus scripts/replay_session_capture.py imports it).
+        full4, stats4 = _MOD.read_activities(path)
+        self.assertEqual(len(full4), 2)
+        self.assertEqual(set(stats4), {"lines", "parsed", "messages", "tiering_error"})
+
+    def test_zero_line_watermark_is_a_valid_trivial_resume(self):
+        path = self._transcript()
+        _, _, prefix, _ = _MOD.read_activities_incremental(path)
+        empty_prefix = {"lines": 0, "sha256": hashlib.sha256().hexdigest()}
+        full, stats, prefix2, resumed = _MOD.read_activities_incremental(path, empty_prefix)
+        self.assertEqual(len(full), 2)
+        self.assertTrue(resumed, "a 0-line watermark trivially matches")
+        self.assertEqual(prefix2["lines"], 2)
 
 
 if __name__ == "__main__":
