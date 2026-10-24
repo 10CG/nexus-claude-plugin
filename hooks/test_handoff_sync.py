@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from unittest import mock
@@ -304,6 +305,11 @@ class _Backend:
                     status, body = backend.script.pop(0)
                 else:
                     status, body = 599, {"detail": "unscripted request"}
+                if status == "hang":
+                    # A10 D5 fixture arm: never answer; the client's own
+                    # timeout is the "PATCH got no response" being pinned.
+                    time.sleep(30)
+                    return
                 payload = json.dumps(body).encode("utf-8") if body is not None else b""
                 handler.send_response(status)
                 handler.send_header("Content-Type", "application/json")
@@ -2561,7 +2567,12 @@ class TestWritePath(_WriteCase):
         )))
         self._run(session_id="sess-1")
         self.assertEqual([r["method"] for r in self.requests], ["GET"])
-        self.assertEqual(self._last_entry()["reason"], "unchanged")
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "unchanged")
+        # A10 D5: the ledger's status field is decided_status; a round that
+        # only LOOKED the row up decided nothing, so None -- not the GET's
+        # 200, which used to leak in via outcome.status.
+        self.assertIsNone(entry.get("status"))
 
     def test_a_body_revision_patches_without_identity_keys(self):
         self._write("2026-09-20-1000-x.md", section6="## §6 Next session 入口\n\noriginal six")
@@ -2647,6 +2658,40 @@ class TestWritePath(_WriteCase):
         self.assertEqual(entry["dedup_merged"], 1)
         findings, _marks = _INJECT_MOD._failure_report(self.cwd)
         self.assertTrue(any("handoff-sync" in f and "dedup_merged" in f for f in findings), findings)
+
+    def test_a_dedup_204_does_not_outlive_a_patch_that_never_answered(self):
+        """A10 D5: `status` on the ledger row reads decided_status, never
+        outcome.status -- the dedup DELETE's 204 is the state of a call that
+        ran BEFORE the PATCH, and a PATCH that never answered decided
+        nothing. The old code's extra["status"] carried the 204 forward and
+        the row said the write succeeded when it did not."""
+        path = self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
+        with open(path, encoding="utf-8") as fh:
+            _fm, body = _MOD._split_frontmatter(fh.read())
+        content, _reason = _MOD._build_content(body)
+        digest = _ingest_client.content_hash(content)
+        stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
+        # The CANONICAL survivor is the EARLIEST row; only its hash decides
+        # whether a PATCH follows the dedup, so the stale hash goes there.
+        older = _row(
+            self._ext("2026-09-20-1000-x.md"),
+            content_hash="sha256:stale-not-the-local-one",  # differs: a PATCH must follow the dedup
+            extra=stored,
+            created_at="2026-09-19T00:00:00.000001Z", row_id="aaaaaaaa-1111-4111-8111-111111111111",
+        )
+        newer = _row(
+            self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
+            created_at="2026-09-19T01:00:00.000001Z", row_id="bbbbbbbb-1111-4111-8111-111111111111",
+        )
+        self.backend.reply(200, _page(newer, older)).reply(204, None).reply("hang", None)
+        self._run(session_id="sess-1")
+        entry = self._last_entry()
+        # worst_reason may well rank dedup_merged above the timeout -- the
+        # point of THIS fixture is the status field: the DELETE's 204 must
+        # not survive an unanswered PATCH in it (decided_status stayed None).
+        self.assertNotEqual(entry.get("status"), 204, entry)
+        self.assertNotEqual(entry.get("status"), 200, entry)
+        self.assertFalse(entry["ok"])
 
     def test_a_closed_stderr_during_a_full_lookup_page_does_not_turn_into_http_error(self):
         """R4-c06: `_ingest_client._lookup`'s OWN "dedup page full"
@@ -2782,612 +2827,6 @@ class TestWritePath(_WriteCase):
         meta = self.requests[1]["json"]["metadata"]
         self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
         self.assertEqual(self._last_entry()["reason"], "none")
-
-    def test_identity_drift_reports_once(self):
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "none")
-        self.assertNotIn("identity_changed", self._last_entry())  # no drift this run: key absent
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            self._run(session_id="sess-1")
-        entry = self._last_entry()
-        self.assertEqual(entry["reason"], "identity_changed")
-        self.assertTrue(entry["identity_changed"])
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-b")  # a clean write: persisted
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m3"})
-            self._run(session_id="sess-1")
-        self.assertNotEqual(self._last_entry()["reason"], "identity_changed")  # reported once, not every run
-
-    def test_a_skip_class_reason_does_not_persist_a_drifted_container_id(self):
-        """R5-c07: `run["persist_container_id"]` (initialised `False` in
-        `main()`) is only ever reassigned on the ONE line right after
-        `client.upsert(...)` returns (ruling 2) -- an early return before
-        the write path never reaches it, so THIS run's own drifted
-        container_id must not land in state just because `_collect`
-        happened to already know it by the time it returned early. No
-        existing test combines "this container's id has already drifted"
-        with a SKIP-class early return that never reaches `client.upsert`
-        at all: every existing identity-drift test (`test_identity_drift_
-        with_a_500_does_not_persist_the_new_id` and its 403/timeout
-        siblings) still reaches `client.upsert` -- a round-abort outcome
-        is decided THERE, on the write path, not before it -- so none of
-        them would catch a future regression that moved the persist flag
-        earlier, ahead of the owner/opt-out checks."""
-        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-a"):
-            self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "none")
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-a")
-
-        # A second round whose directory holds NOTHING of this
-        # container's: the own document is gone, a newer foreign one sits
-        # in its place (A9-2: the own-group scan finds nothing, every
-        # candidate is provably somebody else's -> not_owner). This
-        # container's own id has drifted to dev-box-b in the meantime, but
-        # `not_owner` is decided well before the write path -- the old
-        # fixture kept the own document in place and relied on the pre-A9
-        # "newest wins across ALL candidates" rule, which A9-2 replaced
-        # with the own-group scan (that shape now re-ingests the own doc).
-        os.remove(os.path.join(self.handoff_dir, "2026-09-20-1000-x.md"))
-        self._write(
-            "2026-09-20-1100-y.md", owner=f"owner/{OTHER_UUID}", updated_at="2026-09-20T11:00:00Z",
-        )
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self._run(session_id="sess-2")
-        self.assertEqual(self._last_entry()["reason"], "not_owner")
-        # Only the FIRST run's GET+POST -- the second made zero requests.
-        self.assertEqual([r["method"] for r in self.requests], ["GET", "POST"])
-
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-a")  # unchanged by the skip-class run
-
-    def test_a_content_failure_does_not_persist_a_drifted_container_id_empty_sections(self):
-        """R6-c05: the test right above only proves the persist flag was
-        not moved ahead of the OWNER check -- a regression that moved it
-        to right AFTER the owner check but still BEFORE `_build_content`
-        (still well ahead of the one real assignment site, right after
-        `client.upsert` returns) would pass every existing test INCLUDING
-        that one, because `not_owner` returns even earlier and never
-        reaches such a mutant at all (confirmed: applying exactly that
-        mutation to a temp copy left the whole suite green). `empty_
-        sections` is decided strictly AFTER the owner check (ruling 3 /
-        R1-c01) -- the same shape ruling 2 protects against, just for a
-        different early-return reason, and one this class's own R2-c10
-        sibling (`TestContentReasonsEndToEnd`) never combined with a
-        drifted id."""
-        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-a"):
-            self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "none")
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-a")
-
-        # A second, NEWER document -- same owner, but an empty body -- with
-        # this container's own id already drifted to dev-box-b.
-        self._write(
-            "2026-09-20-1100-y.md", body="   \n\n  ", updated_at="2026-09-20T11:00:00Z",
-        )
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self._run(session_id="sess-2")
-        self.assertEqual(self._last_entry()["reason"], "empty_sections")
-        # Only the FIRST run's GET+POST -- the second made zero requests.
-        self.assertEqual([r["method"] for r in self.requests], ["GET", "POST"])
-
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-a")  # unchanged by the skip-class run
-
-    def test_a_content_failure_does_not_persist_a_drifted_container_id_sections_unparsed(self):
-        """R6-c05, second form: `sections_unparsed` -- a NONTRIVIAL body
-        (>= `_MIN_NONTRIVIAL_BODY`) with neither section parseable -- is
-        the FAILURE-class sibling of the quiet `empty_sections` case right
-        above; both are decided inside `_build_content`, strictly after
-        the owner check, so both close the same gap in `test_a_skip_
-        class_reason_does_not_persist_a_drifted_container_id`."""
-        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-a"):
-            self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "none")
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-a")
-
-        body = "# Title\n\n" + ("prose with no known section headings at all. " * 10)
-        self.assertGreaterEqual(len(body.strip()), _MOD._MIN_NONTRIVIAL_BODY)
-        self._write(
-            "2026-09-20-1100-y.md", body=body, updated_at="2026-09-20T11:00:00Z",
-        )
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self._run(session_id="sess-2")
-        self.assertEqual(self._last_entry()["reason"], "sections_unparsed")
-        self.assertEqual([r["method"] for r in self.requests], ["GET", "POST"])
-
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-a")  # unchanged by the failure-class run
-
-    def _drift_then_fail(self, act):
-        """Shared setup for the three ruling-2 (R1-c04) tests below: a clean
-        first run under CONTAINER, then ``act()`` -- which must patch
-        container_id to something else itself, queue whatever backend
-        response(s) it needs, and drive the second (failing) run. Returns
-        that second run's ledger entry. The container_id / deadline patches
-        live inside ``act`` rather than around this whole method so they
-        never touch the FIRST (deliberately clean) run."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "none")
-        act()
-        return self._last_entry()
-
-    def test_identity_drift_with_a_500_does_not_persist_the_new_id(self):
-        """Ruling 2 (TASK-005 R1 fix round, R1-c04): http_error aborts the
-        round, so the drift must stay unresolved for the NEXT run too --
-        and, since http_error outranks identity_changed in worst_reason,
-        the drift signal must still show up in the ledger `extra`."""
-
-        def act():
-            with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-                self.backend.reply(200, _page()).reply(500, {"detail": "boom"})
-                self._run(session_id="sess-1")
-
-        entry = self._drift_then_fail(act)
-        self.assertEqual(entry["reason"], "http_error")
-        self.assertTrue(entry["identity_changed"])
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), CONTAINER)  # NOT persisted
-
-        # Next run, still dev-box-b, backend healthy: the drift must still
-        # be detected -- it was never actually recorded as resolved.
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m3"})
-            self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "identity_changed")
-
-    def test_identity_drift_with_403_ingest_disabled_does_not_persist_the_new_id(self):
-        def act():
-            with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-                self.backend.reply(200, _page()).reply(
-                    403, {"detail": {"error": "STRUCTURED_INGEST_DISABLED", "reason": "tenant off"}}
-                )
-                self._run(session_id="sess-1")
-
-        entry = self._drift_then_fail(act)
-        self.assertEqual(entry["reason"], "ingest_disabled")
-        self.assertTrue(entry["identity_changed"])
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), CONTAINER)
-
-    def test_identity_drift_with_a_client_timeout_does_not_persist_the_new_id(self):
-        """The client's OWN deadline refusal (no request even sent), not the
-        outer work-budget abandonment -- see test_a_deadline_already_
-        exhausted_refuses_without_a_request for that half of R1-c26."""
-
-        def act():
-            with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
-                    mock.patch.object(_MOD, "_DEADLINE_SLACK_SECONDS", 1_000_000.0):
-                self._run(session_id="sess-1")  # deadline already exhausted: no reply need be queued
-
-        entry = self._drift_then_fail(act)
-        self.assertEqual(entry["reason"], "timeout")
-        self.assertTrue(entry["identity_changed"])
-        self.assertEqual(len(self.requests), 2)  # only the first (successful) run's GET+POST
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), CONTAINER)
-
-    def test_identity_drift_row_survives_a_persist_that_stalls_past_the_ledger_budget(self):
-        """R2-c01: the row for THIS run must exist independently of how long
-        the container_id persist (which follows it) takes. The earlier
-        ordering wrote the persist FIRST, inside the same budgeted write();
-        a persist slow/contended enough to eat the whole ledger budget could
-        commit the new container_id to disk and then run out of budget
-        before record_run ever ran at all -- silently and PERMANENTLY
-        losing identity_changed (the next run's drift check would then find
-        the state already at the new id and detect nothing). Reordering
-        alone fixes this: record_run must complete before the persist
-        attempt even starts.
-
-        The persist step is stalled here (not the ledger write itself) via
-        a released Event, the same pattern as
-        test_calls_is_recorded_as_unknown_not_zero_when_the_work_is_abandoned
-        above -- a real subprocess kill is exercised separately by
-        TestSubprocess; what matters at this level is the ORDER of the two
-        writes, not the abandonment mechanics themselves.
-        """
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "none")
-
-        release = threading.Event()
-        self.addCleanup(release.set)  # let the stalled persist finish so it does not leak into later tests
-
-        def stalled_update_state(name, cwd, mutate):
-            release.wait(30)
-            return dict(mutate({})), []
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
-                mock.patch.object(_hook_state, "update_state", side_effect=stalled_update_state), \
-                mock.patch.object(_MOD, "_LEDGER_BUDGET_SECONDS", 0.2):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            with mock.patch("sys.stderr"):  # the abandoned-write warning is expected here
-                self._run(session_id="sess-1")
-
-        entry = self._last_entry()
-        self.assertEqual(entry["reason"], "identity_changed")
-        self.assertTrue(entry["identity_changed"])
-        # The persist itself has not gone through yet (still stalled): proof
-        # that the row above was NOT gated on it finishing first.
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), CONTAINER)
-
-    def test_main_return_value_reflects_a_ledger_write_left_behind(self):
-        """R3-c13: `main()`'s return value is what `__main__` uses to
-        choose between `os._exit(0)` and `sys.exit(0)` (via
-        `_hook_runner.finish`) -- dropping `record_left_behind` from
-        `main`'s own `return record_left_behind or left_behind` would
-        leave a ledger-write thread abandoned mid-write with no
-        protection at all, and until `_run_main` was fixed (this same
-        finding) to return `main()`'s own value, nothing here could have
-        caught it: every existing test that stalls the ledger write only
-        ever inspects the LEDGER, never what `main()` reported back."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-
-        release = threading.Event()
-        self.addCleanup(release.set)
-
-        def stalled_update_state(name, cwd, mutate):
-            release.wait(30)
-            return dict(mutate({})), []
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
-                mock.patch.object(_hook_state, "update_state", side_effect=stalled_update_state), \
-                mock.patch.object(_MOD, "_LEDGER_BUDGET_SECONDS", 0.2):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            with mock.patch("sys.stderr"):
-                returned = self._run(session_id="sess-1")
-        self.assertTrue(returned)
-
-    def test_main_return_value_is_false_on_a_clean_run(self):
-        """The other half of R3-c13: a clean run (nothing left behind)
-        must return a FALSY value, not merely "truthy sometimes" -- the
-        pair together pin the actual boolean, not just its presence."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        returned = self._run(session_id="sess-1")
-        self.assertFalse(returned)
-
-    def test_record_does_not_persist_when_the_work_thread_was_abandoned(self):
-        """R3-c12: `_record`'s persist gate is `run["persist_container_id"]
-        and not work_left_behind` -- but no fixture called `_record`
-        directly with a combination isolating the SECOND half.
-        `_collect` sets `persist_container_id = True` a few lines before
-        it returns, so a work thread abandoned in that exact window
-        would leave the flag True while the run's true outcome is
-        unknown; dropping "and not work_left_behind" from the gate still
-        passed the whole suite (confirmed by mutation), because reaching
-        this combination in a real run needs an actual thread race, which
-        no existing test drives at this level -- `_record` is a plain
-        function and needs none of that to exercise directly."""
-        _hook_state.update_state(_MOD.HOOK, self.cwd, lambda s: {**s, "container_id": CONTAINER})
-        run = {
-            "cwd": self.cwd, "calls": 0, "extra": {}, "persist_container_id": True,
-            "deadline": _MOD.time.monotonic() + 10,
-        }
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            _MOD._record("none", _MOD.time.monotonic(), run, work_left_behind=True)
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), CONTAINER)  # NOT overwritten
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        self.assertIsNone(entries[-1]["calls"])  # R1-c09's own rule still holds here too
-
-    def test_state_write_failed_from_persisting_does_not_vanish(self):
-        """Ruling 2 / R2-c11: a persist failure discovered AFTER the run's
-        own row is already written must still show up in the ledger, and
-        the drift itself must still be detected on the NEXT run (the old
-        container_id was never actually replaced on disk, so it is not a
-        one-time report that then falls silent)."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-
-        def failing_update_state(name, cwd, mutate):
-            return {}, ["state_write_failed"]
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
-                mock.patch.object(_hook_state, "update_state", side_effect=failing_update_state):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            with mock.patch("sys.stderr"):
-                self._run(session_id="sess-1")
-
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        self.assertGreaterEqual(len(entries), 2)
-        identity_row, persist_row = entries[-2], entries[-1]
-        self.assertEqual(identity_row["reason"], "identity_changed")
-        self.assertTrue(identity_row["identity_changed"])
-        self.assertEqual(persist_row["reason"], "state_write_failed")
-        self.assertFalse(persist_row["ok"])
-
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), CONTAINER)  # never actually persisted
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m3"})
-            self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "identity_changed")  # still unresolved
-
-    def test_a_transient_container_id_failure_during_the_persist_check_does_not_swallow_state_write_failed(self):
-        """R4-c05: a full write-path run with drift calls `_identity.
-        container_id()` up to THREE times, across TWO different functions
-        (R6-c08: an earlier revision of this docstring attributed all
-        three to `write()` alone, though its own very next clause already
-        named two of them as being inside `_collect` instead) --
-        `identity_drift`'s own `current=` and the `IngestClient`
-        constructor, BOTH inside `_collect`, and -- protected by its OWN
-        try/except, the actual fix -- the precompute right before
-        `update_state`, inside `_record`'s own nested `write()` closure.
-        This pins that the fix HOLDS for the precompute's own call
-        specifically raising: `update_state` is never even reached (the
-        `except` branch sets `state_write_failed` directly, see below),
-        but the supplementary row it guarantees must still land.
-
-        R5-c05: an EARLIER revision of this docstring (and the comment
-        below) described the THIRD call as "the unprotected comparison"
-        -- true of the CODE this fix REPLACED, no longer true of the code
-        that replaced it: post-468fcc2 the comparison itself makes no
-        call at all (`_new_state.get("container_id") == new_container_id`,
-        a plain variable read) -- see the test right below this one for a
-        mutant that reintroduces a FRESH, unprotected call at that exact
-        spot, which nothing here catches."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-
-        def failing_update_state(name, cwd, mutate):
-            return {}, ["state_write_failed"]
-
-        with mock.patch.object(
-            _identity, "container_id",
-            # P1 (TASK-013) collapsed _collect's two calls (identity_
-            # drift's `current=`, then the IngestClient constructor) into
-            # ONE pre-read in main(); the SECOND and last call is the
-            # protected precompute in `write()` itself, which is what
-            # this raises on.
-            side_effect=["dev-box-b", RuntimeError("transient container_id failure")],
-        ) as mock_container_id, mock.patch.object(
-            _hook_state, "update_state", side_effect=failing_update_state
-        ) as mock_update_state:
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            with mock.patch("sys.stderr"):
-                self._run(session_id="sess-1")
-
-        # R5-c05: the precompute's OWN exception is caught in the `except`
-        # branch, which sets `state_write_failed` directly WITHOUT ever
-        # reaching the `else` branch's `update_state` call -- so the mock
-        # above is never invoked. Asserted explicitly (code-reviewer #5's
-        # own point): the mock existing at all, unreached, is not itself a
-        # sign that anything is wrong, but a future edit accidentally
-        # making the precompute's exception NOT short-circuit past
-        # `update_state` should be visible here, not just coincidentally
-        # still pass because both paths happen to set the same reason.
-        mock_update_state.assert_not_called()
-        self.assertEqual(mock_container_id.call_count, 2)  # main()'s pre-read + write()'s precompute
-
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        reasons = [e["reason"] for e in entries]
-        # The run's own row must exist and say identity_changed regardless
-        # (record_run happens before any of this: R2-c01's ordering) --
-        # this much already holds even on the unfixed code.
-        self.assertIn("identity_changed", reasons)
-        # The point of this test: the supplementary state_write_failed row
-        # must ALSO exist -- a genuine persist failure this run must not be
-        # swallowed just because the precompute's own container_id() call
-        # happened to raise.
-        self.assertIn("state_write_failed", reasons)
-        persist_row = entries[-1]
-        self.assertEqual(persist_row["reason"], "state_write_failed")
-        self.assertFalse(persist_row["ok"])
-
-    def test_an_unprotected_call_reintroduced_at_the_comparison_does_not_swallow_state_write_failed(self):
-        """R5-c05: 468fcc2 (R4-c05) fixed the ORIGINAL bug shape by making
-        the comparison read a PRECOMPUTED variable (`new_container_id`)
-        instead of calling `_identity.container_id()` a second,
-        unprotected time -- but nothing pinned that the comparison stays
-        a plain variable read: a mutant that changes it back to
-        `_new_state.get("container_id") == _identity.container_id()`
-        (textually identical to the pre-468fcc2 shape) passed the WHOLE
-        suite, this test included, before this test existed (confirmed
-        against a temp copy). `update_state` here returns a GENUINE
-        persist failure (`state_write_failed`, an empty new state) -- the
-        correct, fixed behaviour is to append the supplementary failure
-        row using ONLY the three protected calls below; a FOURTH call
-        reintroduced at the comparison consumes this fixture's trailing
-        `RuntimeError` and escapes `write()` entirely uncaught (nothing
-        wraps that `if` statement), silently losing the very row this
-        fixture means to guarantee -- the identical "quieter" shape of
-        R4-c05's own original bug, one `except` clause further out."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-
-        def failing_update_state(name, cwd, mutate):
-            return {}, ["state_write_failed"]
-
-        with mock.patch.object(
-            _identity, "container_id",
-            # Exactly the three calls the FIXED code makes (drift check,
-            # IngestClient constructor, protected precompute) succeed; a
-            # mutant reintroducing a FOURTH, unprotected call at the
-            # comparison hits this trailing RuntimeError instead.
-            side_effect=["dev-box-b", "dev-box-b", "dev-box-b", RuntimeError("must not be called")],
-        ), mock.patch.object(_hook_state, "update_state", side_effect=failing_update_state):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            with mock.patch("sys.stderr"):
-                self._run(session_id="sess-1")
-
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        reasons = [e["reason"] for e in entries]
-        self.assertIn("identity_changed", reasons)
-        self.assertIn("state_write_failed", reasons)
-        persist_row = entries[-1]
-        self.assertEqual(persist_row["reason"], "state_write_failed")
-        self.assertFalse(persist_row["ok"])
-
-    def test_a_transient_persist_failure_in_steady_state_does_not_append_a_spurious_failure_row(self):
-        """R4-c09, mutant M01: deleting the `new_container_id is not None
-        and _new_state.get("container_id") == new_container_id` check
-        entirely (relying solely on the `"state_write_failed" not in
-        persist_reasons` membership check below it) passes every OTHER
-        existing test, because in every other fixture the two checks
-        return early for the same reason. The one shape that tells them
-        apart: STEADY STATE (this container's id is already the value on
-        disk -- no drift at all this run) plus update_state's OWN write
-        genuinely failing THIS run -- it returns the state as it stood
-        BEFORE the mutate, which, in steady state, already equals the
-        current id. Without the disk-trust check, this reads as a genuine
-        persist failure and appends a spurious row even though nothing on
-        disk is actually wrong."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")  # persists CONTAINER; steady state from here on
-
-        def failing_update_state(name, cwd, mutate):
-            # The write itself raised; update_state returns the PRE-mutate
-            # state (see its own docstring) -- which, in steady state,
-            # already carries today's container_id.
-            return {"container_id": CONTAINER}, ["state_write_failed"]
-
-        with mock.patch.object(_hook_state, "update_state", side_effect=failing_update_state):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            with mock.patch("sys.stderr"):
-                self._run(session_id="sess-1")
-
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        self.assertNotIn("state_write_failed", [e["reason"] for e in entries])
-        self.assertEqual(entries[-1]["reason"], "none")
-
-    def test_an_update_state_mutate_crash_is_not_reported_as_a_persist_failure(self):
-        """R4-c09, mutant M02: reverting `"state_write_failed" not in
-        persist_reasons` back to the literal `not persist_reasons` passes
-        every OTHER existing test too, because the one shape where this
-        matters -- ``update_state``'s own mutate callback raising
-        (``reasons=["unknown"]``, state left exactly as it was before the
-        mutate, per its own docstring) -- is not otherwise exercised.
-        Pins the current, intended behaviour: an unrelated mutate crash is
-        not reported as a persist failure."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-
-        def crashing_update_state(name, cwd, mutate):
-            current, _reasons = _hook_state.read_state(name, cwd)
-            return current, ["unknown"]
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
-                mock.patch.object(_hook_state, "update_state", side_effect=crashing_update_state):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            with mock.patch("sys.stderr"):
-                self._run(session_id="sess-1")
-
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        self.assertNotIn("state_write_failed", [e["reason"] for e in entries])
-        self.assertEqual(entries[-1]["reason"], "identity_changed")
-
-    def test_identity_drift_persists_despite_a_degraded_lock_without_a_spurious_failure_row(self):
-        """R3-c01 (a regression in the R2-c11 fix above): `_hook_state.
-        update_state` can return a NON-EMPTY `reasons` list even when the
-        write itself SUCCEEDED -- `_locked` degrades to writing UNLOCKED
-        (appending `lock_unavailable`) rather than dropping the write when
-        `flock` itself is refused (e.g. an NFS home without lock support).
-        The code this fixes treated ANY non-empty `persist_reasons` as
-        "persist failed" and appended a bogus `state_write_failed` row on
-        top of the correctly-recorded `identity_changed` one -- and because
-        `session_inject._failure_report` only reads the ledger's LAST row,
-        that bogus row buried the real one."""
-        self._write("2026-09-20-1000-x.md")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["reason"], "none")
-
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"), \
-                mock.patch.object(_hook_state.fcntl, "flock", side_effect=OSError("no locks")):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
-            self._run(session_id="sess-1")
-
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        self.assertEqual(entries[-1]["reason"], "identity_changed")
-        self.assertTrue(entries[-1]["identity_changed"])
-        self.assertNotIn("state_write_failed", [e["reason"] for e in entries])
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(state.get("container_id"), "dev-box-b")  # persisted despite the degraded lock
-
-        # And the drift is not re-reported next run: the persist really landed.
-        with mock.patch.object(_identity, "container_id", return_value="dev-box-b"):
-            self.backend.reply(200, _page()).reply(201, {"memory_id": "m3"})
-            self._run(session_id="sess-1")
-        self.assertNotEqual(self._last_entry()["reason"], "identity_changed")
-
-    def test_corrupt_state_file_is_repaired_without_a_spurious_failure_row(self):
-        """R3-c01, second scenario: a state file that fails to PARSE (not
-        merely missing a key, contrast `test_identity_drift_unknown_does_
-        not_set_identity_changed` below) makes `_hook_state.read_state`
-        return `({}, ["unknown"])`; `identity_drift` then reports
-        `unknown`, not `identity_changed` (R2-c06), since the previous
-        identity is unknowable. The SAME corrupted read also flows through
-        the persist step's own `update_state` call, which rebuilds from
-        `{}` and WRITES A VALID FILE -- so persisting this run's
-        container_id actually SUCCEEDS and repairs the state, even though
-        `update_state` still returns `reasons=["unknown"]` (not `[]`) for
-        that call. The old code read any non-empty `persist_reasons` as
-        failure and appended a bogus `state_write_failed` row on top of
-        the correctly-recorded `unknown`."""
-        self._write("2026-09-20-1000-x.md")
-        state_path = _hook_state.state_path(_MOD.HOOK, self.cwd)
-        os.makedirs(os.path.dirname(state_path), exist_ok=True)
-        with open(state_path, "w", encoding="utf-8") as fh:
-            fh.write("{not valid json")
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        with mock.patch("sys.stderr"):
-            self._run(session_id="sess-1")
-
-        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        self.assertEqual(entries[-1]["reason"], "unknown")
-        self.assertNotIn("state_write_failed", [e["reason"] for e in entries])
-        state, reasons = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertEqual(reasons, [])  # the corrupt file was repaired, not left broken
-        self.assertEqual(state.get("container_id"), CONTAINER)
-
-    def test_identity_drift_unknown_does_not_set_identity_changed(self):
-        """R2-c06: `_hook_state.identity_drift` returns `['unknown']` --
-        NOT `['identity_changed']` -- when the previous identity is
-        UNKNOWABLE (state exists but carries no `container_id`, e.g. a
-        corrupted or pre-migration state file): a genuinely different
-        condition from "the identity changed". The old code treated ANY
-        non-empty `drift_reasons` as `identity_changed=True`, conflating
-        the two and sending a debugger chasing a container swap that never
-        happened."""
-        self._write("2026-09-20-1000-x.md")
-        _hook_state.update_state(_MOD.HOOK, self.cwd, lambda s: {**s, "some_other_key": "x"})
-        self.assertTrue(_hook_state.state_exists(_MOD.HOOK, self.cwd))
-        state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
-        self.assertNotIn("container_id", state)
-
-        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
-        with mock.patch("sys.stderr"):
-            self._run(session_id="sess-1")
-        entry = self._last_entry()
-        self.assertEqual(entry["reason"], "unknown")
-        self.assertNotIn("identity_changed", entry)
 
     def test_calls_is_recorded_as_unknown_not_zero_when_the_work_is_abandoned(self):
         """R1-c09: `run["calls"]` is only assigned AFTER `upsert` returns --
@@ -4237,9 +3676,9 @@ class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
         self.assertIn(("_ingest_client", "IngestClient"), visited)
         self.assertIn(("_identity", "memory_dir_key"), visited)
         self.assertIn(("_identity", "project_key"), visited)
-        # identity_drift is reached through the run-captured container_id,
-        # not through a fresh _identity.container_id() on the worker.
-        self.assertIn(("_hook_state", "read_state_at"), visited)
+        # A9-11 (owner 2026-10-01): no read_state_at here anymore -- the
+        # drift check it fed is gone from this hook entirely; asserting its
+        # reachability would pin deleted machinery.
 
     def test_the_same_walk_does_find_main_s_own_reads(self):
         """The control: main() -- on the calling thread -- is where the
@@ -4249,7 +3688,8 @@ class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
         in_main = {read for module, function, read, _line in reads if (module, function) == ("handoff_sync", "main")}
         self.assertIn("os.environ", in_main)
         reached = {r[:3] for r in reads}
-        self.assertIn(("_hook_state", "state_root", "os.environ"), reached)
+        # A9-11: state_root is no longer pre-read either -- this hook has
+        # no state file at all now, so there is nothing to root.
         self.assertIn(("_identity", "container_id", "os.environ"), reached)
         self.assertIn(("_identity", "aria_uuid", "os.path.expanduser"), reached)
 

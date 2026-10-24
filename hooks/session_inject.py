@@ -708,39 +708,40 @@ def _ledger_names(cwd):
     return sorted(names)
 
 
+# A9-20 (owner 2026-10-01): one-time, DESTRUCTIVE failure reasons. Unlike a
+# transient http_error -- which the next run reproduces on its own if it is
+# still true -- these are facts about one exact run (rows soft-deleted will
+# not be there to merge or delete again), so a report that loses them to a
+# same-round priority collision or to a later quiet row is a report that
+# never happens at all. The scanner below revives them from any row newer
+# than the one last reported, scalar reason or also_failed.
+_ONE_TIME_REASONS = ("dedup_merged", "orphans_deleted")
+
+
 def _failure_report(cwd):
     """Look at every hook's ledger. Returns ``(findings, marks)``.
 
-    ``findings`` is a list of one-line strings, one per hook whose latest run
-    failed and has not been reported yet; ``marks`` is the full "reported"
-    map to persist (hook -> identity of what was reported), including entries
-    already reported -- a hook whose ledger became clean again drops out, so
-    the next failure is news again.
+    Steady state is unchanged from before A9-20: a hook whose LAST row
+    failed is reported, a hook whose last row is a clean skip is quiet.
+    Added by A9-20: `dedup_merged` / `orphans_deleted` are additionally
+    scanned out of every row NEWER than the last-reported one, whether they
+    survived as the row's own scalar reason or only in its ``also_failed``
+    -- worst_reason's priority table can crowd them out of the scalar, and
+    a later ``unchanged`` row buries them below the last row entirely.
+
+    The mark is WHICH row was seen (``ts|reason`` of the newest row -- the
+    same shape the pre-A9-20 marks already used, so an upgrade reads them
+    as-is); it persists only after a successful stdout write (see
+    ``_record``), so a report the session never saw is delivered again.
     """
     state, _ = _hook_state.read_state(HOOK, cwd)
     already = state.get("reported") if isinstance(state.get("reported"), dict) else {}
-    seen_raw = state.get(_SEEN_EXPECTED_LEDGERS_KEY)
-    # ruling 4 (R1-c21): a hook newly present in _EXPECTED_LEDGERS but absent
-    # from what THIS project was already told about gets one silent grace
-    # SessionStart -- `main()` persists the current _EXPECTED_LEDGERS here
-    # unconditionally afterwards (see below), so it is only ever absent once
-    # per hook, on the first start after it was added (or, for legacy state
-    # written before this key existed, before the key's own introduction).
-    #
-    # Each ELEMENT is also type-checked, not just the list itself (R3-c08):
-    # `set(seen_raw)` alone raises `TypeError` on an unhashable element (a
-    # stray list/dict, however it got there), which escapes this function
-    # entirely -- `_collect`'s own `except Exception` catches it, but that
-    # leaves `run["marks"]` at its initial `None`, and `_record` reads
-    # `marks is None` as "the ledgers were never read this run; leave the
-    # markers alone" and skips the persist that would otherwise have
-    # overwritten the bad value. Every later SessionStart hits the exact
-    # same `TypeError` forever, with no self-healing write to break the
-    # loop -- unlike the sibling `reported` key three lines up, which
-    # already has this same `isinstance` guard.
+    seen_expected = state.get(_SEEN_EXPECTED_LEDGERS_KEY)
+    # (the per-element isinstance guard and the grace-period semantics here
+    # are unchanged from the pre-A9-20 revision: R1-c21 / R3-c08.)
     seen_expected = (
-        {h for h in seen_raw if isinstance(h, str)}
-        if isinstance(seen_raw, list)
+        {h for h in seen_expected if isinstance(h, str)}
+        if isinstance(seen_expected, list)
         else set(_LEGACY_EXPECTED_LEDGERS)
     )
     own_entries, _ = _hook_state.read_ledger(HOOK, cwd)
@@ -753,22 +754,56 @@ def _failure_report(cwd):
         if not exists:
             if hook in _EXPECTED_LEDGERS and hook in seen_expected and not first_start:
                 key, text = "missing", f"{hook} has never recorded a run (is its hook firing?)"
-            else:
-                continue  # a first start, a hook not installed, or one newly expected (grace period)
-        elif not entries and "unknown" in reasons:
+                marks[hook] = key
+                if already.get(hook) != key:
+                    findings.append(text)
+            continue  # a first start, a hook not installed, or one newly expected (grace period)
+        if not entries and "unknown" in reasons:
             key, text = "unreadable", f"{hook} ledger is unreadable"
-        elif not entries:
+            marks[hook] = key
+            if already.get(hook) != key:
+                findings.append(text)
+            continue
+        if not entries:
             continue  # exists and empty: nothing has happened yet
-        else:
-            last = entries[-1]
-            reason = last.get("reason")
-            if not (_hook_state.is_failure_reason(reason) or last.get("ok") is False):
-                continue
-            ts = str(last.get("ts", ""))
-            key, text = f"{ts}|{reason}", f"{hook} failed its last run ({reason}, {_age_of(ts)} ago)"
-        marks[hook] = key
-        if already.get(hook) != key:
-            findings.append(text)
+
+        # The last-row rule, as before A9-20.
+        last = entries[-1]
+        last_reason = last.get("reason")
+        last_key = "{}|{}".format(last.get("ts", ""), last_reason)
+        last_failed = _hook_state.is_failure_reason(last_reason) or last.get("ok") is False
+        reported_here = []  # (from_end, reason) already emitted for this hook
+        if last_failed and already.get(hook) != last_key:
+            findings.append(
+                f"{hook} failed a run ({last_reason}, {_age_of(str(last.get('ts', '')))} ago)"
+            )
+            reported_here.append((1, str(last_reason)))
+
+        # The A9-20 rescan: one-time reasons in any row newer than the
+        # last-reported one. The mark names the seen row; the same-identity
+        # row found again marks the boundary (matched from the END, so a
+        # ts/reason collision resolves to the newest such row).
+        anchor = already.get(hook)
+        anchor_from_end = None
+        if isinstance(anchor, str):
+            for from_end, row in enumerate(reversed(entries), 1):
+                if "{}|{}".format(row.get("ts", ""), row.get("reason")) == anchor:
+                    anchor_from_end = from_end
+                    break
+        for from_end, row in enumerate(reversed(entries), 1):
+            if anchor_from_end is not None and from_end >= anchor_from_end:
+                break
+            for reason in [row.get("reason"), *(row.get("also_failed") or [])]:
+                if reason in _ONE_TIME_REASONS and (from_end, str(reason)) not in reported_here:
+                    findings.append(
+                        "{} reported {} on a run ({} ago)".format(
+                            hook, reason, _age_of(str(row.get("ts", "")))
+                        )
+                    )
+                    reported_here.append((from_end, str(reason)))
+        # Mark the newest row as seen, failure or not -- a hook that went
+        # clean drops out of the failure rules and its NEXT failure is news.
+        marks[hook] = last_key
     return findings, marks
 
 
@@ -1169,7 +1204,27 @@ def _record(reason, started, run):
                 return next_state
             _hook_state.update_state(HOOK, cwd or os.getcwd(), mutate)
         except Exception as exc:  # noqa: BLE001
+            # A10 D4: this runs AFTER this round's ledger row is already on
+            # disk, so the failure cannot be folded into that row -- a
+            # second, independent state_write_failed row records it, and
+            # the next SessionStart's failure report picks it up (it is
+            # failure-class, A4-1). The marker persistence is deliberately
+            # NOT moved before the row to "fix" this: both share this one
+            # budgeted writer, and reordering would let a stuck state lock
+            # eat the row too.
             print(f"[{HOOK}] could not persist the inject state: {exc!r}", file=sys.stderr)
+            try:
+                _hook_state.record_run(
+                    HOOK,
+                    ok=False,
+                    reason="state_write_failed",
+                    elapsed_ms=0,
+                    calls=None,
+                    cwd=cwd,
+                    extra={"detail": f"state persist failed after this run ({reason})"},
+                )
+            except Exception as exc2:  # record_run does not raise by contract; the net under it
+                print(f"[{HOOK}] could not record state_write_failed: {exc2!r}", file=sys.stderr)
 
     left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
     if left_behind:

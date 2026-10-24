@@ -2436,5 +2436,88 @@ class TestRecipe(_LedgerCase):
         self.assertIn("Facts since last session:", brief)  # facts still present
 
 
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# A9-20 + A10 D4 — one-time reasons survive burial; state-write failures land
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestOneTimeReasonsSurviveBurial(_ReportCase):
+
+    def test_a_same_round_burial_is_read_out_of_also_failed(self):
+        """worst_reason crowded dedup_merged out of the row's own scalar (an
+        http_error from a later file won the priority table); the report
+        still names it, reading the row's also_failed."""
+        self._write_ledger("handoff-sync", [
+            {**_entry("http_error", "2026-09-21T09:00:00Z", hook="handoff-sync"),
+             "also_failed": ["dedup_merged"]},
+        ])
+        parsed, _ = self._start()
+        self.assertIn("dedup_merged", parsed["systemMessage"])
+
+    def test_a_previous_round_burial_is_reported_on_the_next_start(self):
+        """Two SessionEnds before one SessionStart: the dedup round's row was
+        buried under a later unchanged row before any start could see it as
+        the last row. The scanner reads it out from below."""
+        self._write_ledger("memory-sync", [
+            _entry("dedup_merged", "2026-09-21T09:00:00Z", hook="memory-sync"),
+            _entry("unchanged", "2026-09-21T10:00:00Z", hook="memory-sync"),
+        ])
+        parsed, _ = self._start()
+        self.assertIn("dedup_merged", parsed["systemMessage"])
+        # And exactly once: the next start is quiet about it.
+        parsed2, _ = self._start()
+        self.assertNotIn("dedup_merged", (parsed2 or {}).get("systemMessage", ""))
+
+    def test_a_report_the_stdout_never_carried_is_delivered_again(self):
+        """The reported mark persists only after a successful stdout write
+        (A9-11): a start whose stdout failed re-delivers the finding."""
+        self._write_ledger("session-capture", [
+            _entry("http_error", "2026-09-21T09:00:00Z", hook="session-capture"),
+        ])
+        # First start: the brief write itself fails, so the mark never
+        # lands. main() is called directly (not via _main, whose own stdout
+        # StringIO would shadow the broken one).
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("reader went away")
+
+        with mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([
+                    _page([_mem_row("row", branch="feat/inject")]), _page([]),
+                ])), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", Broken()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            _MOD.main()
+        message = self._system_message()
+        self.assertIsNotNone(message, "the finding is re-delivered after the lost stdout")
+
+
+class TestStateWriteFailureLands(_LedgerCase):
+    """A10 D4, update-side: a state persist that fails AFTER this round's
+    ledger row was written appends a second, independent state_write_failed
+    row -- never folded back into the row it postdates."""
+
+    def test_a_failing_state_persist_appends_the_failure_row(self):
+        self._patch(mock.patch.object(
+            _identity, "project_key",
+            return_value=("nexus", _identity.PROJECT_SOURCE_ENV),
+        ))
+        self._patch(mock.patch.object(
+            _hook_state, "update_state", side_effect=OSError("disk full"),
+        ))
+        queue = lambda: _UrlopenCapture([
+            _page([_mem_row("row", branch="feat/inject", project="nexus")]),
+            _page([]), {"profile": []},
+        ])
+        self._main(queue())
+        entries = self._entries()
+        self.assertEqual([e["reason"] for e in entries[-2:]],
+                         ["none", "state_write_failed"])
+        # And the next SessionStart reports it (failure-class, A4-1).
+        out, _ = self._main(queue())
+        self.assertIn("state_write_failed", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
