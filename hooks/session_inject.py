@@ -30,27 +30,42 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
   - Request body uses ``profile_limit`` (NOT ``limit`` — ContextRequest has no
     ``limit`` field; a stray ``limit`` is silently ignored and the result
     degrades to the default 5). recent_hours=72, ranking_strategy=quality_rerank.
-  - Two-tier fallback (§6 same-branch-first -> project-level, v1 simplification):
-    first request carries metadata_filter (branch + container_id); if the
-    returned profile is empty, a SECOND request is sent WITHOUT metadata_filter
-    (project-level recall). This is the simplified stand-in for the full
-    primary/same-branch-cross-container/project three-tier recall.
-    Known limit since the layer whitelist (10CG/nexus-claude-plugin#32): tier
-    1 used to come back empty almost always (migrated summaries carry no
-    branch, observations are filtered out), so tier 2 ran and rendered the
-    migrated summaries. Now this container's own aggregated episodes fill
-    tier 1 -- on the current branch, or across all branches when the branch
-    is unknown, since the filter is then ``container_id`` alone -- and tier 2
-    is not sent. Tier 2 is the usual source of the migrated summaries, of this
-    container's other branches, and of the other container's rows -- "usual"
-    because a hybrid tenant's sentence channel sends no filter at all, so rows
-    of any of those kinds can arrive in tier 1 anyway. A start then sees its
-    own episodes and typically not the other container's -- before the
-    whitelist it saw neither. Workflow D (change 2 TASK-007) replaces these tiers with
-    per-container grouping and peer look-ups and ships in the same release
-    (TASK-008); until then an installed client stays on the snapshot it was
-    installed from, but the marketplace source pins no ref, so a fresh
-    install or an update takes main HEAD. A test pins it.
+  - Three segments, each with its own try and timeout (workflow D, TASK-007;
+    a failure in one segment never costs the others their brief):
+    (1) episodes -- one ``GET /v1/memories?layer=session_summary&branch=&project=&limit=100``
+    page, verified row by row (layer / branch / project; mismatches are
+    dropped and counted as ``filter_suspect`` -- the CLIENT layer whitelist is
+    gone, layers are decided server-side and CHECKED here), grouped by
+    container: peers first (latest 2 per container, groups by their newest
+    row, peers <= 4), own rows filling to 5. No peer rows in the page -> one
+    look-up per state-remembered peer (<= 2). Still nothing -> the page is
+    retried once WITHOUT branch (project-level, same rules). Handoff rows
+    (``aria.source=handoff``) render first, the newest per container in full
+    (title + pre-§2 head + §6, ~1500 chars) and older ones as one title line
+    (A9-10); their age anchor is ``aria.updated_at``. Every other row's age
+    is the response's top-level ``created_at`` (metadata keys are legacy
+    fallback only).
+    (2) fact delta -- ``GET /v1/memories?layer=fact&updated_after=<marker -
+    10min>&project=&limit=100``, keyset-paged with ``before_created_at`` +
+    ``before_id`` (byte-exact from the previous page's last row; NEVER
+    offset -- ``updated_after`` + offset is a 422, #499), <= 5 pages, deduped
+    by id, own container's rows dropped, M=10 by ``aria.modified`` desc,
+    rendered as ``aria.description`` only. The marker advances ONLY on a
+    cleanly-completed startup round (any page failure or truncation -> no
+    advance; compact/resume -> no advance), is bound to user_id, and a first
+    run / state loss / user change starts from now - 7 days with a
+    systemMessage note.
+    (3) semantic -- project-scoped ``POST /context/retrieve`` (query
+    non-empty, ``layers=["semantic"]``, no graph/history/recent,
+    ``metadata_filter={"project": slug}``), rows verified against the project;
+    ``ai_profile`` is NEVER rendered (it rides include_profile, cannot be
+    turned off, and is not project-scoped -- nexus PR #620). No derivable
+    project -> the segment is not sent at all.
+  - The three-state profile contract (nexus#613): ``profile: null`` PLUS
+    ``errors.profile`` is a semantic-layer failure (reported); ``[]`` is an
+    honest "nothing matched"; ``null`` without errors means not requested.
+  - The whole brief is <= 4000 chars: episode-priority -- fact items are
+    dropped whole first, then the episode tail goes.
   - HTTP headers MUST include a User-Agent (SPIKE #8: requests through the CF
     proxy with no UA are blocked by CF 1010 Bot Fight Mode), plus X-API-Key,
     Content-Type, and X-Nexus-Source: sessionstart-hook/<plugin version>.
@@ -104,7 +119,7 @@ import os
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Siblings are imported by name, which only works while this file's directory
 # is on sys.path. PYTHONSAFEPATH=1 / `python -P` (3.11+) takes it off, and this
@@ -219,10 +234,34 @@ HOOK = "session-inject"  # names the ledger file
 # attributed to "unknown" before anyone looked. Renaming it here redoes that.
 SOURCE_NAME = "sessionstart-hook"
 
-# Per-request timeouts; worst-case total (tier1 + tier2) stays ~10s so a slow
-# backend never stalls session start beyond that (fail-open caps it anyway).
-_TIER1_TIMEOUT_SECONDS = 6
-_TIER2_TIMEOUT_SECONDS = 4
+# Per-request timeouts (workflow D, TASK-007). The episode page is the one
+# expensive call (6 s); every other call -- peer look-ups, the project-level
+# retry, each fact page, the semantic segment -- gets 3 s. Worst case stays
+# under _WORK_BUDGET_SECONDS, and run_with_deadline's abandon is the backstop
+# (a round cut short there never advances the fact marker).
+_EPISODE_TIMEOUT_SECONDS = 6
+_SMALL_CALL_TIMEOUT_SECONDS = 3
+
+# The recipe (proposal D + TASK-007 verification): episode page + peer
+# look-ups + project-level retry, fact delta with keyset paging, semantic
+# segment, 4000-char budget.
+_EPISODE_LIMIT = 100            # one page, the endpoint's cap
+_EPISODE_RENDER_TOTAL = 5       # peers first, own rows fill up to this
+_PEER_ROWS_PER_GROUP = 2        # per peer container, latest first
+_PEER_TOTAL = 4                 # across all peer containers
+_PEER_QUERY_MAX = 2             # state-known peers actually queried
+_PEER_STATE_MAX = 4             # peers remembered in state (query newest 2)
+_FACT_MAX_PAGES = 5             # beyond this: fact_delta_truncated
+_FACT_DIAL_BACK_MINUTES = 10    # covers stamp-then-commit rows and clock skew
+_FACT_RENDER_LIMIT = 10         # M, ordered by aria.modified desc
+_BASELINE_DAYS = 7              # first run / state loss / user change
+_BRIEF_CHAR_BUDGET = 4000       # episode-priority; facts dropped item-wise first
+_HANDOFF_RENDER_CHARS = 1500    # latest handoff per container, line-boundary cap
+
+# session-inject's own state keys, next to `reported` / `container_id`:
+_FACT_MARKER_KEY = "fact_marker"          # ISO instant the last round advanced from
+_FACT_MARKER_USER_KEY = "fact_marker_user_id"  # the marker is bound to user_id (owner 2026-10-17)
+_SEEN_CONTAINERS_KEY = "seen_containers"  # peer container ids seen in episodes, newest first
 # How long the ledger write may hold up the exit. Normally it takes
 # milliseconds; this is the cap for when it does not (see _record).
 # hooks.json `timeout` is checked against these numbers by a test.
@@ -259,20 +298,6 @@ class _BadResponse(Exception):
     challenge page), or JSON of the wrong shape."""
 
 
-# The server-side tasks whose results are merged into `profile`. The backend
-# degrades gracefully: when one of them raises, the response is still 200, with
-# the exception text under `errors[<task>]`.
-_PROFILE_TASKS = ("profile", "recent")
-
-# The layers the brief renders, best first. `session_summary` is what the
-# backend's session aggregator writes (and what `services/context.py`'s layer
-# preference ranks first); `summary` is the claude-mem migration (no branch,
-# no session_id). Matching `summary` alone dropped every aggregated row
-# (10CG/nexus-claude-plugin#32). `observation` stays out on purpose: raw
-# activity granularity is noise in a warm-start.
-_SETTLED_LAYERS = ("session_summary", "summary")
-_SETTLED_RANK = {layer: rank for rank, layer in enumerate(_SETTLED_LAYERS)}
-
 
 def _current_branch(cwd):
     """Return the current git branch, or None if not a git repo / git failed.
@@ -288,11 +313,20 @@ def _current_branch(cwd):
 
 
 def _retrieve(base_url, token, user_id, metadata_filter, timeout):
-    """POST one context/retrieve request; return the parsed JSON dict (or None)."""
+    """POST one context/retrieve request (the semantic segment). Returns the
+    parsed JSON dict; raises _BadResponse / urllib errors."""
+    # Workflow D: the semantic segment is project-scoped, semantic layer only.
+    # NO recent layer (it bypasses metadata_filter), no graph, no history; the
+    # query must be non-empty or the backend falls back to an UNFILTERED
+    # recent-memories list. `ai_profile` comes back with include_profile and
+    # cannot be turned off -- it is simply never rendered (PR nexus#620).
     body = {
         "user_id": user_id,
         "query": "session start: recent work context",
-        "recent_hours": 72,
+        "layers": ["semantic"],
+        "include_profile": True,
+        "include_history": False,
+        "include_graph": False,
         # MUST be profile_limit, NOT limit (ContextRequest has no `limit` field).
         "profile_limit": 10,
         "ranking_strategy": "quality_rerank",
@@ -320,55 +354,312 @@ def _retrieve(base_url, token, user_id, metadata_filter, timeout):
 
 
 def _rows_from(ctx, run):
-    """The settled rows of one response, after checking it is one.
+    """The profile rows of one context/retrieve answer, after checking it is
+    one -- and after the #613 contract made the three states readable.
 
-    Reading only `profile` is how a backend outage used to look exactly like a
-    project with no memories: `profile: null` plus `errors: {"profile": ...}`
-    came back as an empty list, and the run was recorded as `nothing_to_do` --
-    an expected skip, never reported.
+    ``profile: null`` PLUS ``errors.profile`` is a semantic-layer FAILURE
+    (reported; the rest of the brief still renders). ``profile: []`` is an
+    honest "queried fine, nothing matched". ``null`` with no errors means the
+    layer was not requested. Before nexus#613 the failure state arrived as
+    ``profile: null`` with NO ``errors`` -- indistinguishable from an empty
+    project -- and the run was recorded as `nothing_to_do`, an expected skip
+    that is never reported.
     """
     if not isinstance(ctx, dict):
         raise _BadResponse(f"expected a JSON object, got {type(ctx).__name__}")
     errors = ctx.get("errors")
-    if isinstance(errors, dict):
-        failed = sorted(set(run["extra"].get("backend_errors", [])) | (set(errors) & set(_PROFILE_TASKS)))
-        if failed:
-            run["extra"]["backend_errors"] = failed
+    if isinstance(errors, dict) and "profile" in errors:
+        run["extra"]["backend_errors"] = sorted(
+            set(run["extra"].get("backend_errors", [])) | {"profile"}
+        )
     profile = ctx.get("profile")
     if profile is None:
         return []
     if not isinstance(profile, list) or not all(isinstance(row, dict) for row in profile):
         raise _BadResponse("`profile` is not a list of objects")
-    return _settled_rows(profile)
+    return list(profile)
 
 
-def _settled_rank(row):
-    """The row's position in ``_SETTLED_LAYERS``, or ``None`` if not rendered."""
-    layer = (row.get("metadata") or {}).get("layer")
-    # isinstance first: a dict lookup hashes, and a list-valued layer from a
-    # confused writer would raise and take the whole brief down with it.
-    return _SETTLED_RANK.get(layer) if isinstance(layer, str) else None
+def _list_memories(base_url, token, user_id, params, timeout):
+    """GET one /v1/memories page; return the raw rows (list of dicts).
 
-
-def _settled_rows(profile):
-    """Filter profile rows to settled summaries, ``session_summary`` first.
-
-    If NO row carries a ``layer`` metadata key at all, take every row (no layer
-    dimension present -> nothing to filter on).
+    ``params`` are the deterministic list filters (layer / branch /
+    container_id / project / updated_after / before_created_at / before_id /
+    limit). Values are urlencoded -- cursor values go back EXACTLY as the
+    response gave them, and hand-joining a query string would re-encode them
+    differently.
     """
-    rows = [r for r in profile if isinstance(r, dict)]
-    has_layer = any("layer" in (r.get("metadata") or {}) for r in rows)
-    if not has_layer:
-        return rows
-    ranked = []
+    from urllib.parse import urlencode
+    query = {"user_id": user_id, **{k: v for k, v in params.items() if v is not None}}
+    req = urllib.request.Request(
+        f"{base_url}/memories?{urlencode(query)}",
+        headers={
+            "User-Agent": _USER_AGENT,
+            "X-Nexus-Source": _identity.source_header(SOURCE_NAME),
+            **({"X-API-Key": token} if token else {}),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        try:
+            body = json.load(resp)
+        except ValueError as exc:
+            raise _BadResponse(f"body is not JSON: {exc}") from exc
+    if not isinstance(body, dict) or not isinstance(body.get("memories"), list):
+        raise _BadResponse("`memories` is not a list")
+    if not all(isinstance(row, dict) for row in body["memories"]):
+        raise _BadResponse("`memories` holds a non-object row")
+    return body["memories"]
+
+
+def _verify_rows(rows, run, *, layer=None, branch=None, project=None):
+    """Row-by-row verification of what the server was asked to filter.
+
+    The client layer whitelist is GONE (#30's empty-recall mechanism): layers
+    are decided server-side and CHECKED here, one row at a time -- trusting
+    the filter without checking it is how a filter bug would silently empty
+    the brief. Every dropped row counts toward `filter_suspect`.
+    """
+    kept = []
+    dropped = 0
     for row in rows:
-        rank = _settled_rank(row)
-        if rank is not None:
-            ranked.append((rank, row))
-    # Sorted on the rank alone, and sort is stable: within a layer the
-    # backend's order is kept.
-    ranked.sort(key=lambda pair: pair[0])
-    return [row for _, row in ranked]
+        meta = row.get("metadata") or {}
+        if layer is not None and meta.get("layer") != layer:
+            dropped += 1
+            continue
+        if branch is not None and meta.get("branch") != branch:
+            dropped += 1
+            continue
+        if project is not None and meta.get("project") != project:
+            dropped += 1
+            continue
+        kept.append(row)
+    if dropped:
+        run["extra"]["filter_suspect"] = run["extra"].get("filter_suspect", 0) + dropped
+    return kept
+
+
+def _row_time(row):
+    """The row's sort time: top-level ``created_at`` (the list endpoint puts
+    it there; metadata keys are a LEGACY fallback only). ``None`` when no
+    usable timestamp -- callers sort those last."""
+    raw = row.get("created_at")
+    if not (isinstance(raw, str) and raw):
+        meta = row.get("metadata") or {}
+        raw = meta.get("valid_from") or meta.get("original_created_at")
+    if not (isinstance(raw, str) and raw):
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    except ValueError:
+        return None
+
+
+def _handoff_time(row):
+    """A9-10: a handoff row's age anchor is ``aria.updated_at`` (parsed as a
+    time), falling back to ``created_at`` -- its content is REWRITTEN on every
+    sync, so created_at would show the first write, not the last."""
+    raw = (row.get("metadata") or {}).get("aria.updated_at")
+    if not (isinstance(raw, str) and raw):
+        return _row_time(row)
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    except ValueError:
+        return _row_time(row)
+
+
+def _aria_modified(row):
+    """The fact delta's ordering key: ``aria.modified`` (peer backfills share
+    a created_at week; created_at order would be a lottery). Missing parses as
+    the epoch, sorting last."""
+    raw = (row.get("metadata") or {}).get("aria.modified")
+    if isinstance(raw, str) and raw:
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _age_row(row):
+    """Age string for one row. Handoff rows anchor on aria.updated_at
+    (A9-10); everything else on created_at (TASK-007), with the metadata
+    keys as the legacy fallback."""
+    if (row.get("metadata") or {}).get("aria.source") == "handoff":
+        ts = _handoff_time(row)
+    else:
+        ts = _row_time(row)
+    if ts is None:
+        return "?"
+    secs = (datetime.now(timezone.utc) - ts).total_seconds()
+    if secs < 0:
+        return "0m"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+def _row_container(row):
+    container = (row.get("metadata") or {}).get("container_id")
+    return container if isinstance(container, str) and container else "?"
+
+
+def _pick_episodes(rows, own_container):
+    """Group by container and pick: peers first (latest 2 per group, groups
+    by their newest row, peers total <= 4), own rows filling up to 5 total --
+    own >= 1 whenever own rows exist (peers can never take the 5th slot).
+
+    Returns ``(picked, peer_ids)``; ``picked`` is handoff-first (proposal D).
+    """
+    groups = {}
+    for row in rows:
+        groups.setdefault(_row_container(row), []).append(row)
+    peers = [c for c in groups if c != own_container]
+    peers.sort(key=lambda c: _handoff_time(groups[c][0]) or _row_time(groups[c][0]) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    picked = []
+    peer_total = 0
+    for c in peers:
+        if peer_total >= _PEER_TOTAL:
+            break
+        take = groups[c][:_PEER_ROWS_PER_GROUP]
+        picked.extend(take)
+        peer_total += len(take)
+    for row in groups.get(own_container, []):
+        if len(picked) >= _EPISODE_RENDER_TOTAL:
+            break
+        picked.append(row)
+    # aria.source=handoff rows render first (stable within each band).
+    picked.sort(key=lambda r: (r.get("metadata") or {}).get("aria.source") != "handoff")
+    return picked, peers
+
+
+def _episode_segment(base_url, token, user_id, branch, project, own_container, state, run):
+    """One episode page + verification + grouping + peer look-ups + the
+    project-level retry. Returns ``(picked_rows, peers_seen)``.
+
+    Peer look-ups fire only when the page that produced the result had no
+    peer rows (the call budget: 1 page + <= 2 peer queries + <= 1 retry).
+    """
+    def page(extra, timeout):
+        params = {"layer": "session_summary", "limit": _EPISODE_LIMIT, "project": project}
+        if branch is not None:
+            params["branch"] = branch
+        params.update(extra)
+        run["calls"] += 1
+        return _verify_rows(
+            _list_memories(base_url, token, user_id, params, timeout),
+            run, layer="session_summary", branch=branch, project=project,
+        )
+
+    kept = page({}, _EPISODE_TIMEOUT_SECONDS)
+    picked, peers = _pick_episodes(kept, own_container)
+    if not peers:
+        # Grouping can only reorder rows the page already returned; a peer
+        # whose rows fell outside the window needs a look-up of its own.
+        remembered = [
+            c for c in (state.get(_SEEN_CONTAINERS_KEY) or [])
+            if isinstance(c, str) and c != own_container
+        ][:_PEER_QUERY_MAX]
+        for peer in remembered:
+            peer_rows = page({"container_id": peer, "limit": _PEER_ROWS_PER_GROUP},
+                             _SMALL_CALL_TIMEOUT_SECONDS)
+            picked.extend(peer_rows[:_PEER_ROWS_PER_GROUP])
+        if remembered and not any(_row_container(r) != own_container for r in picked):
+            run["extra"]["peer_absent"] = 1
+    if not picked and branch is not None:
+        # Project-level retry: same rules, no branch scope.
+        branch = None
+        kept = page({}, _SMALL_CALL_TIMEOUT_SECONDS)
+        picked, peers = _pick_episodes(kept, own_container)
+        if not peers:
+            remembered = [
+                c for c in (state.get(_SEEN_CONTAINERS_KEY) or [])
+                if isinstance(c, str) and c != own_container
+            ][:_PEER_QUERY_MAX]
+            for peer in remembered:
+                peer_rows = page({"container_id": peer, "limit": _PEER_ROWS_PER_GROUP},
+                                 _SMALL_CALL_TIMEOUT_SECONDS)
+                picked.extend(peer_rows[:_PEER_ROWS_PER_GROUP])
+            if remembered and not any(_row_container(r) != own_container for r in picked):
+                run["extra"]["peer_absent"] = 1
+    peers_seen = [
+        _row_container(r) for r in kept
+        if _row_container(r) != own_container and _row_container(r) != "?"
+    ]
+    return picked, peers_seen
+
+
+def _fact_segment(base_url, token, user_id, project, own_container, since, run):
+    """The fact delta: pages of layer=fact rows updated since ``since``
+    (already dialed back), keyset-paged (before_created_at + before_id, the
+    previous page's last row, byte-exact; NEVER offset -- updated_after +
+    offset > 0 is a 422, #499), deduped by id, own container dropped, M rows
+    by aria.modified desc.
+
+    Returns ``(fact_rows, truncated)``. Any page failure raises to the
+    caller; a truncated round is flagged so the marker does not advance.
+    """
+    collected = []
+    seen_ids = set()
+    last_created = None
+    last_id = None
+    truncated = False
+    for page_no in range(1, _FACT_MAX_PAGES + 1):
+        params = {
+            "layer": "fact",
+            "limit": _EPISODE_LIMIT,
+            "updated_after": since.isoformat(),
+            "project": project,
+        }
+        if page_no > 1:
+            params["before_created_at"] = last_created
+            params["before_id"] = last_id
+        run["calls"] += 1
+        rows = _list_memories(base_url, token, user_id, params, _SMALL_CALL_TIMEOUT_SECONDS)
+        rows = _verify_rows(rows, run, layer="fact", project=project)
+        rows = [r for r in rows if _row_container(r) != own_container]
+        if not rows:
+            break  # an empty page is the end of the delta
+        for row in rows:
+            row_id = str(row.get("id") or row.get("memory_id") or "")
+            if row_id and row_id in seen_ids:
+                continue  # dial-back overlap: render once
+            if row_id:
+                seen_ids.add(row_id)
+            collected.append(row)
+        last_created = rows[-1].get("created_at")
+        last_id = str(rows[-1].get("id") or "")
+        if page_no == _FACT_MAX_PAGES:
+            truncated = True  # a 5th page that still had rows: unread remainder
+    collected.sort(key=_aria_modified, reverse=True)
+    return collected[:_FACT_RENDER_LIMIT], truncated
+
+
+def _semantic_segment(base_url, token, user_id, project, run):
+    """The optional third segment: project-scoped /context/retrieve, query
+    non-empty, semantic layer only. Returns verified profile rows (rendered
+    like episode rows, after the grouped episodes). ``ai_profile`` is never
+    rendered (it rides include_profile, cannot be switched off, and is not
+    project-scoped -- PR nexus#620). No project -> the segment is NOT sent:
+    an unscoped query only looks scoped."""
+    if not project:
+        return []
+    run["calls"] += 1
+    ctx = _retrieve(
+        base_url, token, user_id, {"project": project}, _SMALL_CALL_TIMEOUT_SECONDS
+    )
+    rows = _rows_from(ctx, run)
+    return _verify_rows(rows, run, project=project)
 
 
 def _age(meta):
@@ -481,46 +772,149 @@ def _failure_report(cwd):
     return findings, marks
 
 
-def _render(rows):
-    """Render the settled rows into a provenance-annotated brief (or None)."""
-    if not rows:
-        return None
-    lines = ["Nexus project memory (cross-container warm-start, settled summaries):"]
-    for r in rows:
-        meta = r.get("metadata") or {}
-        container = meta.get("container_id", "?")
-        branch = meta.get("branch")
-        if not isinstance(branch, str) or not branch.strip():
-            # A migrated summary never had a branch: "-" says "none", where
-            # "?" would suggest one went missing. Empty, blank and non-string
-            # values are missing too; rendered as they came they left an empty
-            # (or nonsense) slot in the bracket.
-            branch = "-" if meta.get("layer") == "summary" else "?"
-        age = _age(meta)
-        content = (r.get("content") or "").strip().replace("\n", " ")
-        if len(content) > 300:
-            content = content[:300] + "…"
-        lines.append(f"  • [{container} · {age} · {branch}] {content}")
-    # One row carrying a lone surrogate made the stdout write raise
-    # UnicodeEncodeError, and every other row went down with it.
-    return "\n".join(lines).encode("utf-8", "replace").decode("utf-8")
+def _handoff_pieces(row):
+    """(title, head, sect6, full) for a handoff row's content.
+
+    head = everything before the `## §2` heading (title, intro and §0 -- the
+    entry section is warm-start gold); sect6 = the `## §6` section, up to the
+    next `## ` heading. A9-10; the real handoff docs spell sections `## §0`,
+    `## §1`, ... so the marker forms are stable.
+    """
+    content = (row.get("content") or "").strip()
+    lines = content.splitlines()
+    title = next((l[2:].strip() for l in lines if l.startswith("# ")), None) \
+        or next((l.strip() for l in lines if l.strip()), "")
+    head_lines, sect6_lines, zone = [], [], "head"
+    for line in lines:
+        if line.startswith("## "):
+            if zone == "head" and "§2" in line:
+                zone = "past2"          # head ends here
+            elif zone == "sect6":
+                zone = "done"           # §6 section ends at the next heading
+            elif "§6" in line:
+                zone = "sect6"
+            continue
+        if zone == "head":
+            head_lines.append(line)
+        elif zone == "sect6":
+            sect6_lines.append(line)
+    return title, "\n".join(head_lines).strip(), "\n".join(sect6_lines).strip(), content
+
+
+def _cap_at_line(text, cap):
+    """Truncate to ~cap chars at a line boundary (never mid-line)."""
+    if len(text) <= cap:
+        return text
+    cut = text[:cap]
+    nl = cut.rfind("\n")
+    return cut[:nl] if nl > 0 else cut
+
+
+def _render_handoff_row(row):
+    """The LATEST handoff of one container: (title, head + §6), the body
+    line-boundary capped at ~1500 chars; no §6 anywhere -> the whole document
+    capped the same way. A9-10."""
+    title, head, sect6, full = _handoff_pieces(row)
+    parts = [part for part in (head, sect6) if part]
+    body = _cap_at_line("\n".join(parts) if parts else full, _HANDOFF_RENDER_CHARS)
+    return title, body
+
+
+def _episode_line(row):
+    """One non-handoff episode/semantic row: provenance bracket + capped
+    content."""
+    meta = row.get("metadata") or {}
+    container = _row_container(row)
+    branch = meta.get("branch")
+    if not isinstance(branch, str) or not branch.strip():
+        branch = "-" if meta.get("layer") == "summary" else "?"
+    content = (row.get("content") or "").strip().replace("\n", " ")
+    if len(content) > 300:
+        content = content[:300] + "…"
+    return f"  • [{container} · {_age_row(row)} · {branch}] {content}"
+
+
+def _fact_line(row):
+    """One fact row: only aria.description (proposal D; the 4000-char budget
+    drops whole items, not half of one)."""
+    meta = row.get("metadata") or {}
+    desc = meta.get("aria.description")
+    if not isinstance(desc, str) or not desc.strip():
+        desc = (row.get("content") or "").strip().replace("\n", " ")[:300]
+    return f"  • [{_row_container(row)} · {_age_row(row)}] {desc.strip()}"
+
+
+def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET):
+    """Assemble the brief: handoff episode groups (A9-10) ahead of plain
+    episode lines (grouped episodes, then semantic rows -- the caller already
+    ordered them), then the fact delta.
+
+    The budget is episode-priority: drop fact items first (whole items), then
+    episode lines from the tail. Returns None when nothing survives.
+    """
+    header = "Nexus project memory (cross-container warm-start):"
+
+    # Split the handoff rows into per-container groups; within each group the
+    # newest row (by aria.updated_at) renders fully, older ones one title line.
+    handoff = [r for r in episode_rows if (r.get("metadata") or {}).get("aria.source") == "handoff"]
+    plain = [r for r in episode_rows if (r.get("metadata") or {}).get("aria.source") != "handoff"]
+    groups = {}
+    for row in handoff:
+        groups.setdefault(_row_container(row), []).append(row)
+    handoff_lines = []
+    for container in groups:
+        ordered = sorted(groups[container], key=_handoff_time, reverse=True)
+        for pos, row in enumerate(ordered):
+            meta = row.get("metadata") or {}
+            branch = meta.get("branch") if isinstance(meta.get("branch"), str) and meta.get("branch") else "?"
+            bracket = f"[{container} · {_age_row(row)} · {branch}]"
+            title, body = _render_handoff_row(row)
+            if pos == 0:
+                handoff_lines.append(f"  • {bracket} {title}\n{body}")
+            else:
+                handoff_lines.append(f"  • {bracket} {title}")
+
+    episode_lines = handoff_lines + [_episode_line(r) for r in plain]
+    fact_lines = [_fact_line(r) for r in fact_rows]
+
+    def assemble(els, fls):
+        parts = [header] + els
+        if fls:
+            parts.append("Facts since last session:")
+            parts.extend(fls)
+        text = "\n".join(parts)
+        return text.encode("utf-8", "replace").decode("utf-8")
+
+    text = assemble(episode_lines, fact_lines)
+    while len(text) > budget and fact_lines:
+        fact_lines.pop()  # whole items only, newest-preserved order
+        text = assemble(episode_lines, fact_lines)
+    while len(text) > budget and episode_lines:
+        episode_lines.pop()  # the episode tail goes last
+        text = assemble(episode_lines, fact_lines)
+    if not episode_lines and not fact_lines:
+        return None  # a bare header is not a brief
+    return text
 
 
 def _collect(run):
-    """Do the work. Returns ``(reason, brief)``; raises if a remote call fails.
+    """Do the work. Returns ``(reason, brief)``; each remote SEGMENT has its
+    own try (proposal D: 段一抛错 → 段二仍渲染, and the other way round).
 
     ``run`` is filled in as facts become known, so that whatever happens next
     -- a return or an exception -- the ledger record has the right project and
     the number of calls actually attempted.
     """
     raw = sys.stdin.read()
-    # SessionStart payload is parsed only to extract cwd.
+    # SessionStart payload: cwd plus `source` (startup / resume / clear /
+    # compact). Only `startup` advances the fact marker (proposal D).
     event = json.loads(raw) if raw.strip() else {}
     if not isinstance(event, dict):
         raise ValueError("SessionStart payload is not a JSON object")
     if isinstance(event.get("cwd"), str) and event["cwd"]:
         run["cwd"] = event["cwd"]
     cwd = run["cwd"] or os.getcwd()
+    source = event.get("source") if isinstance(event.get("source"), str) else ""
 
     # The failure report first, before anything that can return early or
     # raise: the other hooks' failures are worth knowing regardless of how
@@ -539,31 +933,134 @@ def _collect(run):
     user_id = _identity.user_id(cwd)
     container_id = _identity.container_id()
     branch = _current_branch(cwd)
+    # X1-policy (TASK-007): the project scope for every query. Underivable
+    # (None) -> the project-scoped queries are simply not sent: an unscoped
+    # query only LOOKS scoped, and an empty-string scope is an empty answer.
+    project, project_source = _identity.project_key(
+        cwd, os.environ.get(_identity.PROJECT_DIR_ENV)
+    )
+    if project is not None and project_source == _identity.PROJECT_SOURCE_GIT:
+        run["extra"]["project_source"] = "git_fallback"
 
-    # Tier 1: branch + container scoped (branch key omitted if branch unknown).
-    metadata_filter = {"container_id": container_id}
-    if branch:
-        metadata_filter["branch"] = branch
+    # Own state: the fact marker (bound to user_id), the peers remembered
+    # from past episodes, and the last container_id (A9-11 compares here).
+    state = {}
+    state_unknown = False
+    if _hook_state is not None:
+        state, state_reasons = _hook_state.read_state(HOOK, cwd)
+        if not isinstance(state, dict):
+            state = {}
+        # A10 D4: a non-ENOENT read failure must not be silent -- it counts
+        # into THIS round's ledger reason (and forces the fact baseline).
+        state_unknown = "unknown" in (state_reasons or [])
+        if state_unknown:
+            run["extra"]["state_read_unknown"] = True
+        prev_container = state.get("container_id")
+        if isinstance(prev_container, str) and prev_container and prev_container != container_id:
+            # A9-11: report the change once, here, NOT as a ledger reason.
+            # Old rows now count as another container's; the remedy is the env
+            # override. Persisted only after the stdout write succeeded.
+            run["notes"].append(
+                f"container_id changed from {prev_container} to {container_id}; "
+                f"rows written as {prev_container} now count as a peer's. "
+                f"Set NEXUS_CONTAINER_ID={prev_container} and restart to keep the old identity."
+            )
 
-    run["calls"] += 1  # counted before the call: a call that fails was still made
-    ctx = _retrieve(base_url, token, user_id, metadata_filter, _TIER1_TIMEOUT_SECONDS)
-    rows = _rows_from(ctx, run)
-    run["extra"]["tier"] = 1
+    # The fact marker, bound to user_id (owner 2026-10-17): a different
+    # user_id restarts from the baseline and says so (old value vs new).
+    marker = state.get(_FACT_MARKER_KEY)
+    if state.get(_FACT_MARKER_USER_KEY) != user_id:
+        if isinstance(marker, str) and marker:
+            run["notes"].append(
+                f"fact marker rebound: user_id {state.get(_FACT_MARKER_USER_KEY)!r} -> {user_id!r};"
+                " starting from the 7-day baseline"
+            )
+        marker = None
+    if isinstance(marker, str) and marker:
+        try:
+            since = datetime.fromisoformat(marker.replace("Z", "+00:00"))
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+        except ValueError:
+            since = None
+    else:
+        since = None
+    if since is None:
+        since = datetime.now(timezone.utc) - timedelta(days=_BASELINE_DAYS)
+        run["notes"].append(
+            f"fact baseline starts at {since.strftime('%Y-%m-%d %H:%M UTC')} (7 days)"
+        )
+    # The NEW marker is the moment before this round's first request (the
+    # whole round then re-reads anything committed while it ran); it only
+    # advances after the round completes cleanly, on a startup event.
+    marker_now = datetime.now(timezone.utc).isoformat()
+    run["marker_candidate"] = marker_now
+    run["marker_user"] = user_id
 
-    # Tier 2: project-level fallback (no metadata_filter) when tier 1 is empty.
-    if not rows:
-        run["calls"] += 1
-        ctx = _retrieve(base_url, token, user_id, None, _TIER2_TIMEOUT_SECONDS)
-        rows = _rows_from(ctx, run)
-        run["extra"]["tier"] = 2
+    # ── segment 1: episodes (own container grouped first-class, peers
+    # looked up, project-level retry) ──
+    episode_rows = []
+    peers_seen = []
+    episode_failed = False
+    try:
+        episode_rows, peers_seen = _episode_segment(
+            base_url, token, user_id, branch, project, container_id, state, run
+        )
+    except Exception:
+        episode_failed = True  # segment 2 must still render (independent try)
 
-    run["extra"]["rows"] = len(rows)
-    brief = _render(rows)
-    if run["extra"].get("backend_errors"):
-        # Inject whatever did come back, and report what did not.
+    # ── segment 2: the fact delta (keyset pages, dedupe, own rows dropped) ──
+    fact_rows = []
+    fact_failed = False
+    fact_truncated = False
+    try:
+        fact_rows, fact_truncated = _fact_segment(
+            base_url, token, user_id, project, container_id,
+            since - timedelta(minutes=_FACT_DIAL_BACK_MINUTES), run,
+        )
+    except Exception:
+        fact_failed = True
+    if fact_truncated:
+        run["extra"]["fact_delta_truncated"] = 1
+    run["advance_fact_marker"] = (
+        not fact_failed and not fact_truncated and source == "startup"
+    )
+
+    # ── segment 3: project-scoped semantic retrieve (query non-empty) ──
+    semantic_rows = []
+    semantic_failed = False
+    try:
+        semantic_rows = _semantic_segment(base_url, token, user_id, project, run)
+    except Exception:
+        semantic_failed = True
+
+    # Remember the peers this round actually saw (own container excluded),
+    # newest first, bounded: next round's 补查 queries the two newest.
+    seen = [c for c in peers_seen if c not in (container_id, "?")]
+    for prev in (state.get(_SEEN_CONTAINERS_KEY) or []):
+        if isinstance(prev, str) and prev not in seen and prev != container_id:
+            seen.append(prev)
+    run["seen_containers"] = seen[:_PEER_STATE_MAX]
+
+    run["extra"].update(
+        episodes=len(episode_rows), facts=len(fact_rows), semantic=len(semantic_rows),
+        project=project, tier=None,
+    )
+    brief = _render(episode_rows + semantic_rows, fact_rows)
+    if brief is None and not (run["notes"] or run["report"]):
+        return "nothing_to_do", None  # nothing to inject at all
+
+    # Reason precedence: a hard failure of any segment, then a backend-said-
+    # it-failed (errors.profile), then rows dropped by verification, then a
+    # failed own-state read (A10 D4), else the run is a clean skip.
+    if episode_failed or fact_failed or semantic_failed:
         return "http_error", brief
-    if not brief:
-        return "nothing_to_do", None  # nothing to inject
+    if run["extra"].get("backend_errors"):
+        return "http_error", brief
+    if run["extra"].get("filter_suspect"):
+        return "filter_suspect", brief
+    if state_unknown:
+        return "unknown", brief
     return (_hook_state.NO_REASON if _hook_state else "none"), brief
 
 
@@ -607,29 +1104,41 @@ def _record(reason, started, run):
             )
         except Exception as exc:  # record_run does not raise by contract; the net under it
             print(f"[{HOOK}] could not record this run ({reason}): {exc!r}", file=sys.stderr)
-        if marks is None:
-            return  # the ledgers were never read this run; leave the markers alone
+        # The fact marker advances only on a cleanly-completed startup round
+        # (any page failure or truncation leaves it where it was -- the next
+        # round re-reads); the peers this round saw ride the same write.
+        # A10 D4: update_state runs AFTER this round's ledger row (it always
+        # did), so its own failure is a state_write_failed the NEXT start
+        # reports; it must never be back-filled into the row just written.
+        advance = run.get("advance_fact_marker")
+        marker_candidate = run.get("marker_candidate")
+        marker_user = run.get("marker_user")
+        seen_containers = run.get("seen_containers")
         try:
-            # container_id travels with every state write: identity_drift
-            # (TASK-007) reads it back, and a state written without it makes
-            # every later run report unknown.
-            # seen_expected_ledgers travels alongside `reported` (ruling 4,
-            # R1-c21): persisting the CURRENT _EXPECTED_LEDGERS every run
-            # this far means a hook newly added to it is "seen" starting
-            # with the very next start -- exactly one grace period, then
-            # ordinary "missing" reporting resumes.
-            _hook_state.update_state(
-                HOOK,
-                cwd or os.getcwd(),
-                lambda s: {
-                    **s,
-                    "reported": marks,
-                    "container_id": _identity.container_id(),
-                    _SEEN_EXPECTED_LEDGERS_KEY: list(_EXPECTED_LEDGERS),
-                },
-            )
+            def mutate(st):
+                next_state = dict(st)
+                if advance and marker_candidate:
+                    next_state[_FACT_MARKER_KEY] = marker_candidate
+                    next_state[_FACT_MARKER_USER_KEY] = marker_user
+                if isinstance(seen_containers, list):
+                    next_state[_SEEN_CONTAINERS_KEY] = seen_containers
+                if run.get("stdout_ok"):
+                    # A9-11: the new container_id and the report marks persist
+                    # only once the stdout write succeeded -- reporting a
+                    # change the session never saw would eat it forever.
+                    if marks is not None:
+                        next_state["reported"] = marks
+                    next_state["container_id"] = _identity.container_id()
+                    # seen_expected_ledgers travels alongside `reported`
+                    # (ruling 4, R1-c21): a hook newly added to
+                    # _EXPECTED_LEDGERS is "seen" from the very next start --
+                    # exactly one grace period, then ordinary "missing"
+                    # reporting resumes.
+                    next_state[_SEEN_EXPECTED_LEDGERS_KEY] = list(_EXPECTED_LEDGERS)
+                return next_state
+            _hook_state.update_state(HOOK, cwd or os.getcwd(), mutate)
         except Exception as exc:  # noqa: BLE001
-            print(f"[{HOOK}] could not persist the report markers: {exc!r}", file=sys.stderr)
+            print(f"[{HOOK}] could not persist the inject state: {exc!r}", file=sys.stderr)
 
     left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
     if left_behind:
@@ -693,7 +1202,10 @@ def main():
     # main() calls within the same test process do not double-wrap
     # (production runs this once per process).
     _hook_runner.guard_stderr()
-    run = {"cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None}
+    run = {
+        "cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None,
+        "notes": [], "stdout_ok": False,
+    }
 
     # The work runs against a deadline of its own. urllib's timeout is per
     # socket operation, not per request -- one "6 s" request was measured at
@@ -749,7 +1261,16 @@ def main():
         if run["extra"].get("backend_errors"):
             diagnostics.append((reason, f"backend reported failures in {run['extra']['backend_errors']}"))
 
-    findings = run["report"]
+    # A9-11 / marker notes are user-visible exactly like failure findings --
+    # but they only RIDE real output. With neither a brief nor a report
+    # finding (an unreachable backend on a first run), fail-open silence
+    # wins over bookkeeping notes: the baseline note would otherwise turn
+    # "backend down" into a non-empty stdout, which is exactly the shape
+    # fail-open exists to prevent. It surfaces on the first start that has
+    # something real to say.
+    findings = list(run["report"])
+    if brief or findings:
+        findings = list(run["notes"]) + findings
     if findings:
         # One line for the user, one for Claude, then the brief (if any).
         headline = "; ".join(findings)
@@ -771,6 +1292,7 @@ def main():
         try:
             sys.stdout.write(json.dumps(output, ensure_ascii=False))
             sys.stdout.flush()
+            run["stdout_ok"] = True  # A9-11: only now may the state persist
         except Exception as exc:
             reason = "unknown"
             diagnostics.append(("could not write the brief", exc))

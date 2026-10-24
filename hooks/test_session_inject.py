@@ -36,6 +36,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
 
@@ -185,6 +186,56 @@ def _profile_row(content, *, container_id="dev-claude-308", layer="summary",
         meta["layer"] = layer
     return {"memory_id": "m1", "content": content, "memory_type": "semantic",
             "metadata": meta}
+
+
+def _mem_row(content, *, row_id="m1", container_id="dev-claude-308",
+             layer="session_summary", branch="feat/inject", project=None,
+             created_at="2026-10-24T08:00:00Z", updated=None, **meta_extra):
+    """One GET /v1/memories row (MemoryResponse shape: top-level created_at,
+    metadata carries the provenance keys)."""
+    meta = {"container_id": container_id, "branch": branch}
+    if layer is not None:
+        meta["layer"] = layer
+    if project is not None:
+        meta["project"] = project
+    if updated is not None:
+        meta["aria.modified"] = updated
+    meta.update(meta_extra)
+    return {"memory_id": f"{container_id}::{row_id}", "id": row_id,
+            "content": content, "memory_type": "semantic", "metadata": meta,
+            "created_at": created_at}
+
+
+def _page(rows):
+    """One GET /v1/memories answer."""
+    return {"memories": list(rows), "total_count": len(rows), "limit": 100,
+            "offset": 0, "has_next": bool(rows)}
+
+
+def _fact_row(desc, *, row_id="f1", container_id="peer-a", project=None,
+              created_at="2026-10-20T08:00:00Z", modified="2026-10-24T09:00:00Z",
+              **meta_extra):
+    meta = {"container_id": container_id, "layer": "fact",
+            "aria.description": desc, "aria.modified": modified}
+    if project is not None:
+        meta["project"] = project
+    meta.update(meta_extra)
+    return {"memory_id": f"{container_id}::{row_id}", "id": row_id,
+            "content": desc, "memory_type": "fact", "metadata": meta,
+            "created_at": created_at}
+
+
+# The standard happy-path queue for the D recipe: one episode page with own
+# rows, one empty fact page (the delta loop stops at an empty page), one
+# semantic POST. Tests tailor the pieces they care about.
+def _happy_queue(rows, facts=(), semantic=None):
+    if semantic is None:
+        semantic = {"profile": []}
+    q = [_page(rows), _page(facts)]
+    if facts:
+        q.append(_page([]))  # the fact loop stops on an EMPTY page
+    q.append(semantic)
+    return q
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1024,6 +1075,8 @@ class _FakeBackend:
                 handler.send_header("Content-Length", str(len(payload)))
                 handler.end_headers()
                 handler.wfile.write(payload)
+
+            do_GET = do_POST  # the D recipe's episode/fact pages are GETs
 
             def log_message(handler, *args):
                 pass
@@ -2051,6 +2104,331 @@ class TestExpectedLedgersMatchTheManifest(unittest.TestCase):
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             self.assertIn(mod.HOOK, _MOD._EXPECTED_LEDGERS, f"{script} leaves ledger {mod.HOOK!r}")
+
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class Recipe — workflow D (change 2 TASK-007): episodes + fact delta +
+# semantic segment, verification, grouping, marker rules, budget.
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestRecipe(_LedgerCase):
+    """The D recipe's acceptance fixtures (detailed-tasks TASK-007)."""
+
+    def setUp(self):
+        super().setUp()
+        # Deterministic project scope: CLAUDE_PROJECT_DIR-derived in prod,
+        # patched here (tmp cwds are not git repos -- the real fallback would
+        # answer None and disable project scoping entirely).
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+
+    def _capture(self, responses, stdin_text=None):
+        cap = _UrlopenCapture(responses)
+        out, err = self._main(cap, stdin_text=stdin_text)
+        return cap, out, err
+
+    # ── episode: verification ──────────────────────────────────────────────
+
+    def test_episode_rows_are_verified_row_by_row(self):
+        """A row the page should not have returned (observation layer, wrong
+        branch, other project) is dropped and counted as filter_suspect."""
+        rows = [
+            _mem_row("right", project="nexus"),
+            _mem_row("wrong layer", layer="observation", row_id="m2", project="nexus"),
+            _mem_row("wrong branch", branch="other", row_id="m3", project="nexus"),
+            _mem_row("wrong project", project="kairos", row_id="m4"),
+        ]
+        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        self.assertIn("right", out)
+        self.assertNotIn("wrong layer", out)
+        self.assertNotIn("wrong branch", out)
+        self.assertNotIn("wrong project", out)
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "filter_suspect")
+        self.assertEqual(entries[-1].get("filter_suspect"), 3)
+
+    def test_the_episode_page_scopes_layer_branch_and_project(self):
+        rows = [_mem_row("hello", project="nexus")]
+        cap, _, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        first = cap.requests[0][0]
+        self.assertIn("/memories?", first)
+        self.assertIn("layer=session_summary", first)
+        self.assertIn("branch=feat%2Finject", first)
+        self.assertIn("project=nexus", first)
+        self.assertIn("limit=100", first)
+
+    # ── episode: grouping + peer look-ups ──────────────────────────────────
+
+    def test_own_rows_fill_to_five(self):
+        rows = [_mem_row(f"own-{i}", row_id=f"m{i}", project="nexus") for i in range(7)]
+        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        for i in range(5):
+            self.assertIn(f"own-{i}", out)
+        self.assertNotIn("own-5", out)
+
+    def test_peers_first_and_own_keeps_a_slot(self):
+        rows = (
+            [_mem_row(f"peer-a-{i}", row_id=f"a{i}", container_id="peer-a", project="nexus") for i in range(3)]
+            + [_mem_row(f"own-{i}", row_id=f"o{i}", project="nexus") for i in range(3)]
+        )
+        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        self.assertIn("peer-a-0", out)
+        self.assertIn("peer-a-1", out)
+        self.assertNotIn("peer-a-2", out)  # 2 per peer group
+        self.assertIn("own-0", out)        # own keeps at least one slot
+
+    def test_a_remembered_peer_is_looked_up_when_the_page_has_no_peer_rows(self):
+        """The pinned known-limit case: 100 own rows must not keep the peer's
+        latest episode out of the brief -- grouping can only REORDER rows the
+        page returned, so the peer gets a look-up of its own."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "seen_containers": ["peer-a"],
+        })
+        own = [_mem_row(f"own-{i}", row_id=f"m{i}", project="nexus") for i in range(10)]
+        peer = [_mem_row("peer-latest", row_id="p1", container_id="peer-a", project="nexus")]
+        cap = _UrlopenCapture([
+            _page(own),                      # episode page: own rows only
+            _page(peer),                     # peer look-up
+            _page([]),                       # fact page 1 (empty)
+            {"profile": []},                 # semantic
+        ])
+        out, _ = self._main(cap)
+        self.assertIn("peer-latest", out)
+        peer_url = cap.requests[1][0]
+        self.assertIn("container_id=peer-a", peer_url)
+        self.assertIn("limit=2", peer_url)
+
+    def test_peer_absent_when_remembered_peers_have_nothing_either(self):
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "seen_containers": ["peer-a"],
+        })
+        own = [_mem_row("own-0", project="nexus")]
+        cap = _UrlopenCapture([
+            _page(own), _page([]), _page([]), {"profile": []},
+        ])
+        out, _ = self._main(cap)
+        self.assertIn("own-0", out)
+        entries = self._entries()
+        self.assertEqual(entries[-1].get("peer_absent"), 1)
+
+    def test_empty_branch_page_retries_once_without_branch(self):
+        cap = _UrlopenCapture([
+            _page([]),                                   # branch-scoped: empty
+            _page([_mem_row("proj-level", branch=None, project="nexus")]),
+            _page([]), _page([]),                        # fact pages
+            {"profile": []},
+        ])
+        out, _ = self._main(cap)
+        self.assertIn("proj-level", out)
+        urls = [u for u, _, _ in cap.requests]
+        branchless = [u for u in urls if "branch=" not in u and "/memories" in u]
+        self.assertTrue(branchless, f"expected a branchless retry, got {urls}")
+
+    # ── semantic segment ───────────────────────────────────────────────────
+
+    def test_semantic_request_is_project_scoped_and_bare(self):
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        body = cap.requests[-1][1]
+        self.assertEqual(body.get("layers"), ["semantic"])
+        self.assertFalse(body.get("include_graph"))
+        self.assertFalse(body.get("include_history"))
+        self.assertEqual(body.get("metadata_filter"), {"project": "nexus"})
+        self.assertTrue(body.get("query"))
+
+    def test_semantic_rows_are_project_verified_and_ai_profile_is_ignored(self):
+        sem = {"profile": [_profile_row("other project row")], "ai_profile": {"k": "v"}}
+        # the semantic row carries no project metadata -> dropped as suspect
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")], semantic=sem))
+        self.assertNotIn("other project row", out)
+        self.assertNotIn("ai_profile", out)
+        self.assertNotIn("\"k\": \"v\"", out)
+
+    def test_errors_profile_means_failure_but_the_rest_still_renders(self):
+        sem = {"profile": None, "errors": {"profile": "boom"}}
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")], semantic=sem))
+        self.assertIn("ep", out)  # the episode segment still renders
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "http_error")
+        self.assertEqual(entries[-1].get("backend_errors"), ["profile"])
+
+    def test_no_project_means_no_scoped_query_at_all(self):
+        """Underivable project -> no project-scoped episode/fact/semantic
+        call: an unscoped query only LOOKS scoped."""
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=(None, _identity.PROJECT_SOURCE_GIT)
+        ))
+        cap = _UrlopenCapture([
+            _page([_mem_row("unscoped-episode")]), _page([]),
+        ])
+        out, _ = self._main(cap)
+        self.assertIn("unscoped-episode", out)
+        urls = [u for u, _, _ in cap.requests]
+        self.assertFalse(any("project=" in u for u in urls), urls)
+        self.assertFalse(any("context/retrieve" in u for u in urls), urls)
+
+    # ── fact delta ─────────────────────────────────────────────────────────
+
+    def test_fact_pages_carry_the_cursor_and_stop_at_an_empty_page(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        f1 = _fact_row("fact-1", row_id="f1", project="nexus",
+                       created_at="2026-10-23T08:00:00Z")
+        f2 = _fact_row("fact-2", row_id="f2", project="nexus",
+                       created_at="2026-10-22T08:00:00Z")
+        cap = _UrlopenCapture([
+            _page([_mem_row("ep", project="nexus")]),  # episode
+            _page([f1]),                               # fact page 1
+            _page([f2]),                               # fact page 2
+            _page([]),                                 # fact page 3: empty -> stop
+            {"profile": []},                           # semantic
+        ])
+        out, _ = self._main(cap, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("fact-1", out)
+        self.assertIn("fact-2", out)
+        fact_urls = [u for u, _, _ in cap.requests if "layer=fact" in u]
+        self.assertEqual(len(fact_urls), 3)
+        self.assertNotIn("offset=", fact_urls[0])
+        self.assertIn("updated_after=", fact_urls[0])
+        self.assertIn(f"before_created_at={urllib.parse.quote(f1['created_at'])}", fact_urls[1])
+        self.assertIn("before_id=f1", fact_urls[1])
+        # clean startup round -> the marker advanced past the pre-round moment
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertIn(_MOD._FACT_MARKER_KEY, state)
+
+    def test_a_failed_fact_page_keeps_the_episodes_and_the_marker(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+
+        def exploding_second_page(req, timeout=None):
+            url = req.full_url
+            if "layer=fact" in url and "before_created_at" in url:
+                raise OSError("page 2 down")
+            if "/memories" in url:
+                if "layer=fact" in url:
+                    return _FakeResponse(_page([_fact_row("fact-1", row_id="f1", project="nexus")]))
+                return _FakeResponse(_page([_mem_row("ep", project="nexus")]))
+            return _FakeResponse({"profile": []})
+
+        out, _ = self._main(exploding_second_page,
+                            stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("ep", out)      # segment 1 survived segment 2's failure
+        self.assertNotIn("fact-1", out)  # the delta never completed
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "http_error")
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_KEY), marker)  # not advanced
+
+    def test_compact_never_advances_the_marker(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        cap, out, _ = self._capture(
+            _happy_queue([_mem_row("ep", project="nexus")],
+                         facts=[_fact_row("fact-1", row_id="f1", project="nexus")]),
+            stdin_text=json.dumps({"cwd": self.cwd, "source": "compact"}),
+        )
+        self.assertIn("fact-1", out)
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_KEY), marker)
+
+    def test_fact_delta_dedupes_and_drops_own_container_rows(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        dup = _fact_row("fact-dup", row_id="f1", project="nexus",
+                        created_at="2026-10-23T08:00:00Z")
+        later = _fact_row("fact-2", row_id="f2", project="nexus",
+                          created_at="2026-10-22T08:00:00Z")
+        own = _fact_row("own fact", row_id="f3", container_id="dev-claude-308",
+                        project="nexus", created_at="2026-10-23T09:00:00Z")
+        cap = _UrlopenCapture([
+            _page([_mem_row("ep", project="nexus")]),
+            _page([dup, own]),
+            _page([dup, later]),   # dial-back overlap: f1 seen again
+            _page([]),
+            {"profile": []},
+        ])
+        out, _ = self._main(cap)
+        self.assertEqual(out.count("fact-dup"), 1)
+        self.assertIn("fact-2", out)
+        self.assertNotIn("own fact", out)
+
+    def test_truncated_delta_flags_and_keeps_the_marker(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        full = [_fact_row(f"fact-{i}", row_id=f"f{i}", project="nexus",
+                          created_at=f"2026-10-2{i}T08:00:00Z") for i in range(3)]
+        cap = _UrlopenCapture(
+            [_page([_mem_row("ep", project="nexus")])]
+            + [_page(full)] * _MOD._FACT_MAX_PAGES   # never an empty page
+            + [{"profile": []}]
+        )
+        out, _ = self._main(cap, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        entries = self._entries()
+        self.assertEqual(entries[-1].get("fact_delta_truncated"), 1)
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_KEY), marker)
+
+    # ── first run / baseline / A9-10 / budget ──────────────────────────────
+
+    def test_first_run_reports_the_baseline(self):
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        self.assertIn("baseline", out)
+
+    def test_handoff_rows_render_newest_per_container_in_full(self):
+        def handoff(row_id, container, updated, branch="feat/inject"):
+            return _mem_row(
+                f"# handoff {container}\n\nintro line\n\n## §0 入口\n\nentry text\n\n"
+                f"## §1 已完成\n\ndone text\n\n## §2 未完成\n\ncarried\n\n"
+                f"## §6 Next session\n\nnext steps",
+                row_id=row_id, container_id=container, project="nexus",
+                created_at="2026-10-20T08:00:00Z",
+                **{"aria.source": "handoff", "aria.updated_at": updated},
+            )
+        rows = [
+            handoff("h1", "dev-claude-308", "2026-10-24T07:00:00Z"),
+            _mem_row(
+                "# handoff dev-claude-308 (old)\n\nOLD-BODY-MARKER\n\n## §6 Next\n\nold steps",
+                row_id="h2", container_id="dev-claude-308", project="nexus",
+                created_at="2026-10-19T08:00:00Z",
+                **{"aria.source": "handoff", "aria.updated_at": "2026-10-23T07:00:00Z"},
+            ),
+            handoff("h3", "peer-a", "2026-10-24T06:00:00Z"),
+        ]
+        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        # both containers' newest handoff render in full (title + §0 + §6)
+        self.assertIn("entry text", out)
+        self.assertIn("next steps", out)
+        # the older own handoff: title line only, its body is not rendered
+        self.assertNotIn("OLD-BODY-MARKER", out)
+
+    def test_the_brief_stays_within_the_budget_and_facts_go_first(self):
+        long_desc = "描" * 600
+        facts = [_fact_row(long_desc, row_id=f"f{i}", project="nexus",
+                           created_at=f"2026-10-2{i}T08:00:00Z") for i in range(8)]
+        episodes = [_mem_row("episode-keep", project="nexus")]
+        cap, out, _ = self._capture(_happy_queue(episodes, facts=facts, semantic={"profile": []}))
+        payload = json.loads(out)
+        brief = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(brief), 4000)
+        self.assertIn("episode-keep", brief)
+        self.assertIn("Facts since last session:", brief)  # facts still present
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

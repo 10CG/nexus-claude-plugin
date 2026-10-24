@@ -160,7 +160,7 @@ class TestSessionStartBound(unittest.TestCase):
 
     def test_the_timeout_clears_the_network_budget_and_stays_bounded(self):
         mod = self._inject_module()
-        network = mod._TIER1_TIMEOUT_SECONDS + mod._TIER2_TIMEOUT_SECONDS
+        network = mod._EPISODE_TIMEOUT_SECONDS + 4 * mod._SMALL_CALL_TIMEOUT_SECONDS
         hooks = _commands("SessionStart")
         self.assertTrue(hooks, "no SessionStart command hook registered")
         for _, hook in hooks:
