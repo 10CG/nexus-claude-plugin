@@ -292,155 +292,121 @@ class TestFailOpen(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════════
 
 class TestRender(unittest.TestCase):
-
-    def test_only_summary_layer_kept(self):
-        rows = [
-            _profile_row("settled one", layer="summary"),
-            _profile_row("raw obs", layer="observation"),
-            _profile_row("settled two", layer="summary"),
-        ]
-        kept = _MOD._settled_rows(rows)
-        contents = [r["content"] for r in kept]
-        self.assertIn("settled one", contents)
-        self.assertIn("settled two", contents)
-        self.assertNotIn("raw obs", contents)
-
-    def test_no_layer_key_takes_all(self):
-        """If NO row carries a layer key, all rows are taken (nothing to filter on)."""
-        rows = [_profile_row("a", layer=None), _profile_row("b", layer=None)]
-        kept = _MOD._settled_rows(rows)
-        self.assertEqual(len(kept), 2)
-
-    # ── 10CG/nexus-claude-plugin#32: the aggregator's layer is session_summary ──
+    """Rendering guarantees after the client layer filter was deleted
+    (TASK-007): layer truth is server-side + row-by-row verification; these
+    pin the bracket, the age anchor and the branch slot rendering."""
 
     @staticmethod
-    def _aggregated_row(content, *, branch="feat/x", container_id="dev-claude-308"):
-        """A row as `workers/session_aggregator.py` writes it: the provenance
-        keys only when the session's observations agree on one, and no
-        timestamp in the metadata."""
-        meta = {"layer": "session_summary", "session_id": "s-1", "source_activity_count": 3,
-                "observation_ids": ["t::u::a"], "aggregation_hash": "h"}
-        if branch is not None:
-            meta["branch"] = branch
-        if container_id is not None:
-            meta["container_id"] = container_id
-        return {"memory_id": "m2", "content": content, "memory_type": "episodic", "metadata": meta}
+    def _agg(content, **kw):
+        return _mem_row(content, layer="session_summary", **kw)
 
-    def test_a_profile_of_aggregated_summaries_is_rendered(self):
-        """The bug itself: a profile holding only session_summary rows used to
-        render nothing, so the brief fell back to July's migrated summaries."""
-        rows = [self._aggregated_row("episode one"), _profile_row("raw obs", layer="observation")]
-        brief = _MOD._render(_MOD._settled_rows(rows))
-        self.assertIsNotNone(brief)
-        self.assertIn("episode one", brief)
-        self.assertNotIn("raw obs", brief)
+    def test_a_row_renders_with_container_age_branch(self):
+        line = _MOD._episode_line(
+            self._agg("hello", container_id="dev-a", branch="feat/x",
+                      created_at="2026-10-24T06:00:00Z")
+        )
+        self.assertTrue(line.startswith("  • [dev-a · "), line)
+        self.assertIn(" · feat/x] hello", line)
 
-    def test_session_summary_goes_first_and_each_layer_keeps_the_backend_order(self):
-        # Backend order runs against both content and id, so a secondary sort
-        # key on either would show up as a reordering.
-        rows = [
-            _profile_row("migrated y", layer="summary"),
-            _profile_row("raw obs", layer="observation"),
-            self._aggregated_row("episode z"),
-            _profile_row("migrated b", layer="summary"),
-            self._aggregated_row("episode a"),
-        ]
-        for row, memory_id in zip(rows, ("m-4", "m-5", "m-3", "m-2", "m-1")):
-            row["memory_id"] = memory_id
-        kept = [r["content"] for r in _MOD._settled_rows(rows)]
-        self.assertEqual(kept, ["episode z", "episode a", "migrated y", "migrated b"])
+    def test_the_age_is_read_from_the_top_level_created_at(self):
+        """TASK-007: the age anchor moved to the list endpoint's top-level
+        created_at (the pinned successor of the old `age is ?` fixture)."""
+        line = _MOD._episode_line(
+            self._agg("hello", created_at="2026-10-23T06:00:00Z", branch="main")
+        )
+        self.assertIn(" · 1d · ", line)  # not "?" anymore
 
-    def test_a_profile_of_only_observations_renders_nothing(self):
-        """The rows carry a layer, just not a settled one: that is not the
-        no-layer case, and observations must not fall through into the brief."""
-        rows = [_profile_row("obs 1", layer="observation"), _profile_row("obs 2", layer="observation")]
-        self.assertEqual(_MOD._settled_rows(rows), [])
-        self.assertIsNone(_MOD._render(_MOD._settled_rows(rows)))
+    def test_a_missing_timestamp_renders_a_question_mark(self):
+        row = self._agg("hello", created_at=None, branch="main")
+        line = _MOD._episode_line(row)
+        self.assertIn(" · ? · ", line)
+
+    def test_a_handoff_rows_age_anchors_on_aria_updated_at(self):
+        """A9-10: handoff content is rewritten on every sync; created_at would
+        show the FIRST write, not the last."""
+        row = self._agg("h", created_at="2026-10-01T00:00:00Z", branch="main",
+                        **{"aria.source": "handoff", "aria.updated_at": "2026-10-24T06:00:00Z"})
+        self.assertIn(" · 1h · ", _MOD._episode_line(row))
+
+    def test_the_migrated_summary_branch_slot_is_a_dash(self):
+        """A migrated `summary` never had a branch: "-" says none, where "?"
+        would suggest one went missing."""
+        line = _MOD._episode_line(_profile_row("old", layer="summary", branch=""))
+        self.assertTrue(line.endswith("· -] old"), line)
 
     def test_an_empty_branch_is_rendered_like_a_missing_one(self):
-        migrated = _profile_row("old", layer="summary", branch="")
-        episode = self._aggregated_row("new", branch="")
-        lines = _MOD._render(_MOD._settled_rows([migrated, episode])).splitlines()
-        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
-        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
+        line = _MOD._episode_line(self._agg("new", branch=""))
+        self.assertTrue(line.endswith("· ?] new"), line)
 
     def test_a_blank_or_non_string_branch_is_rendered_like_a_missing_one(self):
         """Whitespace leaves the same empty slot an empty string did, and a
         branch that is not a string is not a branch."""
         for value in ("  ", "\t", 0, 7, ["main"]):
             with self.subTest(value=value):
-                row = self._aggregated_row("x", branch=value)
-                self.assertTrue(_MOD._render(_MOD._settled_rows([row])).endswith("· ?] x"))
+                row = self._agg("x", branch=value)
+                self.assertTrue(_MOD._episode_line(row).endswith("· ?] x"))
 
-    def test_a_layer_value_that_is_not_a_known_string_is_dropped_not_raised(self):
-        """`in` on the rank table hashes the value: a list would raise and take
-        every other row down with it."""
-        rows = [self._aggregated_row("keep"), _profile_row("list", layer=["summary"]),
-                _profile_row("number", layer=7), _profile_row("unknown", layer="fact")]
-        self.assertEqual([r["content"] for r in _MOD._settled_rows(rows)], ["keep"])
+    def test_long_content_is_capped_not_wrapped(self):
+        line = _MOD._episode_line(self._agg("x" * 400, branch="main"))
+        self.assertTrue(line.endswith("…"))
+        self.assertLessEqual(len(line), 360)  # bracket + 300 capped content
 
-    def test_branch_shows_dash_for_a_migrated_summary_and_question_mark_otherwise(self):
-        migrated = _profile_row("old", layer="summary")
-        del migrated["metadata"]["branch"]
-        mixed_session = self._aggregated_row("new", branch=None)  # no unique branch
-        brief = _MOD._render(_MOD._settled_rows([migrated, mixed_session]))
-        lines = brief.splitlines()
-        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
-        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
-
-    def test_an_aggregated_row_renders_its_provenance_with_an_unknown_age(self):
-        """Neither the aggregator's metadata nor a profile row carries a
-        timestamp, so the age is '?' until workflow D (TASK-007) reads
-        `created_at` from the list endpoint. Pinned so that change is seen."""
-        brief = _MOD._render(_MOD._settled_rows([self._aggregated_row("did it", branch="feat/us-037")]))
-        self.assertIn("[dev-claude-308 · ? · feat/us-037] did it", brief)
-
-    def test_render_has_provenance(self):
-        rows = [_profile_row("did the thing", container_id="dev-claude-308",
-                             branch="feat/us-037")]
-        brief = _MOD._render(_MOD._settled_rows(rows))
+    def test_render_assembles_episodes_then_facts(self):
+        brief = _MOD._render(
+            [self._agg("episode one", branch="main")],
+            [_fact_row("fact one")],
+        )
         self.assertIsNotNone(brief)
-        self.assertIn("dev-claude-308", brief)
-        self.assertIn("feat/us-037", brief)
-        self.assertIn("did the thing", brief)
-        # provenance bracket form [container · age · branch]
-        self.assertIn("[dev-claude-308 ·", brief)
+        self.assertIn("episode one", brief)
+        self.assertIn("fact one", brief)
+        self.assertLess(brief.index("episode one"), brief.index("Facts since last session:"))
 
-    def test_render_empty_is_none(self):
-        self.assertIsNone(_MOD._render([]))
+    def test_render_returns_none_when_nothing_survives(self):
+        self.assertIsNone(_MOD._render([], []))
 
-    def test_age_formatting(self):
-        # ~2 hours ago -> "Nh"
-        from datetime import datetime, timedelta, timezone
-        two_h = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-        meta = {"valid_from": two_h}
-        self.assertTrue(_MOD._age(meta).endswith("h"))
-        # missing -> '?'
-        self.assertEqual(_MOD._age({}), "?")
+    def test_the_fact_line_renders_only_the_description(self):
+        row = _fact_row("the description", container_id="peer-a")
+        row["content"] = "the full content body that must NOT be rendered"
+        line = _MOD._fact_line(row)
+        self.assertIn("the description", line)
+        self.assertNotIn("full content body", line)
 
+    def test_one_unencodable_row_does_not_cost_the_whole_brief(self):
+        # One row carrying a lone surrogate made the stdout write raise
+        # UnicodeEncodeError, and every other row went down with it.
+        bad = self._agg("lone surrogate: \udcff", branch="main")
+        good = self._agg("fine", branch="main")
+        brief = _MOD._render([bad, good], [])
+        self.assertIn("fine", brief)
 
-# ════════════════════════════════════════════════════════════════════════════════
-# Class RequestParams — capture the outgoing request body via monkeypatched urllib.
-# ════════════════════════════════════════════════════════════════════════════════
 
 class TestRequestParams(unittest.TestCase):
+    """Request-shape pins for the D recipe (episode GET + semantic POST);
+    the tier-1/tier-2 fixtures were replaced by TestRecipe's project-level
+    retry and peer look-up cases."""
 
     def setUp(self):
         self._orig_urlopen = _MOD.urllib.request.urlopen
         self._orig_branch = _MOD._current_branch
-        # Force a deterministic branch so metadata_filter is predictable.
+        # Force a deterministic branch so the episode URL is predictable.
         _MOD._current_branch = lambda cwd: "feat/inject"
         os.environ["NEXUS_API_URL"] = "https://nexus.example/v1"
         os.environ["NEXUS_DEFAULT_USER_ID"] = "nexus"
         os.environ["NEXUS_CONTAINER_ID"] = "dev-claude-308"
         os.environ["NEXUS_API_TOKEN"] = "tok123"
+        # Deterministic project scope so the semantic segment is sent.
+        patcher = mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         _MOD.urllib.request.urlopen = self._orig_urlopen
         _MOD._current_branch = self._orig_branch
-        for k in ("NEXUS_API_URL", "NEXUS_DEFAULT_USER_ID", "NEXUS_CONTAINER_ID",
-                  "NEXUS_API_TOKEN"):
-            os.environ.pop(k, None)
+        for key in ("NEXUS_API_URL", "NEXUS_DEFAULT_USER_ID",
+                    "NEXUS_CONTAINER_ID", "NEXUS_API_TOKEN"):
+            os.environ.pop(key, None)
 
     def _run_main_capturing(self, responses, stdin_event):
         """``sys.stderr`` is saved and restored too (Amendment A9-21), not
@@ -465,68 +431,58 @@ class TestRequestParams(unittest.TestCase):
             sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
         return cap, out
 
-    def test_body_uses_profile_limit_not_limit(self):
-        resp = {"profile": [_profile_row("hello world")], "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
-        self.assertEqual(len(cap.requests), 1)
-        _, body, headers = cap.requests[0]
+    @staticmethod
+    def _queue(episode_rows):
+        return [_page(episode_rows), _page([]), {"profile": []}]
+
+    def test_the_semantic_body_uses_profile_limit_not_limit(self):
+        cap, out = self._run_main_capturing(
+            self._queue([_mem_row("hello world", branch="feat/inject", project="nexus")]),
+            {"cwd": _HOOKS_DIR},
+        )
+        semantic = [r for r in cap.requests if "context/retrieve" in r[0]]
+        self.assertEqual(len(semantic), 1)
+        _, body, _ = semantic[0]
         self.assertIn("profile_limit", body, "request body must use profile_limit")
         self.assertEqual(body["profile_limit"], 10)
         self.assertNotIn("limit", body, "request body must NOT contain a bare `limit` field")
         self.assertEqual(body["ranking_strategy"], "quality_rerank")
-        self.assertEqual(body["recent_hours"], 72)
 
     def test_user_agent_header_present(self):
-        resp = {"profile": [_profile_row("hello")], "total_latency_ms": 1}
-        cap, _ = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
+        cap, _ = self._run_main_capturing(
+            self._queue([_mem_row("hello", branch="feat/inject", project="nexus")]), {"cwd": _HOOKS_DIR}
+        )
         _, _, headers = cap.requests[0]
         # urllib title-cases header keys.
-        joined = " ".join(headers.keys())
         self.assertIn("User-agent", headers, f"User-Agent header required (CF 1010). Got: {headers}")
         self.assertIn("X-nexus-source", headers)
 
-    def test_metadata_filter_has_branch_and_container(self):
-        resp = {"profile": [_profile_row("hello")], "total_latency_ms": 1}
-        cap, _ = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
-        _, body, _ = cap.requests[0]
-        mf = body.get("metadata_filter")
-        self.assertIsNotNone(mf, "tier-1 request must carry metadata_filter")
-        self.assertEqual(mf.get("branch"), "feat/inject")
-        self.assertEqual(mf.get("container_id"), "dev-claude-308")
+    def test_the_episode_page_carries_layer_branch_and_limit(self):
+        cap, _ = self._run_main_capturing(
+            self._queue([_mem_row("hello", branch="feat/inject", project="nexus")]), {"cwd": _HOOKS_DIR}
+        )
+        url = cap.requests[0][0]
+        self.assertIn("/memories?", url)
+        self.assertIn("layer=session_summary", url)
+        self.assertIn("branch=feat%2Finject", url)
+        self.assertIn("limit=100", url)
 
-    def test_empty_profile_triggers_second_unfiltered_request(self):
-        """Tier 1 empty -> tier 2 (no metadata_filter) project-level fallback."""
-        tier1 = {"profile": [], "total_latency_ms": 1}
-        tier2 = {"profile": [_profile_row("project level hit")], "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([tier1, tier2], {"cwd": _HOOKS_DIR})
-        self.assertEqual(len(cap.requests), 2, "empty tier-1 must trigger a second request")
-        _, body1, _ = cap.requests[0]
-        _, body2, _ = cap.requests[1]
-        self.assertIn("metadata_filter", body1, "tier-1 carries metadata_filter")
-        self.assertNotIn("metadata_filter", body2, "tier-2 fallback must omit metadata_filter")
-        # And the tier-2 hit must be rendered.
-        self.assertIn("project level hit", out)
-
-    def test_known_limit_own_episodes_in_tier_one_keep_tier_two_from_running(self):
-        """Pinned known limit (10CG/nexus-claude-plugin#32 interim fix): this
-        container's aggregated episode on the branch satisfies tier 1, so the
-        project-level tier 2 -- the only source of the other container's rows
-        and of the migrated summaries -- is never sent. Workflow D (change 2
-        TASK-007) replaces the tiers; this test is expected to change then."""
-        own = TestRender._aggregated_row("my own episode", branch="feat/inject")
-        tier1 = {"profile": [own], "total_latency_ms": 1}
-        tier2 = {"profile": [_profile_row("other container episode", container_id="dev-claude2")],
-                 "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([tier1, tier2], {"cwd": _HOOKS_DIR})
-        self.assertEqual(len(cap.requests), 1)
-        self.assertIn("my own episode", out)
-        self.assertNotIn("other container episode", out)
+    def test_branch_omitted_when_no_branch(self):
+        """Non-git dir (branch None) -> no branch parameter at all."""
+        _MOD._current_branch = lambda cwd: None
+        cap, _ = self._run_main_capturing(
+            [_page([_mem_row("hello", branch=None, project="nexus")]), _page([]), {"profile": []}],
+            {"cwd": _HOOKS_DIR},
+        )
+        first = cap.requests[0][0]
+        self.assertNotIn("branch=", first, first)
 
     def test_output_shape_and_provenance(self):
-        resp = {"profile": [_profile_row("did a refactor", container_id="dev-claude-308",
-                                         branch="feat/inject")],
-                "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
+        cap, out = self._run_main_capturing(
+            self._queue([_mem_row("did a refactor", container_id="dev-claude-308",
+                                  branch="feat/inject", project="nexus")]),
+            {"cwd": _HOOKS_DIR},
+        )
         parsed = json.loads(out)
         hso = parsed["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "SessionStart")
@@ -535,21 +491,6 @@ class TestRequestParams(unittest.TestCase):
         self.assertIn("[dev-claude-308 ·", ctx)
         self.assertIn("feat/inject", ctx)
 
-    def test_branch_omitted_when_no_branch(self):
-        """Non-git dir (branch None) -> metadata_filter has container_id but no branch."""
-        _MOD._current_branch = lambda cwd: None
-        resp = {"profile": [_profile_row("hello")], "total_latency_ms": 1}
-        cap, _ = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
-        _, body, _ = cap.requests[0]
-        mf = body.get("metadata_filter")
-        self.assertIsNotNone(mf)
-        self.assertNotIn("branch", mf, "branch key must be omitted when branch is unknown")
-        self.assertIn("container_id", mf)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# Class NonVacuity — prove the suite can go red.
-# ════════════════════════════════════════════════════════════════════════════════
 
 class TestNonVacuity(unittest.TestCase):
 
@@ -646,33 +587,37 @@ class _LedgerCase(unittest.TestCase):
 class TestLedger(_LedgerCase):
 
     def test_a_successful_injection_records_one_clean_run(self):
-        out, _ = self._main(_UrlopenCapture([{"profile": [_profile_row("hello")]}]))
+        out, _ = self._main(_UrlopenCapture([_page([_mem_row("hello", branch="feat/inject")]), _page([])]))
         self.assertIn("hello", out)
         entries = self._entries()
         self.assertEqual(len(entries), 1)
         entry = entries[0]
         self.assertEqual(
             (entry["hook"], entry["ok"], entry["reason"], entry["calls"]),
-            ("session-inject", True, "none", 1),
+            ("session-inject", True, "none", 2),
         )
         self.assertIs(type(entry["elapsed_ms"]), int)
         self.assertGreaterEqual(entry["elapsed_ms"], 0)
-        self.assertEqual((entry["tier"], entry["rows"]), (1, 1))
+        self.assertEqual((entry["episodes"], entry["facts"], entry["semantic"]), (1, 0, 0))
 
     def test_the_project_level_fallback_counts_both_calls(self):
-        cap = _UrlopenCapture([{"profile": []}, {"profile": [_profile_row("tier two")]}])
+        cap = _UrlopenCapture([
+            _page([]),  # branch-scoped episode page: empty
+            _page([_mem_row("project level hit", branch=None)]),  # branchless retry
+            _page([]),  # fact page
+        ])
         out, _ = self._main(cap)
-        self.assertIn("tier two", out)
+        self.assertIn("project level hit", out)
         entry = self._entries()[-1]
-        self.assertEqual((entry["reason"], entry["calls"], entry["tier"]), ("none", 2, 2))
+        self.assertEqual((entry["reason"], entry["calls"]), ("none", 3))
 
     def test_nothing_to_inject_is_a_recorded_skip_not_silence(self):
         """Exit 0 with no stdout is also what a broken hook looks like. The
         ledger is the only thing that tells the two apart."""
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         self.assertEqual(out, "")
         entry = self._entries()[-1]
-        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (True, "nothing_to_do", 2))
+        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (True, "nothing_to_do", 3))
         self.assertFalse(_hook_state.is_failure_reason(entry["reason"]))
 
     def test_no_backend_configured_is_a_recorded_skip_and_makes_no_call(self):
@@ -704,13 +649,13 @@ class TestLedger(_LedgerCase):
                 entries = self._entries()
                 self.assertEqual(len(entries), count, "every run appends exactly one record")
                 entry = entries[-1]
-                self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, expected, 1))
+                self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, expected, 2))
                 self.assertIn(expected, err)
 
     def test_the_second_call_failing_still_counts_two_calls(self):
         """`calls` is attempts, not successes: a baseline that undercounts the
         calls made on the failing path is wrong exactly when it is read."""
-        responses = iter([_FakeResponse({"profile": []})])
+        responses = iter([_FakeResponse(_page([])), _FakeResponse(_page([]))])
 
         def urlopen(req, timeout=None):
             try:
@@ -720,7 +665,7 @@ class TestLedger(_LedgerCase):
 
         self._main(urlopen)
         entry = self._entries()[-1]
-        self.assertEqual((entry["reason"], entry["calls"]), ("http_error", 2))
+        self.assertEqual((entry["reason"], entry["calls"]), ("http_error", 3))
 
     def test_a_two_hundred_that_is_not_json_is_an_http_error(self):
         """A proxy or challenge page. `unknown` would be true and useless."""
@@ -748,12 +693,12 @@ class TestLedger(_LedgerCase):
             return {}
 
         with mock.patch.object(_hook_state, "record_run", side_effect=spy):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("first things first")]}]))
+            self._main(_UrlopenCapture([_page([_mem_row("first things first", branch="feat/inject")]), _page([])]))
         self.assertIn("first things first", seen["stdout"])
 
     def test_a_ledger_that_blows_up_does_not_take_the_hook_down(self):
         with mock.patch.object(_hook_state, "record_run", side_effect=RuntimeError("disk on fire")):
-            out, err = self._main(_UrlopenCapture([{"profile": [_profile_row("still here")]}]))
+            out, err = self._main(_UrlopenCapture([_page([_mem_row("still here", branch="feat/inject")]), _page([])]))
         self.assertIn("still here", out)
         self.assertIn("could not record", err)
         self.assertIn("disk on fire", err)
@@ -762,7 +707,7 @@ class TestLedger(_LedgerCase):
 class TestSourceHeader(_LedgerCase):
 
     def test_every_remote_call_carries_name_slash_version(self):
-        cap = _UrlopenCapture([{"profile": []}, {"profile": [_profile_row("x")]}])
+        cap = _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])])
         self._main(cap)
         self.assertEqual(len(cap.requests), 2)
         for _, _, headers in cap.requests:  # urllib title-cases header keys
@@ -781,7 +726,7 @@ class TestIdentityIsShared(_LedgerCase):
         """Not `equal to what _identity would say` -- *the same call*. The write
         side uses it too, and two derivations that merely agree today are how
         the two sides end up keying one project differently."""
-        cap = _UrlopenCapture([{"profile": [_profile_row("x")]}])
+        cap = _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])])
         with mock.patch.object(_identity, "user_id", return_value="pinned-user") as user_id, \
                 mock.patch.object(_identity, "container_id", return_value="pinned-container"):
             self._main(cap)
@@ -843,7 +788,7 @@ class TestSharedModulesUnavailable(_LedgerCase):
         self.assertIsNone(mod._hook_state)
         with mock.patch.object(mod, "_current_branch", return_value="feat/inject"):
             out, err = self._main(
-                _UrlopenCapture([{"profile": [_profile_row("ledgerless")]}]), mod=mod
+                _UrlopenCapture([_page([_mem_row("ledgerless", branch="feat/inject")]), _page([])]), mod=mod
             )
         self.assertIn("ledgerless", out)
         self.assertIn("ledger unavailable", err)
@@ -961,7 +906,7 @@ class TestLedgerStepIsBounded(_LedgerCase):
         began = time.monotonic()
         with mock.patch.object(_hook_state, "record_run", side_effect=stall), \
                 mock.patch.object(_MOD, "_LEDGER_BUDGET_SECONDS", 0.2):
-            out, err = self._main(_UrlopenCapture([{"profile": [_profile_row("kept")]}]))
+            out, err = self._main(_UrlopenCapture([_page([_mem_row("kept", branch="feat/inject")]), _page([])]))
         self.assertLess(time.monotonic() - began, 5, "main() waited for the stalled write")
         self.assertIn("kept", out, "the brief must already be out")
         self.assertIn("still running", err)
@@ -2310,7 +2255,7 @@ class TestRecipe(_LedgerCase):
         def exploding_second_page(req, timeout=None):
             url = req.full_url
             if "layer=fact" in url and "before_created_at" in url:
-                raise OSError("page 2 down")
+                raise urllib.error.URLError("page 2 down")
             if "/memories" in url:
                 if "layer=fact" in url:
                     return _FakeResponse(_page([_fact_row("fact-1", row_id="f1", project="nexus")]))

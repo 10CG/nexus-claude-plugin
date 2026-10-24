@@ -1002,12 +1002,15 @@ def _collect(run):
     episode_rows = []
     peers_seen = []
     episode_failed = False
+    segment_errors = []  # (segment, exc) -- reason attribution below
     try:
         episode_rows, peers_seen = _episode_segment(
             base_url, token, user_id, branch, project, container_id, state, run
         )
-    except Exception:
+    except Exception as exc:
         episode_failed = True  # segment 2 must still render (independent try)
+        segment_errors.append(("episode", exc))
+        run.setdefault("diagnostics", []).append(("episode", exc))
 
     # ── segment 2: the fact delta (keyset pages, dedupe, own rows dropped) ──
     fact_rows = []
@@ -1018,8 +1021,10 @@ def _collect(run):
             base_url, token, user_id, project, container_id,
             since - timedelta(minutes=_FACT_DIAL_BACK_MINUTES), run,
         )
-    except Exception:
+    except Exception as exc:
         fact_failed = True
+        segment_errors.append(("fact", exc))
+        run.setdefault("diagnostics", []).append(("fact", exc))
     if fact_truncated:
         run["extra"]["fact_delta_truncated"] = 1
     run["advance_fact_marker"] = (
@@ -1031,8 +1036,10 @@ def _collect(run):
     semantic_failed = False
     try:
         semantic_rows = _semantic_segment(base_url, token, user_id, project, run)
-    except Exception:
+    except Exception as exc:
         semantic_failed = True
+        segment_errors.append(("semantic", exc))
+        run.setdefault("diagnostics", []).append(("semantic", exc))
 
     # Remember the peers this round actually saw (own container excluded),
     # newest first, bounded: next round's 补查 queries the two newest.
@@ -1047,25 +1054,46 @@ def _collect(run):
         project=project, tier=None,
     )
     brief = _render(episode_rows + semantic_rows, fact_rows)
-    if brief is None and not (run["notes"] or run["report"]):
-        return "nothing_to_do", None  # nothing to inject at all
 
-    # Reason precedence: a hard failure of any segment, then a backend-said-
-    # it-failed (errors.profile), then rows dropped by verification, then a
-    # failed own-state read (A10 D4), else the run is a clean skip.
-    if episode_failed or fact_failed or semantic_failed:
-        return "http_error", brief
+    # Reason precedence: a hard failure of any segment (the FIRST specific
+    # reason wins -- rate_limited / timeout carry more signal than a blanket
+    # http_error, and the failure-report machinery keys off the reason), then
+    # a backend-said-it-failed (errors.profile), then rows dropped by
+    # verification, then a failed own-state read (A10 D4), else a clean skip.
+    fail_reason = None
+    for _segment, exc in segment_errors:
+        if isinstance(exc, _BadResponse):
+            r = "http_error"
+        else:
+            r = _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
+        if fail_reason is None or (fail_reason == "http_error" and r != "http_error"):
+            fail_reason = r
+    if fail_reason:
+        return fail_reason, brief
     if run["extra"].get("backend_errors"):
         return "http_error", brief
     if run["extra"].get("filter_suspect"):
         return "filter_suspect", brief
     if state_unknown:
         return "unknown", brief
+    if brief is None and not run["report"]:
+        # Notes (baseline / identity) are main()'s concern and are suppressed
+        # without real output; no brief and no report findings is a skip.
+        return "nothing_to_do", None
     return (_hook_state.NO_REASON if _hook_state else "none"), brief
 
 
 def _warn(reason, exc):
     print(f"[{HOOK}] {reason}: {exc!r}", file=sys.stderr)
+
+
+def fail_reason_word(exc):
+    """The failure-table reason an exception maps to (rate_limited / timeout /
+    http_error / unknown) -- kept as a module function so diagnostics and the
+    ledger agree on one mapping."""
+    if isinstance(exc, _BadResponse):
+        return "http_error"
+    return _hook_state.reason_for_exception(exc) if _hook_state else "unknown"
 
 
 def _record(reason, started, run):
@@ -1238,7 +1266,7 @@ def main():
     # printed AFTER _record has run -- see the comment right before that
     # _record call, further down, for why (R2-c05, mirrored from
     # handoff_sync.py / session_capture.py).
-    diagnostics = []
+    diagnostics = list(run.get("diagnostics") or [])
 
     reason, brief = "unknown", None
     if left_behind:
@@ -1313,7 +1341,11 @@ def main():
     # write, a different concern from the one this reorder addresses.
     record_left_behind = _record(reason, started, run)
     for label, detail in diagnostics:
-        _warn(label, detail)
+        if isinstance(label, str) and label in ("episode", "fact", "semantic"):
+            reason_word = fail_reason_word(detail)
+            _warn(reason_word or "http_error", detail)
+        else:
+            _warn(label, detail)
     return record_left_behind or left_behind
 
 
