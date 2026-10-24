@@ -165,21 +165,39 @@ class TestSessionStartBound(unittest.TestCase):
         self.assertTrue(hooks, "no SessionStart command hook registered")
         for _, hook in hooks:
             self.assertIs(type(hook.get("timeout")), int, hook)
-            # Below the hook's own nominal worst case and a slow success gets
-            # killed: two 5 s git calls (project slug, branch), the two HTTP
-            # tiers, and the bounded ledger step. The first version of this
-            # arithmetic said 25 s and the real figure was 30 -- equal to the
-            # timeout -- because recording a run asked git for the project
-            # twice more. The numbers are read from the module so they cannot
-            # drift apart again.
-            worst_case = 2 * 5 + network + mod._LEDGER_BUDGET_SECONDS
-            self.assertGreater(hook["timeout"], worst_case, hook)
+            # Tier-era arithmetic ("timeout above the serial worst case")
+            # is impossible under the D recipe: its serial worst network time
+            # (episode page + 2 peer look-ups + the branchless retry + 5 fact
+            # pages + the semantic call) exceeds the host timeout on its own.
+            # The bound that actually holds is the hook's OWN work deadline:
+            # run_with_deadline abandons the work first, and the host timeout
+            # only has to clear deadline + ledger. The numbers are read from
+            # the module so they cannot drift apart again.
+            serial_network = (
+                mod._EPISODE_TIMEOUT_SECONDS
+                + 2 * mod._SMALL_CALL_TIMEOUT_SECONDS   # peer look-ups
+                + mod._SMALL_CALL_TIMEOUT_SECONDS       # branchless retry
+                + mod._FACT_MAX_PAGES * mod._SMALL_CALL_TIMEOUT_SECONDS
+                + mod._SMALL_CALL_TIMEOUT_SECONDS       # semantic
+            )
+            self.assertGreater(
+                2 * 5 + serial_network, mod._WORK_BUDGET_SECONDS,
+                "the work deadline must fire before the serial worst case",
+            )
             # And the hook's own deadline has to fire first. If the host's
             # timeout wins, the process is killed: no record, no brief.
             self.assertGreater(
                 hook["timeout"], mod._WORK_BUDGET_SECONDS + mod._LEDGER_BUDGET_SECONDS, hook
             )
-            self.assertGreater(mod._WORK_BUDGET_SECONDS, 2 * 5 + network)
+            # The COMMON path (two git calls + the episode page + one peer
+            # look-up + the first fact page) fits inside the work budget; the
+            # serial worst case beyond it is cut by the deadline, which the
+            # assert above pins to fire first. A truncated fact round simply
+            # does not advance the marker and re-reads next start.
+            self.assertGreaterEqual(
+                mod._WORK_BUDGET_SECONDS,
+                2 * 5 + mod._EPISODE_TIMEOUT_SECONDS + 2 * mod._SMALL_CALL_TIMEOUT_SECONDS,
+            )
             self.assertLessEqual(hook["timeout"], 60, hook)
 
 

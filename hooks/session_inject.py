@@ -1076,9 +1076,10 @@ def _collect(run):
         return "filter_suspect", brief
     if state_unknown:
         return "unknown", brief
-    if brief is None and not run["report"]:
-        # Notes (baseline / identity) are main()'s concern and are suppressed
-        # without real output; no brief and no report findings is a skip.
+    if brief is None:
+        # No brief and no failure reason is a skip; report findings ride
+        # stdout independently of what THIS run injected (the reason says
+        # what the retrieval did, not what the report channel did).
         return "nothing_to_do", None
     return (_hook_state.NO_REASON if _hook_state else "none"), brief
 
@@ -1150,6 +1151,14 @@ def _record(reason, started, run):
                     next_state[_FACT_MARKER_USER_KEY] = marker_user
                 if isinstance(seen_containers, list):
                     next_state[_SEEN_CONTAINERS_KEY] = seen_containers
+                # seen_expected_ledgers persists UNCONDITIONALLY (ruling 4,
+                # R1-c21): a hook newly added to _EXPECTED_LEDGERS is "seen"
+                # from the very next start -- exactly one grace period, then
+                # ordinary "missing" reporting resumes. It is not one of the
+                # A9-11 stdout-gated values: a silent first start must still
+                # consume the grace period, or the SECOND start reports a
+                # hook whose first SessionEnd is still ahead of it.
+                next_state[_SEEN_EXPECTED_LEDGERS_KEY] = list(_EXPECTED_LEDGERS)
                 if run.get("stdout_ok"):
                     # A9-11: the new container_id and the report marks persist
                     # only once the stdout write succeeded -- reporting a
@@ -1157,12 +1166,6 @@ def _record(reason, started, run):
                     if marks is not None:
                         next_state["reported"] = marks
                     next_state["container_id"] = _identity.container_id()
-                    # seen_expected_ledgers travels alongside `reported`
-                    # (ruling 4, R1-c21): a hook newly added to
-                    # _EXPECTED_LEDGERS is "seen" from the very next start --
-                    # exactly one grace period, then ordinary "missing"
-                    # reporting resumes.
-                    next_state[_SEEN_EXPECTED_LEDGERS_KEY] = list(_EXPECTED_LEDGERS)
                 return next_state
             _hook_state.update_state(HOOK, cwd or os.getcwd(), mutate)
         except Exception as exc:  # noqa: BLE001

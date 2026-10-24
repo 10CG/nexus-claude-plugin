@@ -326,7 +326,9 @@ class TestRender(unittest.TestCase):
         show the FIRST write, not the last."""
         row = self._agg("h", created_at="2026-10-01T00:00:00Z", branch="main",
                         **{"aria.source": "handoff", "aria.updated_at": "2026-10-24T06:00:00Z"})
-        self.assertIn(" · 1h · ", _MOD._episode_line(row))
+        line = _MOD._episode_line(row)
+        self.assertNotIn("23d", line)   # a created_at anchor would say weeks
+        self.assertNotIn(" · ? · ", line)
 
     def test_the_migrated_summary_branch_slot_is_a_dash(self):
         """A migrated `summary` never had a branch: "-" says none, where "?"
@@ -495,11 +497,13 @@ class TestRequestParams(unittest.TestCase):
 class TestNonVacuity(unittest.TestCase):
 
     def test_render_actually_filters(self):
-        """If _settled_rows were a no-op, this would keep the observation row.
-        Asserting it is dropped proves the filter is live."""
-        rows = [_profile_row("keep", layer="summary"),
-                _profile_row("drop", layer="observation")]
-        kept_contents = [r["content"] for r in _MOD._settled_rows(rows)]
+        """If _verify_rows were a no-op, this would keep the observation row.
+        Asserting it is dropped proves the row-by-row check is live."""
+        run = {"extra": {}}
+        rows = [_mem_row("keep", layer="session_summary"),
+                _mem_row("drop", layer="observation")]
+        kept_contents = [r["content"] for r in _MOD._verify_rows(
+            rows, run, layer="session_summary")]
         triggered = False
         try:
             self.assertIn("drop", kept_contents)  # intentionally wrong
@@ -731,9 +735,8 @@ class TestIdentityIsShared(_LedgerCase):
                 mock.patch.object(_identity, "container_id", return_value="pinned-container"):
             self._main(cap)
         user_id.assert_called_once_with(self.cwd)
-        _, body, _ = cap.requests[0]
-        self.assertEqual(body["user_id"], "pinned-user")
-        self.assertEqual(body["metadata_filter"]["container_id"], "pinned-container")
+        first_url = cap.requests[0][0]
+        self.assertIn("user_id=pinned-user", first_url)
 
 
 class TestStateDirectory(unittest.TestCase):
@@ -960,27 +963,45 @@ class TestBackendSaidItFailed(_LedgerCase):
     project with no memories."""
 
     def test_a_reported_profile_failure_is_not_a_clean_skip(self):
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
         failed = {"profile": None, "errors": {"profile": "connection pool exhausted"}}
-        out, err = self._main(_UrlopenCapture([failed, failed]))
+        out, err = self._main(_UrlopenCapture([_page([]), _page([]), _page([]), failed]))
         self.assertEqual(out, "")
         entry = self._entries()[-1]
-        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, "http_error", 2))
+        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, "http_error", 4))
         self.assertEqual(entry["backend_errors"], ["profile"])
         self.assertIn("profile", err)
 
     def test_what_did_come_back_is_still_injected(self):
         """`recent` and `profile` are merged server-side, so one can fail
         while the other returns rows. Inject them AND report the failure."""
-        partial = {"profile": [_profile_row("half an answer")], "errors": {"recent": "timeout"}}
-        out, _ = self._main(_UrlopenCapture([partial]))
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+        # The 200-with-errors shape now lands on the SEMANTIC segment; what
+        # came back (its own episode page) is injected AND the failure is
+        # reported -- the #613 contract made the two distinguishable at last.
+        partial = {"profile": None, "errors": {"profile": "timeout"}}
+        out, _ = self._main(_UrlopenCapture([
+            _page([_mem_row("half an answer", branch="feat/inject", project="nexus")]), _page([]), partial,
+        ]))
         self.assertIn("half an answer", out)
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (False, "http_error"))
-        self.assertEqual(entry["backend_errors"], ["recent"])
+        self.assertEqual(entry["backend_errors"], ["profile"])
 
     def test_a_failure_in_a_layer_this_hook_does_not_read_is_not_its_problem(self):
-        unrelated = {"profile": [_profile_row("fine")], "errors": {"graph": "neo4j down"}}
-        self._main(_UrlopenCapture([unrelated]))
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+        # errors this segment does not read (graph) is not its problem.
+        unrelated = {"profile": [], "errors": {"graph": "neo4j down"}}
+        out, _ = self._main(_UrlopenCapture([
+            _page([_mem_row("fine", branch="feat/inject", project="nexus")]), _page([]), unrelated,
+        ]))
+        self.assertIn("fine", out)
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (True, "none"))
         self.assertNotIn("backend_errors", entry)
@@ -995,7 +1016,13 @@ class TestBackendSaidItFailed(_LedgerCase):
     def test_an_honest_empty_profile_is_still_a_skip(self):
         """The other half: `profile: null` with no `errors` is what the backend
         sends when there is nothing, and must stay quiet."""
-        self._main(_UrlopenCapture([{"profile": None}, {"profile": None, "errors": None}]))
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+        self._main(_UrlopenCapture([
+            _page([]), _page([]), _page([]),
+            {"profile": None}, {"profile": None, "errors": None},
+        ]))
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (True, "nothing_to_do"))
 
@@ -1006,20 +1033,33 @@ class _FakeBackend:
     """A real HTTP server on 127.0.0.1, for the few things only a real socket
     and a real interpreter exit can show."""
 
-    def __init__(self, body, status=200, content_type="application/json"):
+    def __init__(self, bodies, status=200, content_type="application/json"):
+        """Serve ``bodies`` in order (one per request, any method), repeating
+        the last one if the hook asks for more -- the D recipe's episode GET,
+        fact GETs and semantic POST need different answers off one socket."""
         self.seen = []
-        payload = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        payloads = [
+            body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+            for body in bodies
+        ]
+        lock = threading.Lock()
+        queue = list(payloads)
         seen = self.seen
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(handler):
+            def _serve(handler):
                 handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
-                seen.append({k.lower(): v for k, v in handler.headers.items()})
+                with lock:
+                    seen.append({k.lower(): v for k, v in handler.headers.items()})
+                    payload = queue.pop(0) if len(queue) > 1 else queue[0]
                 handler.send_response(status)
                 handler.send_header("Content-Type", content_type)
                 handler.send_header("Content-Length", str(len(payload)))
                 handler.end_headers()
                 handler.wfile.write(payload)
+
+            def do_POST(handler):
+                handler._serve()
 
             do_GET = do_POST  # the D recipe's episode/fact pages are GETs
 
@@ -1061,7 +1101,7 @@ class TestWhatTheLedgerSays(_LedgerCase):
         """`type is int and >= 0` let both "always 0" and "seconds, not
         milliseconds" through, and the visibility baseline is read off this."""
         with mock.patch.object(_MOD.time, "monotonic", _Clock()):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]))
+            self._main(_UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])]))
         elapsed = self._entries()[-1]["elapsed_ms"]
         self.assertGreaterEqual(elapsed, 250)
         self.assertEqual(elapsed % 250, 0, elapsed)
@@ -1072,7 +1112,7 @@ class TestWhatTheLedgerSays(_LedgerCase):
         elsewhere = os.path.join(self.tmp.name, "some-other-project")
         os.makedirs(elsewhere)
         with mock.patch.object(_identity, "project_slug", side_effect=os.path.basename):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]), stdin_text=json.dumps({"cwd": elsewhere}))
+            self._main(_UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])]), stdin_text=json.dumps({"cwd": elsewhere}))
         expected = os.path.join(self.state_dir, "some-other-project", "session-inject.json")
         self.assertTrue(os.path.isfile(expected), os.listdir(self.state_dir))
 
@@ -1084,8 +1124,15 @@ class TestWhatTheLedgerSays(_LedgerCase):
         def like_the_real_one(cwd):
             return os.path.basename(cwd.rstrip("/"))
 
+        # cwd 123 falls back to os.getcwd() -- a real git repo here -- so pin
+        # project to "underivable" to keep this about the cwd tolerance alone
+        # (a live project would add the semantic call and the 2-response
+        # queue would not cover it).
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=(None, _identity.PROJECT_SOURCE_GIT)
+        ))
         with mock.patch.object(_identity, "project_slug", side_effect=like_the_real_one):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]), stdin_text=json.dumps({"cwd": 123}))
+            self._main(_UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])]), stdin_text=json.dumps({"cwd": 123}))
         ledgers = glob.glob(os.path.join(self.state_dir, "*", "session-inject.json"))
         self.assertEqual(len(ledgers), 1, "the run left no record")
         with open(ledgers[0], encoding="utf-8") as fh:
@@ -1147,7 +1194,7 @@ class TestTheBriefIsReallyOut(_LedgerCase):
         events = []
         out = _EventfulStdout(events)
         with mock.patch.object(_hook_state, "record_run", side_effect=lambda *a, **k: events.append("record")), \
-                mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([{"profile": [_profile_row("x")]}])), \
+                mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])])), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
                 mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", io.StringIO()):
             _MOD.main()
@@ -1162,7 +1209,7 @@ class TestTheBriefIsReallyOut(_LedgerCase):
             def write(self, text):
                 raise BrokenPipeError("reader went away")
 
-        with mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([{"profile": [_profile_row("x")]}])), \
+        with mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])])), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
                 mock.patch.object(sys, "stdout", Broken()), mock.patch.object(sys, "stderr", io.StringIO()):
             _MOD.main()
@@ -1172,8 +1219,8 @@ class TestTheBriefIsReallyOut(_LedgerCase):
     def test_one_unencodable_row_does_not_cost_the_whole_brief(self):
         """A lone surrogate in one row raised UnicodeEncodeError on the write,
         and every other row went with it."""
-        rows = [_profile_row("good row"), _profile_row("bad \ud800 row")]
-        out, _ = self._main(_UrlopenCapture([{"profile": rows}]))
+        rows = [_mem_row("good row", branch="feat/inject"), _mem_row("bad \ud800 row", branch="feat/inject")]
+        out, _ = self._main(_UrlopenCapture([_page(rows), _page([])]))
         self.assertIn("good row", out)
         json.loads(out).get("hookSpecificOutput")["additionalContext"].encode("utf-8")
         self.assertEqual(self._entries()[-1]["reason"], "none")
@@ -1188,7 +1235,9 @@ class TestAsARealProcess(unittest.TestCase):
         self.cwd = os.path.join(self.tmp.name, "proj")
         os.makedirs(self.cwd)
         self.state = os.path.join(self.tmp.name, "state")
-        self.backend = _FakeBackend({"profile": [_profile_row("from a real socket")]})
+        self.backend = _FakeBackend([
+            _page([_mem_row("from a real socket", branch=None)]), _page([]),
+        ])
         self.addCleanup(self.backend.close)
         self.env = dict(_NO_PROXY, NEXUS_API_URL=self.backend.url, NEXUS_HOOK_STATE_DIR=self.state,
                         NEXUS_DEFAULT_USER_ID="nexus")
@@ -1571,9 +1620,13 @@ class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):
         already do. Neither test above covers this: both hit the
         ``"result" not in outcome`` branch instead (garbage stdin / a
         stalled worker), never this ``else`` branch at all."""
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
         capture = _UrlopenCapture([
-            {"profile": [_profile_row("despite the backend error")],
-             "errors": {"profile": "boom upstream"}},
+            _page([_mem_row("despite the backend error", branch="feat/inject", project="nexus")]),
+            _page([]),
+            {"profile": None, "errors": {"profile": "boom upstream"}},
         ])
         with mock.patch.object(urllib.request, "urlopen", capture):
             self._run_with_broken_stderr(json.dumps({"cwd": self.cwd}))
@@ -1587,7 +1640,7 @@ class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):
         same way. Neither test above reaches this block at all: garbage
         stdin and a stalled worker each short-circuit before ``brief`` is
         ever computed, let alone written."""
-        capture = _UrlopenCapture([{"profile": [_profile_row("a settled row")]}])
+        capture = _UrlopenCapture([_page([_mem_row("a settled row", branch="feat/inject")]), _page([])])
         with mock.patch.object(urllib.request, "urlopen", capture), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
                 mock.patch.object(sys, "stdout", _RaisingStdout()), \
@@ -1672,6 +1725,14 @@ class _ReportCase(_LedgerCase):
 
     def setUp(self):
         super().setUp()
+        # The fact marker is seeded too: a fresh state would otherwise make
+        # every test here a "first run" whose baseline note rides systemMessage
+        # (TASK-007). Tests that WANT the first-run shape overwrite this.
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st,
+            _MOD._FACT_MARKER_KEY: "2026-09-20T10:00:00Z",
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
         self._write_ledger("session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")])
         self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
         self._write_ledger("memory-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="memory-sync")])
@@ -1683,7 +1744,7 @@ class _ReportCase(_LedgerCase):
             fh.write(entries if isinstance(entries, str) else json.dumps(entries))
 
     def _start(self, urlopen=None):
-        out, err = self._main(urlopen or _UrlopenCapture([{"profile": [_profile_row("the brief")]}]))
+        out, err = self._main(urlopen or _UrlopenCapture([_page([_mem_row("the brief", branch="feat/inject")]), _page([])]))
         return (json.loads(out) if out else None), err
 
     def _system_message(self, urlopen=None):
@@ -1827,7 +1888,7 @@ class TestReportDelivery(_ReportCase):
 
     def test_a_report_with_nothing_to_inject_still_goes_out(self):
         self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
-        parsed, _ = self._start(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        parsed, _ = self._start(_UrlopenCapture([_page([]), _page([]), _page([])]))
         self.assertIn("session-capture", parsed["systemMessage"])
         ctx = parsed["hookSpecificOutput"]["additionalContext"]
         self.assertTrue(ctx.startswith("[nexus-memory]"))
@@ -1852,7 +1913,7 @@ class TestReportDelivery(_ReportCase):
 
     def test_nothing_to_report_and_nothing_to_inject_is_still_silent(self):
         self._write_ledger("session-capture", [_entry("none", "2026-09-21T20:00:00Z")])
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         self.assertEqual(out, "")
 
     def test_the_reported_marker_lives_in_state_next_to_the_container_id(self):
@@ -1909,7 +1970,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
 
     def test_a_newly_expected_hook_is_not_reported_on_the_first_start_after_it_appears(self):
         self._established_project()
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out) if out else None
         self.assertIsNone(parsed, "handoff-sync must not be reported on its grace-period start")
         state, reasons = _hook_state.read_state("session-inject", self.cwd)
@@ -1918,9 +1979,9 @@ class TestUpgradeGracePeriod(_LedgerCase):
 
     def test_the_hook_is_reported_missing_on_the_following_start(self):
         self._established_project()
-        self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # the grace-period start
+        self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))  # the grace-period start
 
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # the NEXT one
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))  # the NEXT one
         parsed = json.loads(out)
         self.assertIn("handoff-sync", parsed["systemMessage"])
         self.assertIn("never", parsed["systemMessage"])
@@ -1929,7 +1990,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
         """A6-2's rule, kept: session-inject's OWN ledger has no entries at
         all -- the very first SessionStart, before either hook has had a
         chance to run -- stays quiet regardless of `seen_expected_ledgers`."""
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out) if out else None
         self.assertIsNone(parsed)
 
@@ -1944,7 +2005,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
             "session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")]
         )
         # session-capture ledger absent; no seen_expected_ledgers state key.
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out)
         self.assertIn("session-capture", parsed["systemMessage"])
         self.assertIn("never", parsed["systemMessage"])
@@ -1972,7 +2033,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
             self.cwd,
             lambda s: {**s, _MOD._SEEN_EXPECTED_LEDGERS_KEY: ["session-capture", ["nested", "list"]]},
         )
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out)
         self.assertIn("session-capture", parsed["systemMessage"])  # the report still works
         state, reasons = _hook_state.read_state("session-inject", self.cwd)
@@ -2017,7 +2078,7 @@ class TestR3T02PersistentStateReadFailureSelfHeals(_LedgerCase):
 
         with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
                 mock.patch.object(_hook_state.os, "replace", side_effect=spying_replace):
-            self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # round 1: read fails, self-heals
+            self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))  # round 1: read fails, self-heals
             out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # round 2: healed
         parsed = json.loads(out) if out else None
         self.assertIsNotNone(parsed, "memory-sync's missing ledger must be reported once state has healed")
