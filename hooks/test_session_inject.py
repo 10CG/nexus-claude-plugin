@@ -124,6 +124,21 @@ def _load_module():
 _MOD = _load_module()
 
 
+def _load_handoff():
+    """handoff_sync, loaded the same way as _MOD: the A9-10 fixtures build
+    their rows' content through its ``_build_content`` distiller (the wire
+    shape D actually reads), so the two modules can only agree by both being
+    right."""
+    spec = importlib.util.spec_from_file_location(
+        "handoff_sync_for_inject_test", os.path.join(_HOOKS_DIR, "handoff_sync.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_HANDOFF = _load_handoff()
+
+
 # ── Subprocess driver (for fail-open / malformed-stdin tests) ───────────────────
 
 def _run_hook(stdin_text, env=None, drop=(), script=None, want_stderr=False):
@@ -223,6 +238,21 @@ def _fact_row(desc, *, row_id="f1", container_id="peer-a", project=None,
     return {"memory_id": f"{container_id}::{row_id}", "id": row_id,
             "content": desc, "memory_type": "fact", "metadata": meta,
             "created_at": created_at}
+
+
+def _handoff_row(row_id, container, updated, *, title, created_at,
+                 branch="feat/inject"):
+    """One ``aria.source=handoff`` episode row whose content is what
+    handoff_sync actually stores: ``_build_content``'s H1 + §6 + §2 distill.
+    The §6 body is ``do <title>`` so a full render is distinguishable from
+    the one-title-line render of the same row's headline."""
+    body = f"# {title}\n\n## §6 Next session\n\ndo {title}\n\n## §2 未完成\n\ncarry {title}\n"
+    content, reason = _HANDOFF._build_content(body)
+    if reason is not None:
+        raise AssertionError(f"fixture body did not distill: {reason}")
+    return _mem_row(content, row_id=row_id, container_id=container,
+                    project="nexus", created_at=created_at, branch=branch,
+                    **{"aria.source": "handoff", "aria.updated_at": updated})
 
 
 # The standard happy-path queue for the D recipe: one episode page with own
@@ -2231,6 +2261,9 @@ class TestRecipe(_LedgerCase):
         urls = [u for u, _, _ in cap.requests]
         branchless = [u for u in urls if "branch=" not in u and "/memories" in u]
         self.assertTrue(branchless, f"expected a branchless retry, got {urls}")
+        # the retry drops the BRANCH, never the PROJECT: the project-level
+        # fallback must not turn into a cross-project query
+        self.assertTrue(all("project=nexus" in u for u in branchless), branchless)
 
     # ── semantic segment ───────────────────────────────────────────────────
 
@@ -2332,6 +2365,26 @@ class TestRecipe(_LedgerCase):
         state, _ = _hook_state.read_state("session-inject", self.cwd)
         self.assertEqual(state.get(_MOD._FACT_MARKER_KEY), marker)  # not advanced
 
+    def test_an_episode_segment_failure_still_renders_the_facts(self):
+        """The other leg of segment independence (proposal D): the episode
+        page blowing up costs the brief its episodes, NOT its fact delta --
+        each segment has its own try, and the failure lands as this round's
+        reason without taking the delta's rows down with it."""
+        def episode_down(req, timeout=None):
+            if "layer=session_summary" in req.full_url:
+                raise urllib.error.URLError("episode backend down")
+            if "layer=fact" in req.full_url:
+                return _FakeResponse(_page([_fact_row(
+                    "fact-survivor", row_id="f1", project="nexus",
+                    created_at="2026-10-23T08:00:00Z")]))
+            return _FakeResponse({"profile": []})
+
+        out, _ = self._main(
+            episode_down, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("fact-survivor", out)
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "http_error")
+
     def test_compact_never_advances_the_marker(self):
         marker = "2026-10-24T07:00:00Z"
         _hook_state.update_state("session-inject", self.cwd, lambda st: {
@@ -2395,33 +2448,151 @@ class TestRecipe(_LedgerCase):
     def test_first_run_reports_the_baseline(self):
         cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
         self.assertIn("baseline", out)
+        # the note names the 7-day window and rides the user-visible channel
+        self.assertIn("7 days", out)
+        self.assertIn("baseline", json.loads(out)["systemMessage"])
+
+    # ── identity (A9-11) and the marker's user_id binding ─────────────────
+
+    def test_a_container_id_change_is_reported_once_with_the_remedy(self):
+        """A9-11: the change is a NOTE on systemMessage and the brief prelude
+        -- never this hook's own ledger reason -- and it names the old value,
+        the new value, and the remedy (the env override)."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "container_id": "dev-a",
+        })
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        message = json.loads(out)["systemMessage"]
+        self.assertIn("container_id changed from dev-a to dev-claude-308", message)
+        self.assertIn("NEXUS_CONTAINER_ID=dev-a", message)
+        entry = self._entries()[-1]
+        self.assertEqual(entry["reason"], "none")  # a note, not a reason
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-claude-308")
+        # and exactly once: the next start does not repeat THE CHANGE (the
+        # baseline note may legitimately repeat until a startup round
+        # advances the marker, and a tmp state dir has no SessionEnd hooks)
+        cap2, out2, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        self.assertNotIn(
+            "container_id changed", json.loads(out2).get("systemMessage", ""))
+
+    def test_the_new_container_id_persists_only_after_a_successful_stdout_write(self):
+        """A9-11: reporting a change the session never saw would eat it
+        forever -- a start whose stdout write fails leaves the OLD
+        container_id in state, so the next start reports it again."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "container_id": "dev-a",
+        })
+
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("reader went away")
+
+        cap = _UrlopenCapture(_happy_queue([_mem_row("ep", project="nexus")]))
+        with mock.patch.object(urllib.request, "urlopen", cap), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", Broken()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            _MOD.main()
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-a")
+
+    def test_a_user_id_change_rebounds_the_marker_and_says_so(self):
+        """The fact marker is bound to user_id (owner 2026-10-17): a
+        different user_id restarts the delta from the 7-day baseline, with a
+        note naming both values -- the marker must never silently skip the
+        new pool's earlier rows."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: "2026-10-20T07:00:00Z",
+            _MOD._FACT_MARKER_USER_KEY: "someone-else",
+        })
+        cap, out, _ = self._capture(
+            _happy_queue([_mem_row("ep", project="nexus")]),
+            stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        message = json.loads(out)["systemMessage"]
+        self.assertIn("rebound", message)
+        self.assertIn("someone-else", message)
+        self.assertIn("'nexus'", message)
+        # the delta re-read from the baseline, not from the stale marker
+        fact_urls = [u for u, _, _ in cap.requests if "layer=fact" in u]
+        self.assertTrue(fact_urls, cap.requests)
+        self.assertNotIn(urllib.parse.quote("2026-10-20T07:00:00"), fact_urls[0])
+        # and the marker's binding moved to the current user
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_USER_KEY), "nexus")
+        self.assertIn(_MOD._FACT_MARKER_KEY, state)
 
     def test_handoff_rows_render_newest_per_container_in_full(self):
-        def handoff(row_id, container, updated, branch="feat/inject"):
-            return _mem_row(
-                f"# handoff {container}\n\nintro line\n\n## §0 入口\n\nentry text\n\n"
-                f"## §1 已完成\n\ndone text\n\n## §2 未完成\n\ncarried\n\n"
-                f"## §6 Next session\n\nnext steps",
-                row_id=row_id, container_id=container, project="nexus",
-                created_at="2026-10-20T08:00:00Z",
-                **{"aria.source": "handoff", "aria.updated_at": updated},
-            )
-        rows = [
-            handoff("h1", "dev-claude-308", "2026-10-24T07:00:00Z"),
-            _mem_row(
-                "# handoff dev-claude-308 (old)\n\nOLD-BODY-MARKER\n\n## §6 Next\n\nold steps",
-                row_id="h2", container_id="dev-claude-308", project="nexus",
-                created_at="2026-10-19T08:00:00Z",
-                **{"aria.source": "handoff", "aria.updated_at": "2026-10-23T07:00:00Z"},
-            ),
-            handoff("h3", "peer-a", "2026-10-24T06:00:00Z"),
+        """A9-10, the spec's own-3 + peer-2 shape: per container only the
+        newest handoff (by aria.updated_at) renders in full; the other three
+        are one title line each. Content is what handoff_sync actually stores
+        (_build_content's H1 + §6 + §2 distill), and the brief stays within
+        budget with the fact delta still rendered."""
+        rows = [  # page order as the endpoint returns it (created_at DESC)
+            _handoff_row("h1", "dev-claude-308", "2026-10-24T07:00:00Z",
+                         title="own newest", created_at="2026-10-24T08:00:00Z"),
+            _handoff_row("h4", "peer-a", "2026-10-24T06:00:00Z",
+                         title="peer newest", created_at="2026-10-24T06:30:00Z"),
+            _handoff_row("h2", "dev-claude-308", "2026-10-23T07:00:00Z",
+                         title="own older", created_at="2026-10-23T08:00:00Z"),
+            _handoff_row("h5", "peer-a", "2026-10-23T06:00:00Z",
+                         title="peer older", created_at="2026-10-23T06:30:00Z"),
+            _handoff_row("h3", "dev-claude-308", "2026-10-22T07:00:00Z",
+                         title="own oldest", created_at="2026-10-22T08:00:00Z"),
         ]
-        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
-        # both containers' newest handoff render in full (title + §0 + §6)
-        self.assertIn("entry text", out)
-        self.assertIn("next steps", out)
-        # the older own handoff: title line only, its body is not rendered
-        self.assertNotIn("OLD-BODY-MARKER", out)
+        facts = [_fact_row("fact-still-rendered", row_id="f1", project="nexus",
+                           created_at="2026-10-23T08:00:00Z")]
+        cap, out, _ = self._capture(_happy_queue(rows, facts=facts))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        # the newest of EACH container renders its §6 body...
+        self.assertIn("do own newest", brief)
+        self.assertIn("do peer newest", brief)
+        # ...the other three rows are one title line each: headline present,
+        # §6 body absent
+        for older in ("own older", "own oldest", "peer older"):
+            self.assertIn(older, brief)
+            self.assertNotIn(f"do {older}", brief)
+        # budget: within 4000 chars with the fact delta still rendered
+        self.assertLessEqual(len(brief), 4000)
+        self.assertIn("Facts since last session:", brief)
+        self.assertIn("fact-still-rendered", brief)
+
+    def test_two_containers_one_handoff_each_render_both_in_full(self):
+        """A9-10's other fixture shape: one handoff per container means no
+        group has an older row to demote -- both render in full, within
+        budget, facts still rendered."""
+        rows = [
+            _handoff_row("h1", "dev-claude-308", "2026-10-24T07:00:00Z",
+                         title="own only", created_at="2026-10-24T08:00:00Z"),
+            _handoff_row("h2", "peer-a", "2026-10-24T06:00:00Z",
+                         title="peer only", created_at="2026-10-24T06:30:00Z"),
+        ]
+        facts = [_fact_row("fact-still-rendered", row_id="f1", project="nexus",
+                           created_at="2026-10-23T08:00:00Z")]
+        cap, out, _ = self._capture(_happy_queue(rows, facts=facts))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("do own only", brief)
+        self.assertIn("do peer only", brief)
+        self.assertLessEqual(len(brief), 4000)
+        self.assertIn("fact-still-rendered", brief)
+
+    def test_a_handoff_without_a_six_section_falls_back_to_the_whole_document(self):
+        """A9-10: a handoff with no §6 renders its WHOLE entry, line-boundary
+        capped at ~1500 chars -- never just the H1. The §2 carry list is
+        exactly what such a handoff must not lose."""
+        body = ("# no six section\n\n## §2 未完成\n\n"
+                + "\n".join(f"carry item {i:02d} - a line of carried work"
+                            for i in range(80)) + "\n")
+        content, reason = _HANDOFF._build_content(body)
+        self.assertIsNone(reason)
+        row = _mem_row(content, row_id="h1", container_id="peer-a", project="nexus",
+                       created_at="2026-10-24T08:00:00Z",
+                       **{"aria.source": "handoff", "aria.updated_at": "2026-10-24T07:00:00Z"})
+        cap, out, _ = self._capture(_happy_queue([row]))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("carry item 00", brief)     # §2 content renders, not just the H1
+        self.assertNotIn("carry item 79", brief)  # the whole-doc cap bites at ~1500
+        self.assertLessEqual(len(brief), 4000)
 
     def test_the_brief_stays_within_the_budget_and_facts_go_first(self):
         long_desc = "描" * 600
@@ -2494,9 +2665,11 @@ class TestOneTimeReasonsSurviveBurial(_ReportCase):
 
 
 class TestStateWriteFailureLands(_LedgerCase):
-    """A10 D4, update-side: a state persist that fails AFTER this round's
+    """A10 D4, both legs: a state persist that fails AFTER this round's
     ledger row was written appends a second, independent state_write_failed
-    row -- never folded back into the row it postdates."""
+    row -- never folded back into the row it postdates; and a state file
+    that keeps failing to READ (not ENOENT) lands `unknown` in THIS round's
+    row instead of passing silently."""
 
     def test_a_failing_state_persist_appends_the_failure_row(self):
         self._patch(mock.patch.object(
@@ -2517,6 +2690,28 @@ class TestStateWriteFailureLands(_LedgerCase):
         # And the next SessionStart reports it (failure-class, A4-1).
         out, _ = self._main(queue())
         self.assertIn("state_write_failed", out)
+
+    def test_a_persistently_unreadable_state_lands_unknown_in_this_rounds_row(self):
+        """A10 D4, read side: the marker could not be read either, so the
+        delta runs from the baseline -- but the point here is that the read
+        failure is NOT silent: this round's row carries `unknown` (ok=False),
+        while the brief itself still renders (fail-open)."""
+        self._patch(mock.patch.object(
+            _identity, "project_key",
+            return_value=("nexus", _identity.PROJECT_SOURCE_ENV),
+        ))
+        self._patch(mock.patch.object(
+            _hook_state, "read_state", return_value=({}, ["unknown"]),
+        ))
+        out, _ = self._main(_UrlopenCapture([
+            _page([_mem_row("row", branch="feat/inject", project="nexus")]),
+            _page([]), {"profile": []},
+        ]))
+        self.assertIn("row", out)  # fail-open: the brief still renders
+        entry = self._entries()[-1]
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertFalse(entry["ok"])
+        self.assertTrue(entry["state_read_unknown"])
 
 
 if __name__ == "__main__":

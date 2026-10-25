@@ -99,19 +99,20 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
     lookup comes back 200 with ``profile: null`` and the error under ``errors``.
     That, a body that is not JSON, and JSON of the wrong shape are all
     ``http_error``; only an honest empty profile is ``nothing_to_do``.
-  - Render: ONLY settled summaries -- ``session_summary`` rows (what the
-    backend's session aggregator writes, and what its layer preference ranks
-    first) ahead of ``summary`` rows (the claude-mem migration), each group in
-    the order the backend returned it; if no profile item carries a ``layer``
-    key at all, take all of them. Filtering on ``summary`` alone dropped every
-    aggregated row (10CG/nexus-claude-plugin#32). Each line is prefixed
+  - Render: handoff rows (``aria.source=handoff``) first, grouped by
+    container -- each group's newest row (by ``aria.updated_at``) renders in
+    full (title + everything before ``## §2`` + the ``## §6`` section, capped
+    ~1500 chars at a line boundary; a handoff with no §6 renders the WHOLE
+    document instead, never just the title), the group's older rows one title
+    line. Plain episode and semantic rows render one line each, prefixed
     ``[<container_id> · <age> · <branch>]`` provenance (§6 — guard the
     warm-start from half-finished observations + make cross-container origin
-    legible). A migrated ``summary`` never had a branch and shows ``-``; a
-    ``session_summary`` shows ``?`` for its age, because neither its metadata
-    nor a profile row carries a timestamp (workflow D, TASK-007, moves to the
-    list endpoint and its ``created_at``). No results -> no stdout (fail-open
-    silent).
+    legible). The pre-TASK-007 client-side ``layer=summary`` filter dropped
+    every aggregated row (10CG/nexus-claude-plugin#32); layers are now
+    decided server-side and verified row by row. A migrated ``summary`` never
+    had a branch and shows ``-``; age comes from the list endpoint's top-level
+    ``created_at`` (metadata keys are a legacy fallback). No results -> no
+    stdout (fail-open silent).
 """
 
 import json
@@ -847,11 +848,15 @@ def _cap_at_line(text, cap):
 
 def _render_handoff_row(row):
     """The LATEST handoff of one container: (title, head + §6), the body
-    line-boundary capped at ~1500 chars; no §6 anywhere -> the whole document
-    capped the same way. A9-10."""
+    line-boundary capped at ~1500 chars. A row with NO §6 section anywhere
+    falls back to the WHOLE document, capped the same way -- never just the
+    title (TASK-007: a no-§6 handoff's §2 carry list is exactly what must
+    not be lost; the head alone would reduce the entry to its H1). A9-10."""
     title, head, sect6, full = _handoff_pieces(row)
-    parts = [part for part in (head, sect6) if part]
-    body = _cap_at_line("\n".join(parts) if parts else full, _HANDOFF_RENDER_CHARS)
+    if sect6:
+        body = _cap_at_line("\n".join(p for p in (head, sect6) if p), _HANDOFF_RENDER_CHARS)
+    else:
+        body = _cap_at_line(full, _HANDOFF_RENDER_CHARS)
     return title, body
 
 
