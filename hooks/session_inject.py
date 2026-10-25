@@ -974,8 +974,9 @@ def _collect(run):
     container_id = _identity.container_id()
     branch = _current_branch(cwd)
     # X1-policy (TASK-007): the project scope for every query. Underivable
-    # (None) -> the project-scoped queries are simply not sent: an unscoped
-    # query only LOOKS scoped, and an empty-string scope is an empty answer.
+    # (None) -> ALL project-scoped segments are skipped below (owner ruling
+    # 2026-10-25, task007-closeout-rulings.md §2 [1]): an unscoped query
+    # only LOOKS scoped, and an empty-string scope is an empty answer.
     project, project_source = _identity.project_key(
         cwd, os.environ.get(_identity.PROJECT_DIR_ENV)
     )
@@ -1043,32 +1044,50 @@ def _collect(run):
     peers_seen = []
     episode_failed = False
     segment_errors = []  # (segment, exc) -- reason attribution below
-    try:
-        episode_rows, peers_seen = _episode_segment(
-            base_url, token, user_id, branch, project, container_id, state, run
+    # X1-policy, ruling [1] on task007-closeout-rulings.md §2 (owner
+    # 2026-10-25): an underivable scope silences the WHOLE D. Episode and
+    # fact pages sent without `project` only LOOK scoped -- every project's
+    # rows would render and the row-by-row project check is off too (X1
+    # isolation gone) -- and an empty-string scope is an empty answer; the
+    # brief stays silent rather than cross projects. The semantic segment
+    # has always refused to run unscoped (it cannot be made safe there).
+    scoped = project is not None
+    if not scoped:
+        run["notes"].append(
+            "project scope underivable (no CLAUDE_PROJECT_DIR and cwd is not "
+            "in a git repo); the project-scoped queries were not sent"
         )
-    except Exception as exc:
-        episode_failed = True  # segment 2 must still render (independent try)
-        segment_errors.append(("episode", exc))
-        run.setdefault("diagnostics", []).append(("episode", exc))
+    if scoped:
+        try:
+            episode_rows, peers_seen = _episode_segment(
+                base_url, token, user_id, branch, project, container_id, state, run
+            )
+        except Exception as exc:
+            episode_failed = True  # segment 2 must still render (independent try)
+            segment_errors.append(("episode", exc))
+            run.setdefault("diagnostics", []).append(("episode", exc))
 
     # ── segment 2: the fact delta (keyset pages, dedupe, own rows dropped) ──
     fact_rows = []
     fact_failed = False
     fact_truncated = False
-    try:
-        fact_rows, fact_truncated = _fact_segment(
-            base_url, token, user_id, project, container_id,
-            since - timedelta(minutes=_FACT_DIAL_BACK_MINUTES), run,
-        )
-    except Exception as exc:
-        fact_failed = True
-        segment_errors.append(("fact", exc))
-        run.setdefault("diagnostics", []).append(("fact", exc))
+    if scoped:
+        try:
+            fact_rows, fact_truncated = _fact_segment(
+                base_url, token, user_id, project, container_id,
+                since - timedelta(minutes=_FACT_DIAL_BACK_MINUTES), run,
+            )
+        except Exception as exc:
+            fact_failed = True
+            segment_errors.append(("fact", exc))
+            run.setdefault("diagnostics", []).append(("fact", exc))
     if fact_truncated:
         run["extra"]["fact_delta_truncated"] = 1
+    # `scoped`: a round that never RAN the delta must not advance the marker
+    # past rows it never read -- an underivable-scope stretch would else skip
+    # the whole delta the day the scope comes back.
     run["advance_fact_marker"] = (
-        not fact_failed and not fact_truncated and source == "startup"
+        scoped and not fact_failed and not fact_truncated and source == "startup"
     )
 
     # ── segment 3: project-scoped semantic retrieve (query non-empty) ──
