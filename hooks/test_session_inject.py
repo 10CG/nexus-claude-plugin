@@ -773,17 +773,37 @@ class TestSourceHeader(_LedgerCase):
 
 class TestIdentityIsShared(_LedgerCase):
 
-    def test_user_id_and_container_id_come_from_the_shared_module(self):
-        """Not `equal to what _identity would say` -- *the same call*. The write
-        side uses it too, and two derivations that merely agree today are how
-        the two sides end up keying one project differently."""
-        cap = _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])])
-        with mock.patch.object(_identity, "user_id", return_value="pinned-user") as user_id, \
-                mock.patch.object(_identity, "container_id", return_value="pinned-container"):
+    def test_identity_comes_from_the_shared_module_on_the_calling_thread(self):
+        """P1 (A10): the worker's identity values are pre-read on the CALLING
+        thread -- main() calls the SHARED `_identity` derivations (the same
+        ones the write side uses; two derivations that merely agree today are
+        how the two sides end up keying one project differently) exactly once
+        and hands them down in `run`. The worker itself must not reach any
+        env-reading identity function (TestTheWorkerThreadDoesNotReadIts
+        Environment pins that statically)."""
+        cap = _UrlopenCapture([
+            _page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []},
+        ])
+        with mock.patch.object(_identity, "container_id", return_value="pinned-container") as container_id:
             self._main(cap)
-        user_id.assert_called_once_with(self.cwd)
-        first_url = cap.requests[0][0]
-        self.assertIn("user_id=pinned-user", first_url)
+        container_id.assert_called_once_with()
+        # the user_id half: NEXUS_DEFAULT_USER_ID set -> that value, verbatim
+        self.assertIn("user_id=nexus", cap.requests[0][0])
+
+    def test_the_user_id_falls_back_to_the_shared_slug_derivation(self):
+        """...and unset -> the SAME shared `_identity.project_slug` call the
+        write side keys on, made exactly once on the calling thread."""
+        cap = _UrlopenCapture([
+            _page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []},
+        ])
+        with mock.patch.dict(os.environ):
+            del os.environ["NEXUS_DEFAULT_USER_ID"]
+            with mock.patch.object(_identity, "project_slug", return_value="pinned-slug") as slug:
+                self._main(cap)
+        # project_slug is ALSO the ledger directory key, so "exactly once"
+        # cannot hold; the pin is the shared call AND its value on the wire
+        self.assertIn(mock.call(self.cwd), slug.call_args_list)
+        self.assertIn("user_id=pinned-slug", cap.requests[0][0])
 
 
 class TestStateDirectory(unittest.TestCase):
@@ -2142,6 +2162,56 @@ class TestR3T02PersistentStateReadFailureSelfHeals(_LedgerCase):
         self.assertIn("never", parsed["systemMessage"])
 
 
+class TestTheWorkerThreadDoesNotReadItsEnvironment(unittest.TestCase):
+    """P1 (A10, proposal.md Amendment A10 「给 TASK-007」): the work runs on a
+    thread that can only be ABANDONED, never safely stopped. Every
+    environment input it needs -- stdin, NEXUS_API_URL / TOKEN, the project
+    dir env, the identity values -- is read ONCE on the calling thread
+    (main) and handed down as data in `run`; the worker and every function
+    it reaches must not read os.environ / sys.stdin itself. R10-1 / R10-2
+    established that neither a runtime lens alone nor a static lens alone
+    catches violations: the runtime nail is the whole suite driving main()
+    with values that only exist in `run`; THIS is the static nail, at the
+    source level."""
+
+    # These run on the calling thread (or at import time): main pre-reads
+    # everything there on purpose. _record also runs on the calling thread
+    # -- but its NESTED writer runs on the abandonable ledger thread, so
+    # nested defs are always checked, never allowlisted through their
+    # enclosing function.
+    _ALLOWED_TOP_LEVEL = {"main", "_silence_stdout", "_silence_stderr", "_import_warn"}
+
+    def test_no_worker_reachable_function_reads_environment_or_stdin(self):
+        import ast
+
+        with open(_HOOK_SCRIPT, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+
+        offenders = []
+
+        def check(fn, allowlisted):
+            if not allowlisted:
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Attribute) and node.attr in ("environ", "stdin"):
+                        offenders.append(f"{fn.name}: `.{node.attr}` read")
+                    if isinstance(node, ast.Name) and node.id == "getenv":
+                        offenders.append(f"{fn.name}: getenv()")
+            for node in fn.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    check(node, allowlisted=False)  # nested defs: never exempt
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                check(node, allowlisted=node.name in self._ALLOWED_TOP_LEVEL)
+
+        # main() is allowlisted (it IS the calling thread, and its reads are
+        # the whole point of P1); everything else landing here is a violation.
+        self.assertEqual(
+            offenders, [],
+            "worker-reachable env/stdin reads (move them to main(), hand the "
+            "values down in `run`): " + "; ".join(offenders))
+
+
 class TestExpectedLedgersMatchTheManifest(unittest.TestCase):
     def test_every_registered_session_end_hook_is_expected_to_leave_a_ledger(self):
         """The "never recorded a run" report only covers hooks named in
@@ -2397,6 +2467,44 @@ class TestRecipe(_LedgerCase):
         # clean startup round -> the marker advanced past the pre-round moment
         state, _ = _hook_state.read_state("session-inject", self.cwd)
         self.assertIn(_MOD._FACT_MARKER_KEY, state)
+
+    def test_a_page_of_own_rows_does_not_end_the_delta_scan(self):
+        """R1-C1 (post_implementation R1): the delta loop ends on a RAW-empty
+        page, never on one whose rows were all dropped (own container /
+        verification failures). A first run after install is exactly an
+        own-backfill-filled window -- breaking there would permanently lose
+        the peer rows on later pages, and the marker would then advance past
+        rows that were never read. The cursor likewise rides the RAW page's
+        last row."""
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        own = [_fact_row(f"own-{i}", row_id=f"o{i}", container_id="dev-claude-308",
+                         project="nexus", created_at="2026-10-24T09:00:00Z")
+               for i in range(2)]
+        peer = _fact_row("peer-fact", row_id="p1", project="nexus",
+                         created_at="2026-10-23T08:00:00Z")
+        cap = _UrlopenCapture([
+            _page([_mem_row("ep", project="nexus")]),
+            _page(own),      # fact page 1: ALL OWN -> filtered empty, scan continues
+            _page([peer]),   # fact page 2: the peer row behind the own wall
+            _page([]),       # fact page 3: raw-empty -> the end of the delta
+            {"profile": []},
+        ])
+        out, _ = self._main(
+            cap, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("peer-fact", out)
+        self.assertNotIn("own-0", out)  # still never rendered
+        # the page-2 cursor rode the RAW page-1 last row (an OWN row, there
+        # was no kept row at all); the page-3 cursor rode page 2's peer row
+        fact_urls = [u for u, _, _ in cap.requests if "before_created_at" in u]
+        self.assertEqual(len(fact_urls), 2, cap.requests)
+        self.assertIn(urllib.parse.quote("2026-10-24T09:00:00Z"), fact_urls[0])
+        self.assertIn("before_id=o1", fact_urls[0])
+        self.assertIn(urllib.parse.quote("2026-10-23T08:00:00Z"), fact_urls[1])
+        self.assertIn("before_id=p1", fact_urls[1])
 
     def test_a_failed_fact_page_keeps_the_episodes_and_the_marker(self):
         marker = "2026-10-24T07:00:00Z"

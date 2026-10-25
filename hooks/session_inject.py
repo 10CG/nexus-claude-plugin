@@ -626,11 +626,17 @@ def _fact_segment(base_url, token, user_id, project, own_container, since, run):
             params["before_created_at"] = last_created
             params["before_id"] = last_id
         run["calls"] += 1
-        rows = _list_memories(base_url, token, user_id, params, _SMALL_CALL_TIMEOUT_SECONDS)
-        rows = _verify_rows(rows, run, layer="fact", project=project)
+        raw = _list_memories(base_url, token, user_id, params, _SMALL_CALL_TIMEOUT_SECONDS)
+        if not raw:
+            break  # a genuinely empty page is the end of the delta
+        # OWN rows and verification failures must NOT end the scan: breaking
+        # on a filtered-empty page loses every PEER row on later pages when
+        # this container's own backfill fills the window first (R1-C1 -- a
+        # first run after install is exactly that shape, and the marker then
+        # advances past the rows that were never read). The cursor likewise
+        # rides the RAW page's last row.
+        rows = _verify_rows(raw, run, layer="fact", project=project)
         rows = [r for r in rows if _row_container(r) != own_container]
-        if not rows:
-            break  # an empty page is the end of the delta
         for row in rows:
             row_id = str(row.get("id") or row.get("memory_id") or "")
             if row_id and row_id in seen_ids:
@@ -638,8 +644,8 @@ def _fact_segment(base_url, token, user_id, project, own_container, since, run):
             if row_id:
                 seen_ids.add(row_id)
             collected.append(row)
-        last_created = rows[-1].get("created_at")
-        last_id = str(rows[-1].get("id") or "")
+        last_created = raw[-1].get("created_at")
+        last_id = str(raw[-1].get("id") or "")
         if page_no == _FACT_MAX_PAGES:
             truncated = True  # a 5th page that still had rows: unread remainder
     collected.sort(key=_aria_modified, reverse=True)
@@ -945,7 +951,11 @@ def _collect(run):
     -- a return or an exception -- the ledger record has the right project and
     the number of calls actually attempted.
     """
-    raw = sys.stdin.read()
+    if run.get("stdin_error") is not None:
+        # the stdin read failed on the calling thread (P1); surface it through
+        # the same reason mapping as when the read lived here
+        raise run["stdin_error"]
+    raw = run.get("payload_raw") or ""
     # SessionStart payload: cwd plus `source` (startup / resume / clear /
     # compact). Only `startup` advances the fact marker (proposal D).
     event = json.loads(raw) if raw.strip() else {}
@@ -965,21 +975,22 @@ def _collect(run):
         except Exception as exc:  # noqa: BLE001 - the report must never cost the brief
             print(f"[{HOOK}] could not read the hook ledgers: {exc!r}", file=sys.stderr)
 
-    base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
+    base_url = run["base_url"]
     if not base_url:
         return "not_configured", None  # the default for a fresh install
-    token = os.environ.get("NEXUS_API_TOKEN", "")
+    token = run["token"]
 
-    user_id = _identity.user_id(cwd)
-    container_id = _identity.container_id()
+    # P1: identity values were pre-read on the calling thread; user_id goes
+    # through the SHARED derivation with the pre-read override ("" = unset),
+    # so no environment is touched here (project_slug only shells out to git).
+    user_id = _identity.user_id(cwd, run["default_user_id"])
+    container_id = run["container_id"]
     branch = _current_branch(cwd)
     # X1-policy (TASK-007): the project scope for every query. Underivable
     # (None) -> ALL project-scoped segments are skipped below (owner ruling
     # 2026-10-25, task007-closeout-rulings.md §2 [1]): an unscoped query
     # only LOOKS scoped, and an empty-string scope is an empty answer.
-    project, project_source = _identity.project_key(
-        cwd, os.environ.get(_identity.PROJECT_DIR_ENV)
-    )
+    project, project_source = _identity.project_key(cwd, run["env_project_dir"])
     if project is not None and project_source == _identity.PROJECT_SOURCE_GIT:
         run["extra"]["project_source"] = "git_fallback"
 
@@ -1178,6 +1189,9 @@ def _record(reason, started, run):
     elapsed_ms = int((time.monotonic() - started) * 1000)  # the hook's work, not the wait below
     # Snapshot: if the work was abandoned, its thread may still be writing to `run`.
     calls, cwd, extra, marks = run["calls"], run["cwd"], dict(run["extra"]), run["marks"]
+    # P1: the writer below runs on the ledger budget thread (abandonable) --
+    # the container id it persists is the value the calling thread pre-read.
+    new_container = run.get("container_id")
 
     def write():
         try:
@@ -1224,7 +1238,7 @@ def _record(reason, started, run):
                     # change the session never saw would eat it forever.
                     if marks is not None:
                         next_state["reported"] = marks
-                    next_state["container_id"] = _identity.container_id()
+                    next_state["container_id"] = new_container
                 return next_state
             _hook_state.update_state(HOOK, cwd or os.getcwd(), mutate)
         except Exception as exc:  # noqa: BLE001
@@ -1312,9 +1326,40 @@ def main():
     # main() calls within the same test process do not double-wrap
     # (production runs this once per process).
     _hook_runner.guard_stderr()
+    # P1 (A10, proposal.md Amendment A10 「给 TASK-007」, owner-ruling track):
+    # every environment input (and stdin) the worker needs is read HERE, on
+    # the calling thread, ONCE, and rides `run` across the thread boundary as
+    # data. The worker -- and every function it can reach -- must not read
+    # the environment itself: it runs on a thread that can only be ABANDONED,
+    # never safely stopped, and a torn read there is undetectable from the
+    # main thread (R10-1 / R10-2). Pinned by the source-level test
+    # TestTheWorkerThreadDoesNotReadItsEnvironment. Standard-library-internal
+    # reads (git finding PATH, urllib finding proxy vars) are exempt.
+    try:
+        payload_raw = sys.stdin.read()
+    except Exception as exc:
+        # Not handled here: _collect re-raises it so the deadline machinery
+        # maps it to a reason and the ledger row, exactly as it did when the
+        # read lived in the worker.
+        payload_raw = ""
+        run_stdin_error = exc
+    else:
+        run_stdin_error = None
     run = {
         "cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None,
         "notes": [], "stdout_ok": False,
+        "payload_raw": payload_raw,
+        "base_url": os.environ.get("NEXUS_API_URL", "").rstrip("/"),
+        "token": os.environ.get("NEXUS_API_TOKEN", ""),
+        "env_project_dir": os.environ.get(_identity.PROJECT_DIR_ENV),
+        # _identity.user_id/container_id read NEXUS_* env themselves; the
+        # worker instead uses these pre-read values (user_id's project_slug
+        # fallback only shells out to git, which is not an env read).
+        "container_id": _identity.container_id(),
+        # "" (not None) when unset: _identity.user_id must never fall back to
+        # reading the environment on the worker thread (P1).
+        "default_user_id": os.environ.get(_identity.DEFAULT_USER_ID_ENV) or "",
+        "stdin_error": run_stdin_error,
     }
 
     # The work runs against a deadline of its own. urllib's timeout is per
