@@ -307,7 +307,11 @@ def _candidates(handoff_dir):
     self-referential symlink), a per-entry permission problem -- as opposed
     to one that is simply GONE by the time this loop reaches it (listed a
     moment ago, unlinked since: an ordinary race, R2-c03's own reading,
-    kept for that case alone). The two used to be indistinguishable by
+    kept for that case alone). Since A9-19 (owner ruling 2026-10-01) each
+    entry carries its OWN bound exception -- ``(name, OSError)`` pairs, the
+    error type no longer discarded at the ``except`` site -- because the
+    fallback-scan report writes "which entry, what error" into the detail.
+    The two used to be indistinguishable by
     exception type: ``os.stat`` follows symlinks, so both a vanished entry
     and a dangling one raise the identical ``FileNotFoundError``. Filtering
     with ``os.path.isfile`` directly (rather than ``os.stat`` + `S_ISREG``
@@ -338,19 +342,19 @@ def _candidates(handoff_dir):
     except NotADirectoryError:
         return [], []
     out = []
-    undecidable = []
+    undecidable = []  # (name, exception) pairs -- A9-19 binds the error
     for name in names:
         if name.upper() in _HANDOFF_EXCLUDED_NAMES_UPPER or not name.endswith(".md"):
             continue
         path = os.path.join(handoff_dir, name)
         try:
             is_file = stat.S_ISREG(os.stat(path).st_mode)
-        except OSError:
+        except OSError as stat_exc:
             try:
                 os.lstat(path)
             except FileNotFoundError:
                 continue  # gone even at the symlink-entry level: a real race
-            except OSError:
+            except OSError as lstat_exc:
                 # R4-c01: EACCES / EIO / ESTALE etc. on the lstat call
                 # itself -- as opposed to FileNotFoundError -- is NOT "gone
                 # by the time we looked": something is still there and this
@@ -362,17 +366,23 @@ def _candidates(handoff_dir):
                 # test_handoff_sync.py's TestLocate:
                 # test_an_unstattable_candidate_entry_is_pointer_
                 # unresolved_not_quiet (mocked) and its real_chmod sibling
-                # pin THIS branch alone; test_an_unstattable_candidates_
-                # own_lstat_failure_does_not_sabotage_a_healthy_sibling
-                # (R5-c06) additionally pins that ONE such entry does not
-                # take a healthy sibling candidate down with it). The old
-                # code read ANY OSError here the same as FileNotFoundError,
-                # quietly dropping the candidate and, if it was the only
-                # one, landing on `no_handoff` -- exactly the silent stop
-                # ruling 5 / ruling 13 rule out. Falls through to the same
-                # `undecidable.append` below as a successful lstat does.
-                pass
-            undecidable.append(name)
+                # pin THIS branch alone). The old code read ANY OSError
+                # here the same as FileNotFoundError, quietly dropping the
+                # candidate and, if it was the only one, landing on
+                # `no_handoff` -- exactly the silent stop ruling 5 /
+                # ruling 13 rule out. The lstat exception is the one bound
+                # on this leg: it is the error that proves "still there
+                # but unresolvable".
+                undecidable.append((name, lstat_exc))
+                continue
+            # A dangling / ELOOP symlink (lstat SUCCEEDS, only the
+            # following stat fails): the entry itself is really there. The
+            # stat exception is the binding one on this leg -- the errors
+            # differ per leg (dangling is FileNotFoundError, ELOOP is
+            # OSError), and A9-19's whole-round report writes that type
+            # into the detail so a reader can tell a deleted-neighbour
+            # case from a permission case without reproducing the run.
+            undecidable.append((name, stat_exc))
             continue
         if is_file:
             out.append(name)
@@ -391,26 +401,43 @@ def _pointer_target(handoff_dir):
     perfectly readable ``latest.md``).
 
     ``unresolved``, when not ``None``, is a short description of why
-    ``latest.md`` itself could not be resolved at all -- a dangling or
-    self-referential (``ELOOP``) symlink, a directory, a permission error, a
-    stale handle (R5-c01). This is a DIFFERENT shape from "no pointer": a
-    project that genuinely keeps no ``latest.md`` must stay quiet, but one
-    whose ``latest.md`` exists in SOME form and cannot be resolved must not
-    have that read failure silently reinterpreted as "no pointer" -- the
-    old ``os.path.isfile`` check folded both into the exact same ``False``,
-    so the newest-``updated-at`` fallback below ran anyway and could
-    silently pick a DIFFERENT document than the one the (unreadable)
-    pointer might actually have named -- exactly the silent which-document
-    swap ruling 13 forbids, and the same shape R4-c03 already closes one
-    level down (an EXPLICIT pointer TARGET landing in ``undecidable``) --
-    this is the pointer FILE itself being unresolvable. The caller
-    (``_locate``) decides what an ``unresolved`` result means: with two or
-    more ``*.md`` entries it could have named -- resolvable candidates and
-    undecidable ones counted together (R6-c01) -- it reports
+    ``latest.md`` itself could not be resolved at all -- a directory, a
+    permission error, a stale handle (R5-c01). This is a DIFFERENT shape
+    from "no pointer": a project that genuinely keeps no ``latest.md`` must
+    stay quiet, but one whose ``latest.md`` exists in SOME form and cannot
+    be resolved must not have that read failure silently reinterpreted as
+    "no pointer" -- the old ``os.path.isfile`` check folded both into the
+    exact same ``False``, so the newest-``updated-at`` fallback below ran
+    anyway and could silently pick a DIFFERENT document than the one the
+    (unreadable) pointer might actually have named -- exactly the silent
+    which-document swap ruling 13 forbids, and the same shape R4-c03
+    already closes one level down (an EXPLICIT pointer TARGET landing in
+    ``undecidable``) -- this is the pointer FILE itself being unresolvable.
+    The caller (``_locate``) decides what an ``unresolved`` result means:
+    with two or more ``*.md`` entries it could have named -- resolvable
+    candidates and undecidable ones counted together (R6-c01) -- it reports
     ``pointer_unresolved`` (guessing could ingest the wrong one); only with
     exactly ONE such entry in total is there nothing else ``latest.md``
     could have named, so that leg falls through unchanged and quiet
     (R2-c13's FIFO fixture stays green).
+
+    A9-23 (owner ruling 2026-10-01, option A 当指针) adds the SYMLINK
+    shape, Aether's real layout: a symlink ``latest.md`` is the pointer
+    ITSELF whenever its fully-resolved path (both sides realpath'd) lands
+    in ``docs/handoff``'s top level -- its basename is returned as
+    ``target`` and judged by the caller exactly like a text pointer's. A
+    dangling or looping symlink is decided by its LINK TEXT
+    (``os.readlink``, which never follows): a text resolving into the
+    directory top level and naming an ``undecidable`` entry reports through
+    the caller's R4-c03 branch; anything else -- outside the directory, a
+    subdirectory, an excluded name -- is the quiet "points at a
+    non-candidate" fallback, NOT an ``unresolved`` error (the pre-A9 code
+    reported the ELOOP/dangling ``repr`` here every single session;
+    R6-c09: that report never prevented a wrong pick anyway). A healthy
+    symlink pointing OUTSIDE the top level (at a pointer file elsewhere, or
+    into a subdirectory) is NOT the pointer: the target's CONTENT is read
+    and the ``**Latest**:`` line searched there, exactly the pre-A9
+    behaviour for those shapes.
 
     ``os.lstat`` -- not ``os.path.isfile``, which this replaces -- is
     checked FIRST specifically so a genuinely ABSENT ``latest.md``
@@ -428,8 +455,9 @@ def _pointer_target(handoff_dir):
     (R1-c13: ``stat()`` reads metadata only, it does not wait for a writer
     the way opening a FIFO does -- confirmed empirically against R2-c13's
     own FIFO fixture). Anything other than a regular file at that point (a
-    directory, FIFO, device, or a dangling/looping symlink ``stat`` itself
-    cannot resolve) is ``unresolved`` and is never opened.
+    directory, FIFO, or device node; dangling/looping symlinks no longer
+    reach this leg -- A9-23 decides them by link text above) is
+    ``unresolved`` and is never opened.
 
     The read itself is capped (``_MAX_DOCUMENT_CHARS``) for the same reason
     a regular file that is merely huge must not be read in full just to
@@ -437,7 +465,7 @@ def _pointer_target(handoff_dir):
     """
     path = os.path.join(handoff_dir, _LATEST_MD)
     try:
-        os.lstat(path)
+        link_stat = os.lstat(path)
     except FileNotFoundError:
         return None, None  # the ordinary case: no latest.md at all
     except OSError as exc:
@@ -445,9 +473,61 @@ def _pointer_target(handoff_dir):
         # existence check itself fail -- same "cannot tell" shape as the
         # two legs below, just caught one step earlier.
         return None, f"{exc!r}"
+    if stat.S_ISLNK(link_stat.st_mode):
+        # A9-23 (owner ruling 2026-10-01, option A 当指针): a SYMLINK
+        # latest.md is Aether's real layout (a git-tracked mode-120000
+        # link, repointed by hand each session close) and is treated as
+        # the pointer itself whenever it resolves into docs/handoff's TOP
+        # LEVEL -- both sides realpath'd, so the judgement is by FULL
+        # PATH, never bare basename (a basename-only check would mis-match
+        # a top-level document sharing the name of a subdirectory target,
+        # and would break the healthy-symlink-to-a-pointer-FILE case the
+        # content read below still handles). The returned basename is then
+        # judged by _locate exactly like a text pointer's: a candidate ->
+        # use it; an undecidable entry -> pointer_unresolved (R4-c03); in
+        # no list -> the same quiet fallback as an ordinary pointer naming
+        # a nonexistent file.
+        try:
+            os.stat(path)  # does the whole chain resolve? (result unused: only failure matters)
+        except OSError:
+            # Dangling or looping chain -- including the case where the
+            # link names an entry that exists but is itself unresolvable
+            # (its own stat failure propagates up the chain). A9-23:
+            # decide by the LINK TEXT (os.readlink never follows), NOT by
+            # the error -- the pre-A9 code returned the ELOOP/FileNotFoundError
+            # repr as `unresolved` here and this fired EVERY session
+            # (R6-c09: the report never prevented a wrong pick anyway).
+            try:
+                text = os.readlink(path)
+            except OSError as exc:
+                return None, f"{exc!r}"
+            lexically = text if os.path.isabs(text) else os.path.join(handoff_dir, text)
+            lexically = os.path.normpath(lexically)
+            try:
+                real_dir = os.path.realpath(handoff_dir)
+            except OSError:
+                real_dir = handoff_dir
+            if os.path.dirname(lexically) == real_dir:
+                return os.path.basename(lexically), None
+            # Names something outside the directory / in a subdirectory /
+            # an excluded name: in NO list, the quiet "points at a
+            # non-candidate" fallback.
+            return None, None
+        # Healthy chain: resolve fully and compare directories.
+        try:
+            resolved_path = os.path.realpath(path)
+            real_dir = os.path.realpath(handoff_dir)
+        except OSError as exc:
+            return None, f"{exc!r}"
+        if os.path.dirname(resolved_path) == real_dir:
+            return os.path.basename(resolved_path), None
+        # A healthy symlink pointing OUTSIDE the directory (at a pointer
+        # file elsewhere) or INTO a subdirectory (a document there): not
+        # the pointer -- fall through and read the link's TARGET CONTENT,
+        # exactly the pre-A9 behaviour for these shapes.
     try:
         resolved = os.stat(path)
-    except OSError as exc:  # a dangling or self-referential (ELOOP) symlink
+    except OSError as exc:  # unreachable for a symlink chain that resolved above
         return None, f"{exc!r}"
     if not stat.S_ISREG(resolved.st_mode):
         # A directory, FIFO, device node, socket: something IS configured
@@ -509,15 +589,18 @@ def _locate(handoff_dir, extra=None):
     ``_candidates``'s ``undecidable`` list (a dangling symlink, ``ELOOP``)
     is "something was configured here, none of it could be resolved" --
     the same ``pointer_unresolved`` leg, not the quiet one, even though
-    ``listdir`` itself succeeded. When there is no pointer naming one of
-    them specifically, a directory with SOME resolvable candidates
-    alongside an undecidable one is not held back by the latter for the
-    FALLBACK scan below: it is simply left out of the newest-``updated-at``
-    comparison, the same as any other document this run cannot see (owner
-    question A9 row c18 -- R4 post_implementation audit -- covers whether
-    that silent exclusion is the right call; unchanged here). A pointer
-    that names one of them EXPLICITLY is a different case, handled before
-    the fallback scan even starts (R4-c03): silently substituting an
+    ``listdir`` itself succeeded. A9-19 (owner ruling 2026-10-01, closing
+    the old A9 row c18) adds the third shape: a directory with SOME
+    resolvable candidates alongside an undecidable one DOES hold back the
+    FALLBACK scan below -- the unstattable entry may be exactly the newest
+    document, so the whole round reports ``pointer_unresolved`` naming the
+    entry and its error type (the pre-A9 code silently left it out of the
+    newest-``updated-at`` comparison). A WORKING pointer that resolves to
+    a resolvable candidate bypasses that scan entirely, so an undecidable
+    SIBLING does not sink a round whose choice was never in doubt. A
+    pointer that names an undecidable entry EXPLICITLY is a different
+    case, handled before the fallback scan even starts (R4-c03): silently
+    substituting an
     older, merely-readable sibling for the specific document latest.md
     points at is exactly the silent which-document swap ruling 13 forbids,
     so that path reports ``pointer_unresolved`` instead.
@@ -585,15 +668,18 @@ def _locate(handoff_dir, extra=None):
         # Every listed *.md entry was undecidable (R3-c05): something WAS
         # kept here, so this is the loud "cannot tell" leg, not "nothing
         # here" -- the same distinction ruling 5 draws for an unlistable
-        # directory, one level down.
+        # directory, one level down. A9-19: the per-entry error types ride
+        # along (a dangling neighbour and a permission loss read the same
+        # without them).
         detail = (
             f"{len(undecidable)} candidate(s) in docs/handoff could not be resolved: "
-            f"{', '.join(undecidable)}"
+            + ", ".join(f"{name} ({exc!r})" for name, exc in undecidable)
         )
         if extra is not None:
             extra["detail"] = _short(detail)
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
+    undecidable_by_name = dict(undecidable)
     target, pointer_unresolved = _pointer_target(handoff_dir)
     if pointer_unresolved is not None and len(candidates) + len(undecidable) > 1:
         # R5-c01 / ruling 13: latest.md exists in SOME form but could not
@@ -632,19 +718,45 @@ def _locate(handoff_dir, extra=None):
         return None, "pointer_unresolved"
     if target in candidates:  # None never matches a real filename
         return target, None
-    if target is not None and target in undecidable:
+    if target is not None and target in undecidable_by_name:
         # R4-c03 / ruling 13: latest.md explicitly names this entry, and it
         # IS listed -- just unresolved (a dangling symlink, ELOOP, a
         # per-entry permission problem). Falling through to the
         # newest-updated-at scan below would silently ingest a DIFFERENT,
         # older document instead of the one the pointer actually names,
         # with a clean-looking ledger row: exactly the silent
-        # which-document swap ruling 13 forbids. This is deliberately
-        # narrower than the fallback scan a few lines down (owner question
-        # A9 row c18): only an EXPLICIT pointer resolving to an
-        # undecidable entry fails loud here; the no-pointer fallback still
-        # simply leaves an undecidable sibling out of the comparison.
-        detail = f"{target}: pointer target could not be resolved"
+        # which-document swap ruling 13 forbids. A9-23 reaches this same
+        # branch with a symlink latest.md whose LINK TEXT names the
+        # undecidable entry (the dangling chain propagates the target's
+        # own stat failure, so the readlink leg returns its basename).
+        # A9-19: the bound error type rides along in the detail.
+        detail = (
+            f"{target}: pointer target could not be resolved "
+            f"({undecidable_by_name[target]!r})"
+        )
+        if extra is not None:
+            extra["detail"] = _short(detail)
+        _warn(f"[{HOOK}] {detail}")
+        return None, "pointer_unresolved"
+    if undecidable:
+        # A9-19 (owner ruling 2026-10-01, option A 全报): this point is
+        # only reached when NO usable pointer resolved (none at all, or
+        # one naming a non-candidate), so the choice below is about to be
+        # made by the newest-`updated-at` fallback scan -- and an entry
+        # that cannot even be stat-ed may be exactly the NEWEST document,
+        # silently excluded from that comparison. The other three
+        # "cannot tell" shapes (unlistable directory, all-undecidable,
+        # latest.md itself unresolved) already report; this used to be the
+        # one quiet hold-out, and "bad entry count 1 vs 2" decided whether
+        # the same damage reported or not. The whole round reports, the
+        # detail naming each entry and its error type. A WORKING pointer
+        # (the branch above) bypasses this scan entirely, which is the one
+        # shape A9-19 spares: a bad sibling must not sink a round whose
+        # choice was never in doubt.
+        detail = (
+            f"{len(undecidable)} candidate(s) in docs/handoff could not be resolved: "
+            + ", ".join(f"{name} ({exc!r})" for name, exc in undecidable)
+        )
         if extra is not None:
             extra["detail"] = _short(detail)
         _warn(f"[{HOOK}] {detail}")

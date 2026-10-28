@@ -631,26 +631,23 @@ class TestLocate(_HandoffDirCase):
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
-    def test_an_unstattable_candidates_own_lstat_failure_does_not_sabotage_a_healthy_sibling(self):
-        """R5-c06: mutating the lstat-OSError `pass` two tests above (R4-
-        c01, `_candidates`'s own per-entry `except OSError:` re-raising
-        instead of falling through to `undecidable.append`) passed the
-        WHOLE suite before this test existed (confirmed against a temp
-        copy) -- every existing fixture for that branch uses a SINGLE
-        candidate, so "that one entry becomes undecidable, landing on
-        pointer_unresolved" and "the whole listing re-raises, caught by
-        `_locate`'s OUTER except, ALSO landing on pointer_unresolved" are
-        indistinguishable: both produce the identical `(None,
-        "pointer_unresolved")` with "docs/handoff" in the stderr detail
-        either way. A second, HEALTHY candidate is what tells them apart
-        -- mirroring `test_a_single_eloop_entry_does_not_sabotage_other_
-        candidates` above, which already pins this for the SIBLING branch
-        (a dangling/looping symlink, where `os.lstat` itself SUCCEEDS and
-        only `os.stat` fails) -- this covers the one where `os.lstat`
-        ITSELF also raises a non-`FileNotFoundError` `OSError`."""
+    def test_an_unstattable_sibling_does_not_sabotage_a_pointer_hit(self):
+        """A9-19 (owner ruling 2026-10-01) FLIPPED the pre-A9 shape this
+        test used to pin (R5-c06: a bad entry not sinking the fallback
+        scan). Under the ruling, the FALLBACK scan reports any unstattable
+        entry whole-round -- so the old fixture (no pointer, EIO on a.md,
+        healthy b.md) is now `pointer_unresolved` by design, and the
+        correct thing left to pin is the shape the ruling spares: a
+        WORKING pointer names a healthy document, and one unstattable
+        sibling must not sink that round -- the directory is fine, the
+        choice was never in doubt (per R6 code-reviewer's suggested
+        fixture). lstat itself raising a non-FileNotFoundError OSError is
+        still the branch under test (R4-c01), just no longer on the
+        fallback-scan path."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "b.md")
         broken = os.path.abspath(os.path.join(self.handoff_dir, "a.md"))
         real_stat, real_lstat = os.stat, os.lstat
 
@@ -667,8 +664,8 @@ class TestLocate(_HandoffDirCase):
         with mock.patch.object(_MOD.os, "stat", side_effect=failing_stat), \
                 mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat):
             result = _MOD._locate(self.handoff_dir)
-        # b.md must still resolve normally -- a.md's own unresolvable
-        # lstat must not take the whole directory listing down with it.
+        # latest.md names b.md: the unstattable a.md sibling never enters
+        # the comparison, so the round resolves b.md cleanly.
         self.assertEqual(result, ("b.md", None))
 
     def test_a_candidate_that_vanishes_at_both_stat_and_lstat_is_dropped_quietly(self):
@@ -753,19 +750,57 @@ class TestLocate(_HandoffDirCase):
         os.symlink(real_target, docs)
         self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
 
-    def test_a_single_eloop_entry_does_not_sabotage_other_candidates(self):
-        """R3-c05, third leg: a self-referential symlink (`ELOOP` on
-        `os.stat`) is neither `FileNotFoundError` (so the old per-entry
-        `except FileNotFoundError` never caught it at all) nor a
-        directory-level failure -- it used to escape `_candidates`
-        entirely, and `_locate`'s outer `except OSError` then read the
-        WHOLE directory as unresolved even though a perfectly good sibling
-        candidate sat right next to it."""
+    def test_a_single_eloop_entry_in_the_fallback_scan_is_pointer_unresolved_whole_round(self):
+        """A9-19 (owner ruling 2026-10-01, option A 全报): the no-pointer
+        fallback scan compares candidates by `updated-at` -- and an entry
+        that cannot even be stat-ed (here a self-referential symlink,
+        `ELOOP` on `os.stat`; EACCES / EIO / ESTALE are the same shape)
+        may be exactly the NEWEST document, silently excluded from the
+        comparison. The other three "cannot tell" shapes already report;
+        this used to be the one quiet hold-out (R3-c05 pinned that
+        silence, this flips it): the whole round is `pointer_unresolved`
+        and the detail names the entry and its error type."""
         self._mkdir()
         loop_path = os.path.join(self.handoff_dir, "loop.md")
         os.symlink(loop_path, loop_path)  # self-referential -> ELOOP on stat()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-20T10:00:00Z")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        extra = {}
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("loop.md", extra["detail"])
+        self.assertIn("OSError(", extra["detail"])  # the error TYPE travels with the name
+        self.assertIn("loop.md", stderr.getvalue())
+
+    def test_a_mocked_eio_entry_in_the_fallback_scan_is_pointer_unresolved_whole_round(self):
+        """A9-19, mocked-EIO twin (root-safe, the chmod-class convention):
+        the same whole-round report when the unstattable entry is an
+        injected `OSError(5)` on stat itself, not a constructible symlink
+        shape."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        broken = os.path.abspath(os.path.join(self.handoff_dir, "b.md"))
+        real_stat, real_lstat = os.stat, os.lstat
+
+        def failing_stat(path, *a, **kw):
+            if os.path.abspath(path) == broken:
+                raise OSError(5, "Input/output error")
+            return real_stat(path, *a, **kw)
+
+        def failing_lstat(path, *a, **kw):
+            if os.path.abspath(path) == broken:
+                raise OSError(5, "Input/output error")
+            return real_lstat(path, *a, **kw)
+
+        extra = {}
+        with mock.patch.object(_MOD.os, "stat", side_effect=failing_stat), \
+                mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat):
+            result = _MOD._locate(self.handoff_dir, extra)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("b.md", extra["detail"])
+        self.assertIn("OSError(", extra["detail"])
 
     def test_an_unreadable_newer_candidate_is_pointer_unresolved_not_a_silent_older_pick(self):
         """R3-c06: with no pointer, the fallback scan compares every
@@ -918,10 +953,17 @@ class TestLocate(_HandoffDirCase):
         self.assertIn("latest.md", extra["detail"])
         self.assertIn("OSError(", extra["detail"])
 
-    def test_a_dangling_latest_md_symlink_with_multiple_candidates_is_pointer_unresolved(self):
-        """R5-c01: latest.md ITSELF (not its target line's basename, R4-c03's
-        shape) is a dangling symlink -- `os.path.isfile` used to read that
-        as plain `False`, indistinguishable from no pointer file at all."""
+    def test_a_dangling_latest_md_symlink_with_multiple_candidates_falls_back_quietly(self):
+        """A9-23 (owner ruling 2026-10-01, option A 当指针) FLIPPED this
+        pre-A9 error (R5-c01). A dangling latest.md symlink is no longer
+        "latest.md itself unresolved" -- the LINK TEXT is read instead
+        (`os.readlink`), resolved against the directory, and when the
+        resolved path names no entry in any list (this link points
+        OUTSIDE the directory), that is the SAME shape as an ordinary
+        pointer naming a nonexistent file: quiet fallback to the newest
+        `updated-at`, not a failure every session. The dangling target may
+        simply be a deleted handoff nobody repointed at -- R6-c09's own
+        finding was that the error never prevented a wrong pick anyway."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
@@ -930,25 +972,91 @@ class TestLocate(_HandoffDirCase):
             os.path.join(self.handoff_dir, "latest.md"),
         )
         result = _MOD._locate(self.handoff_dir)
-        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertEqual(result, ("b.md", None))
 
-    def test_a_self_referential_latest_md_symlink_with_multiple_candidates_is_pointer_unresolved(self):
-        """R5-c01: latest.md -> latest.md (ELOOP). `os.lstat` alone cannot
-        catch this (it does not follow the final component, so it succeeds
-        on the symlink entry itself) -- resolving what is really there
-        needs a FOLLOWING stat, which is where ELOOP actually surfaces.
-        R6-c07: also pins the diagnostic TEXT -- the `repr()` of the
-        `OSError` `os.stat` raises for ELOOP, not just that SOME failure
-        was reported."""
+    def test_a_self_referential_latest_md_symlink_with_multiple_candidates_falls_back_quietly(self):
+        """A9-23, the loop form of the same flip: latest.md -> latest.md.
+        The link text resolves to `latest.md` itself -- an excluded name,
+        in no candidate list -- so this too is "points at a non-candidate"
+        and falls back quietly (was `pointer_unresolved` with the ELOOP
+        repr before the ruling)."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         loop_path = os.path.join(self.handoff_dir, "latest.md")
         os.symlink(loop_path, loop_path)
+        result = _MOD._locate(self.handoff_dir)
+        self.assertEqual(result, ("b.md", None))
+
+    def test_a_healthy_latest_md_symlink_into_the_directory_is_a_pointer(self):
+        """A9-23's main shape -- Aether's real layout (docs/handoff/
+        latest.md is a git-tracked symlink, mode 120000, repointed by
+        hand every session close). The symlink IS the pointer when its
+        resolved full path (both sides realpath'd) lands in docs/handoff's
+        TOP LEVEL and names a candidate -- equal in authority to a text
+        pointer, so it may select an OLDER document than the newest-
+        updated-at fallback would have (latest.md is the human-maintained
+        semantic authority, mtime is only the fallback -- session-handoff
+        standard). The pre-A9 code read the TARGET's content here, found
+        no `**Latest**:` line in it, and fell back to mtime, which only
+        worked on Aether because the target happened to also be the
+        newest."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        os.symlink("a.md", os.path.join(self.handoff_dir, "latest.md"))  # names the OLDER one
+        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+
+    def test_an_absolute_latest_md_symlink_into_the_directory_is_a_pointer(self):
+        """A9-23: the same judgement must not depend on the link text being
+        relative -- an absolute symlink resolving into the directory's top
+        level is the same pointer."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        b = _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        os.symlink(b, os.path.join(self.handoff_dir, "latest.md"))
+        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+
+    def test_a_latest_md_symlink_pointing_into_a_subdirectory_does_not_mis_match_a_top_level_same_name(self):
+        """A9-23: the symlink-pointer judgement is by FULL PATH (both sides
+        realpath'd, directories compared), never by bare basename -- the
+        spec's original wording (`只取基名`) would have matched a top-level
+        document the link does not name and would also have broken R6-c06
+        (a symlink at a pointer FILE). A link into a subdirectory is NOT a
+        pointer; the link's target content is read instead (it holds no
+        `**Latest**:` line here), so the round falls back to the newest
+        top-level candidate -- which must not be x.md merely because the
+        subdirectory document shares its name."""
+        self._mkdir()
+        sub = os.path.join(self.handoff_dir, "sub")
+        os.makedirs(sub)
+        _write_handoff(self.handoff_dir, "x.md", updated_at="2026-09-05T00:00:00Z")
+        _write_handoff(self.handoff_dir, "z.md", updated_at="2026-09-20T00:00:00Z")
+        _write_handoff(sub, "x.md", updated_at="2026-09-25T00:00:00Z")
+        os.symlink("sub/x.md", os.path.join(self.handoff_dir, "latest.md"))
+        self.assertEqual(_MOD._locate(self.handoff_dir), ("z.md", None))
+
+    def test_a_dangling_latest_md_symlink_whose_link_text_names_an_undecidable_entry_is_pointer_unresolved(self):
+        """A9-23's one loud leg for a dangling symlink: the link TEXT
+        resolves into the directory's top level and names an entry that is
+        listed but unresolvable (itself a dangling `*.md` symlink) -- the
+        same shape R4-c03 already closes for text pointers, caught via the
+        link text now: never silently ingest something else."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-target.md"),
+            os.path.join(self.handoff_dir, "gone.md"),
+        )
+        os.symlink("gone.md", os.path.join(self.handoff_dir, "latest.md"))
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir, extra)
         self.assertEqual(result, (None, "pointer_unresolved"))
-        self.assertIn("OSError(", extra["detail"])
+        self.assertIn("gone.md", extra["detail"])
+        self.assertIn("gone.md", stderr.getvalue())
 
     def test_a_directory_named_latest_md_with_multiple_candidates_is_pointer_unresolved(self):
         """R5-c01: a directory named latest.md is confirmed by `os.lstat`
@@ -1012,9 +1120,13 @@ class TestLocate(_HandoffDirCase):
         self.assertIn("latest.md", extra["detail"])
 
     def test_a_dangling_latest_md_symlink_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
-        """R6-c01, second form: `latest.md` ITSELF a dangling symlink (as
-        opposed to the undecidable `*.md` SIBLING entry) -- a different
-        path through the same exemption as the directory form above."""
+        """R6-c01's shape, A9-19's outcome: the dangling latest.md symlink
+        itself now falls back QUIETLY (A9-23 -- its link text names an
+        outside path, in no list), but the fallback scan then meets the
+        undecidable `b.md` sibling -- and A9-19's whole-round report fires
+        with the NEW口径 detail: the ENTRY name and its error type, no
+        longer `latest.md`. Still `pointer_unresolved`, by a different
+        route and with a detail that names the thing to fix."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         os.symlink(
@@ -1028,7 +1140,8 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         result = _MOD._locate(self.handoff_dir, extra)
         self.assertEqual(result, (None, "pointer_unresolved"))
-        self.assertIn("latest.md", extra["detail"])
+        self.assertIn("b.md", extra["detail"])
+        self.assertIn("FileNotFoundError", extra["detail"])
 
     def test_a_mocked_read_failure_on_latest_md_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
         """R6-c01, third form: injected via a mocked `open` (root-safe,
