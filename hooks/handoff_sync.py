@@ -1459,7 +1459,16 @@ def _collect(run):
     # (R1-c10, ruling 9): every reason from here on, write path or not, now
     # says WHICH handoff it was about, instead of only the ones that reached
     # a successful upsert.
-    external_id = _external_id(root, doc_path)
+    # X1 (owner 2026-10-01; A10-12 (2): reuse _identity.memory_dir_key):
+    # every external_id this hook writes carries the Claude Code project
+    # directory key as a prefix -- with user_id now pinning the PERSON
+    # (X1-policy, 2026-10-14), all of one user's projects share a pool, and
+    # two projects' same-named handoffs would otherwise PATCH each other's
+    # rows. The prefix derivation is the SAME single definition memory_sync
+    # keys its external_ids, memory directory and state file by; a degraded
+    # key never reaches the wire (identity_degraded refuses the write).
+    key, _key_degraded = _identity.memory_dir_key(cwd)
+    external_id = f"{key}/{_external_id(root, doc_path)}"
     run["extra"]["external_id"] = external_id
     try:
         with open(doc_path, encoding="utf-8", errors="replace") as fh:

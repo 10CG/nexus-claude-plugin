@@ -2019,6 +2019,10 @@ class _WriteCase(unittest.TestCase):
         # metadata.session_id keeps its meaning. Includes the two real
         # shapes A9-1's oracle handles: leading records with no timestamp,
         # and out-of-order early timestamps.
+        # X1: the external_id prefix -- computed the same way the hook does
+        # (the harness cwd is outside any git repository, so memory_dir_key
+        # falls back to the cwd path itself; deterministic within a run).
+        self.key = _identity.memory_dir_key(self.cwd)[0]
         self.transcript = os.path.join(self.tmp.name, "transcript.jsonl")
         with open(self.transcript, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"type": "mode", "mode": "default"}) + "\n")
@@ -2051,6 +2055,10 @@ class _WriteCase(unittest.TestCase):
                    "transcript_path": self.transcript}
         payload.update(event or {})
         return _run_main(_MOD, payload, env)
+
+    def _ext(self, name):
+        """The prefixed external_id the hook writes for a handoff document."""
+        return f"{self.key}/docs/handoff/{name}"
 
     @property
     def requests(self):
@@ -2441,7 +2449,7 @@ class TestWritePath(_WriteCase):
         self.assertEqual(
             get["query"],
             {"user_id": USER, "layer": "session_summary", "container_id": CONTAINER,
-             "external_id": "docs/handoff/2026-09-20-1000-x.md", "limit": "5"},
+             "external_id": self._ext("2026-09-20-1000-x.md"), "limit": "5"},
         )
         post = self.requests[1]["json"]
         self.assertEqual(post["user_id"], USER)
@@ -2457,7 +2465,7 @@ class TestWritePath(_WriteCase):
         self.assertEqual(meta["aria.updated_at"], "2026-09-20T10:00:00Z")
         self.assertNotIn("aggregation_hash", meta)
         self.assertEqual(meta["layer"], "session_summary")
-        self.assertEqual(meta["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["external_id"], self._ext("2026-09-20-1000-x.md"))
         self.assertEqual(meta["container_id"], CONTAINER)
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "none")
@@ -2484,7 +2492,7 @@ class TestWritePath(_WriteCase):
 
         self._write("2026-09-20-1000-x.md", section6=f"## §6 Next session 入口\n\nCHANGED {marker}")
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash="something-else",
+            self._ext("2026-09-20-1000-x.md"), content_hash="something-else",
         ))).reply(200, {"memory_id": "t1::proj::11111111-1111-4111-8111-111111111111"})
         self._run(session_id="sess-1")
         patch_entry = self._last_entry()
@@ -2499,7 +2507,7 @@ class TestWritePath(_WriteCase):
         digest = _ingest_client.content_hash(content)
         stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+            self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
         )))
         self._run(session_id="sess-1")
         self.assertEqual([r["method"] for r in self.requests], ["GET"])
@@ -2516,7 +2524,7 @@ class TestWritePath(_WriteCase):
             updated_at="2026-09-20T11:00:00Z",
         )
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=created_meta["content_hash"],
+            self._ext("2026-09-20-1000-x.md"), content_hash=created_meta["content_hash"],
             row_id="11111111-1111-4111-8111-111111111111",
             extra={k: v for k, v in created_meta.items() if k.startswith("aria.")},
         ))).reply(200, {"memory_id": "t1::proj::11111111-1111-4111-8111-111111111111"})
@@ -2538,7 +2546,7 @@ class TestWritePath(_WriteCase):
 
         self._write("2026-09-20-1000-x.md", status="done", updated_at="2026-09-20T11:00:00Z")
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=created_meta["content_hash"],
+            self._ext("2026-09-20-1000-x.md"), content_hash=created_meta["content_hash"],
             row_id="22222222-1111-4111-8111-111111111111",
             extra={k: v for k, v in created_meta.items() if k.startswith("aria.")},
         ))).reply(200, {"memory_id": "m1"})
@@ -2552,7 +2560,7 @@ class TestWritePath(_WriteCase):
     def test_an_older_local_updated_at_is_stale_local(self):
         self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash="something-else",
+            self._ext("2026-09-20-1000-x.md"), content_hash="something-else",
             extra={"aria.updated_at": "2026-09-21T00:00:00Z"},
         )))
         self._run(session_id="sess-1")
@@ -2574,11 +2582,11 @@ class TestWritePath(_WriteCase):
         digest = _ingest_client.content_hash(content)
         stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
         older = _row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+            self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
             created_at="2026-09-19T00:00:00.000001Z", row_id="aaaaaaaa-1111-4111-8111-111111111111",
         )
         newer = _row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+            self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
             created_at="2026-09-19T01:00:00.000001Z", row_id="bbbbbbbb-1111-4111-8111-111111111111",
         )
         self.backend.reply(200, _page(newer, older)).reply(204, None)
@@ -2611,7 +2619,7 @@ class TestWritePath(_WriteCase):
         stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
         rows = [
             _row(
-                "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+                self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
                 created_at=f"2026-09-19T0{i}:00:00.000001Z",
                 row_id=f"{i:08x}-1111-4111-8111-111111111111",
             )
@@ -2722,7 +2730,7 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id=None)
         meta = self.requests[1]["json"]["metadata"]
-        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
         self.assertEqual(self._last_entry()["reason"], "none")
 
     def test_identity_drift_reports_once(self):
@@ -3428,7 +3436,7 @@ class TestWritePath(_WriteCase):
         self._write("2026-09-20-1000-x.md")
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(self._last_entry()["external_id"], self._ext("2026-09-20-1000-x.md"))
 
     def test_a_document_that_vanishes_between_locate_and_open_is_unknown_not_quiet(self):
         """R4-c10: after `_locate` has already picked a document, the
@@ -3497,6 +3505,25 @@ class TestWritePath(_WriteCase):
         self.assertEqual(entry["reason"], "pointer_unresolved")
         self.assertIn("2026-09-20-1000-x.md", entry["detail"])
 
+    def test_external_ids_carry_the_x1_project_prefix(self):
+        """X1 (A10-12 (2)): the external_id prefix is _identity.
+        memory_dir_key -- the SAME single definition memory_sync keys its
+        rows by. With user_id pinning the person (X1-policy), two projects
+        of one user share a pool, and same-named handoffs in two different
+        project directories must not land on (and PATCH) each other's
+        external_id."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run()
+        meta = self.requests[1]["json"]["metadata"]
+        key = _identity.memory_dir_key(self.cwd)[0]
+        self.assertEqual(meta["external_id"], f"{key}/docs/handoff/2026-09-20-1000-x.md")
+        # a second project directory with a different path derives a
+        # different key, hence a different external_id for the same name
+        other_cwd = os.path.join(self.tmp.name, "other-proj")
+        os.makedirs(os.path.join(other_cwd, "docs", "handoff"))
+        self.assertNotEqual(_identity.memory_dir_key(other_cwd)[0], key)
+
     def test_the_ledger_detail_is_truncated_to_200_chars(self):
         """R1-c30: `_short`'s cap, pinned end to end through the ledger."""
         self._write("2026-09-20-1000-x.md")
@@ -3553,7 +3580,7 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="this-very-session")
         meta = self.requests[1]["json"]["metadata"]
-        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
         self.assertEqual(self._last_entry()["attribution"], "synthetic")
 
     def test_a_missing_transcript_goes_in_under_the_synthetic_id(self):
@@ -3563,7 +3590,7 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(event={"transcript_path": None})
         meta = self.requests[1]["json"]["metadata"]
-        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
 
     def test_a_transcript_with_no_timestamped_record_goes_in_under_the_synthetic_id(self):
         """Same rule, different shape: a readable transcript whose records
@@ -3576,7 +3603,7 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(event={"transcript_path": bare})
         meta = self.requests[1]["json"]["metadata"]
-        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
 
     def test_the_attribution_tolerance_boundary_is_inclusive(self):
         """updated-at EXACTLY session-start minus tolerance still belongs
@@ -3592,7 +3619,7 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
         self._run(session_id="boundary-session")
         meta = self.requests[3]["json"]["metadata"]
-        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
 
     def test_a_failed_write_leaves_a_later_session_on_the_synthetic_id(self):
         """A9-1's S1/S2 fixture: S1 chose the document (real attribution)
@@ -3611,7 +3638,7 @@ class TestWritePath(_WriteCase):
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="sess-2", event={"transcript_path": s2_transcript})
         meta = self.requests[2]["json"]["metadata"]
-        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
 
     def test_owner_container_frontmatter_value_is_recorded_on_identity_unresolved(self):
         """R1-c10's courtesy, carried through the A9-2 rewrite: the ledger
@@ -3642,7 +3669,7 @@ class TestWritePath(_WriteCase):
         self._write("2026-09-20-1001-mine.md", owner=f"owner/{LOCAL_UUID}", nexus_ingest="skip")
         self._run()
         self.assertEqual(self._last_entry()["reason"], "opted_out")
-        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1001-mine.md")
+        self.assertEqual(self._last_entry()["external_id"], self._ext("2026-09-20-1001-mine.md"))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -3705,7 +3732,8 @@ class TestRuns(unittest.TestCase):
         self._run(sub, backend=backend2, session_id="sess-2")
         from_sub = backend2.requests[1]["json"]["metadata"]["external_id"]
 
-        self.assertEqual(from_root, "docs/handoff/2026-09-20-1000-x.md")
+        expected_prefix = _identity.memory_dir_key(self.repo)[0]
+        self.assertEqual(from_root, f"{expected_prefix}/docs/handoff/2026-09-20-1000-x.md")
         self.assertEqual(from_root, from_sub)
 
 
