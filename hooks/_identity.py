@@ -253,6 +253,7 @@ def project_slug(cwd):
 PROJECT_SOURCE_ENV = "env"   # CLAUDE_PROJECT_DIR was set (worktree already resolved)
 PROJECT_SOURCE_GIT = "git"   # fallback: the cwd git toplevel basename
 PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"  # public: callers read it once on the main thread
+DEFAULT_USER_ID_ENV = "NEXUS_DEFAULT_USER_ID"  # public: same P1 pre-read pattern
 
 
 def _main_worktree(repo_dir):
@@ -315,9 +316,6 @@ def project_key(cwd, env_dir):
     if toplevel is None:
         return None, PROJECT_SOURCE_GIT
     return normalize_slug(os.path.basename(toplevel.rstrip("/"))), PROJECT_SOURCE_GIT
-
-
-DEFAULT_USER_ID_ENV = "NEXUS_DEFAULT_USER_ID"  # public: same P1 pre-read pattern
 
 
 def user_id(cwd, default_user_id=None):

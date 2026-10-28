@@ -1434,8 +1434,7 @@ def _collect(run):
 
     ``run`` is filled in as facts become known, so that whatever happens
     next -- a return or an exception -- the ledger record has the right
-    project and (once the write path is reached) whether the container_id
-    drift check must persist a new value. NOT the call count, if this
+    project. NOT the call count, if this
     thread is abandoned mid-``upsert`` (R1-c09): ``run["calls"]`` is only
     ever assigned AFTER ``upsert`` returns, so a thread abandoned while
     still inside it leaves the count at its initial 0 even though a real
@@ -1567,34 +1566,12 @@ def _collect(run):
         run["extra"]["project_source"] = "git_fallback"
     metadata = _build_metadata(session_id, _current_branch(cwd), frontmatter, doc_uuid, project)
 
-    # P1: the state path resolved from the run's OWN state_root (read once
-    # by main()), never via read_state(HOOK, cwd) -- that form re-resolves
-    # state_root(), an environment read, on this worker thread. The joined
-    # path is byte-identical to _hook_state.state_path(HOOK, cwd).
-    state_path = os.path.join(run["state_root"], _identity.project_slug(cwd), f"{HOOK}.state.json")
-    state, _state_reasons = _hook_state.read_state_at(state_path)
-    drift_reasons = _hook_state.identity_drift(
-        previous=state.get("container_id"),
-        current=run["container_id"],
-        state_existed=os.path.exists(state_path),
-    )
-    if "identity_changed" in drift_reasons:
-        # Recorded independently of the scalar `reason` this run ends on
-        # (ruling 2, R1-c04): worst_reason can have a higher-priority
-        # failure such as http_error outrank identity_changed there, and
-        # without this separate flag the drift signal simply disappears
-        # from the ledger for that run -- exactly the finding's complaint.
-        #
-        # Checked by MEMBERSHIP, not `if drift_reasons:` (R2-c06): a
-        # corrupted or pre-migration state file (one that exists but
-        # carries no `container_id`) makes `identity_drift` return
-        # `["unknown"]` -- the previous identity is UNKNOWABLE, a
-        # genuinely different condition from "the identity changed", and
-        # the old truthiness check stamped `identity_changed: True` on
-        # that ledger row too, sending a reader chasing a container swap
-        # that never happened. `worst_reason` below still surfaces
-        # `unknown` as the scalar `reason` either way.
-        run["extra"]["identity_changed"] = True
+    # A9-11 (owner 2026-10-01): no drift check here, and no container_id
+    # persistence. The compare-and-report moved to session_inject (every
+    # startup, in systemMessage + the brief's first line, persisted only
+    # after a successful stdout write); the two write hooks neither check
+    # nor persist container_id anymore -- rows they wrote under an old
+    # identity simply read as a peer container's on the injection side.
 
     # P1: token / container_id pre-read by main(); user_id INLINES
     # _identity.user_id's own two-line body with the pre-captured override
@@ -1619,28 +1596,22 @@ def _collect(run):
         local_updated_at=frontmatter.get("updated-at"),
     )
     run["calls"] = outcome.calls
-    # Persist the NEW container_id for the next run's drift check only when
-    # this run's write actually finished (ruling 2, R1-c04): a round-abort
-    # outcome (500, 403 ingest_disabled, 429, a client-side timeout) means
-    # we do not know whether the server ever saw the new identity, and
-    # persisting anyway would make the drift silently unrecoverable -- the
-    # next run's `previous` would already read the new value, so a write
-    # that in fact never got through is never retried under the old id
-    # either. `main()` ALSO gates the actual persist on whether the worker
-    # thread was abandoned (`left_behind`): a thread stuck inside `upsert`
-    # itself never reaches this line at all, but that gate does not rely on
-    # this line's placement to hold.
-    run["persist_container_id"] = not outcome.aborts_round
     run["extra"].update(
         # external_id is already in `extra` (set as soon as it was chosen,
         # above) -- not repeated here.
         action=outcome.action,
         redacted=outcome.redacted,
         dedup_merged=outcome.dedup_merged,
-        status=outcome.status,
+        # A10 D5 (2026-10-03): decided_status, never status -- status is the
+        # state of whichever call happened to run LAST on this Outcome (a
+        # dedup DELETE's 204 outlives a PATCH that never answered, and the
+        # ledger would say the write succeeded when it did not). Rounds that
+        # only ever LOOKED something up (unchanged / stale_local) decide
+        # nothing: their status here is None, the honest reading.
+        status=outcome.decided_status,
         detail=_short(outcome.detail),
     )
-    return _hook_state.worst_reason([*drift_reasons, *outcome.reasons])
+    return _hook_state.worst_reason(outcome.reasons)
 
 
 def _record(reason, started, run, work_left_behind):
@@ -1650,56 +1621,14 @@ def _record(reason, started, run, work_left_behind):
     Mirrors the other two SessionEnd hooks' ``_record``: the write happens
     on a daemon thread abandoned after ``_LEDGER_BUDGET_SECONDS`` (the
     ledger takes a blocking lock, and a stall must not keep this process
-    alive past the host's own timeout). One addition here: when the write
-    path was reached AND actually finished (``persist``, see below), the
-    same budgeted write also persists the new ``container_id`` for the NEXT
-    run's drift check -- identical in shape to session_inject.py persisting
-    its ``reported`` markers alongside its ledger write.
+    alive past the host's own timeout).
 
     ``work_left_behind`` is ``main()``'s own ``left_behind`` for the WORK
-    thread (not this function's ledger-write one): ruling 2 (R1-c04) gates
-    the container_id persist on the work having actually finished, not just
-    on ``run["persist_container_id"]`` -- a thread abandoned mid-``upsert``
-    must not have its guess about the outcome trusted.
+    thread (not this function's ledger-write one).
 
-    ``record_run`` happens FIRST, the persist attempt only AFTER (R2-c01,
-    reversing an earlier revision that had it the other way around): both
-    steps share this one budgeted ``write()``, and ``write_with_budget``
-    abandons whichever step is still running at ``_LEDGER_BUDGET_SECONDS``
-    -- the thread is simply left behind, not killed, but the process this
-    runs in DOES get killed shortly after, via ``_hook_runner.finish``'s
-    ``os._exit(0)`` when a thread was left behind (see ``__main__`` below).
-    Persisting first meant a persist slow or contended enough to eat the
-    whole budget could commit the new container_id to disk and STILL run
-    out of time before record_run ever ran -- os._exit then erasing the row
-    for good, not just the persist half of it, because the next run's drift
-    check reads the already-updated state and finds nothing changed. With
-    record_run first, the row that says what THIS run did is what has to
-    survive a slow persist, not the other way around; a persist abandoned
-    after it merely means the NEXT run's drift check still sees the old id
-    and reports the (by then already known) drift again -- a duplicate,
-    not a silent loss.
-
-    A persist failure discovered this way -- after the run's own row is
-    already on disk -- can no longer be folded into that row's `reason`
-    (ruling 2's literal "must not vanish" used to mean exactly that merge).
-    Rewriting the row already appended would need a new ``_hook_state``
-    primitive this fix does not add; a second, independent
-    ``state_write_failed`` row is what stays inside the existing public
-    surface (Amendment A9 -- the exact shape of "must not vanish" is an
-    owner question, not decided here) -- but ONLY when the persist
-    genuinely failed (R3-c01, see ``write`` below): ``update_state``'s own
-    ``reasons`` list is not a pass/fail flag by itself. A degraded lock
-    (``lock_unavailable``) or a corrupt state file it just repaired
-    (``unknown``) both still finish the write -- ``_hook_state._locked``
-    degrades to writing UNLOCKED rather than dropping the write, and a
-    corrupt ``read_state`` rebuilds from empty rather than aborting -- so
-    treating ANY non-empty ``reasons`` as failure appended a SPURIOUS
-    ``state_write_failed`` row even when the write landed, and since
-    ``session_inject._failure_report`` only reads the ledger's LAST row,
-    that spurious row buried whatever this run's real, correctly-recorded
-    reason was (``identity_changed``, ``dedup_merged``) behind a failure
-    that never happened.
+    A9-11 (owner 2026-10-01): the container_id persist that used to ride
+    this write is GONE -- the drift check moved to session_inject, and this
+    hook no longer touches its own state file at all.
     """
     elapsed_ms = int((time.monotonic() - started) * 1000)
     # R1-c09: a work thread abandoned mid-`upsert` never reaches the line
@@ -1708,7 +1637,7 @@ def _record(reason, started, run, work_left_behind):
     # not know". `None` says that honestly instead of a false 0.
     calls = None if work_left_behind else run["calls"]
     cwd = run["cwd"]
-    extra, persist = dict(run["extra"]), run["persist_container_id"] and not work_left_behind
+    extra = dict(run["extra"])
 
     def write():
         try:
@@ -1723,70 +1652,6 @@ def _record(reason, started, run, work_left_behind):
             )
         except Exception as exc:  # record_run does not raise by contract; the net under it
             _warn(f"[{HOOK}] could not record this run ({reason}): {exc!r}")
-        if not persist:
-            return
-        try:
-            # R4-c05: computed ONCE, here, rather than calling
-            # _identity.container_id() again below purely to VERIFY what
-            # this same value already told the mutate lambda to write.
-            # container_id() only reads an env var or falls back to
-            # socket.gethostname(), so a failure here is rare -- but the
-            # old code's SECOND, unprotected call sat right after
-            # update_state's own try/except, with nothing to catch it: a
-            # transient failure there escaped write() entirely, taking the
-            # whole "did the persist really land" check -- and the
-            # state_write_failed row a genuine persist failure is supposed
-            # to guarantee -- down with it. Treated exactly like
-            # update_state's own failure below: nothing could be persisted,
-            # full stop.
-            new_container_id = _identity.container_id()
-        except Exception as exc:  # noqa: BLE001 - the net under it; see above
-            _warn(f"[{HOOK}] could not determine container_id to persist: {exc!r}")
-            new_container_id = None
-            _new_state, persist_reasons = {}, ["state_write_failed"]
-        else:
-            try:
-                _new_state, persist_reasons = _hook_state.update_state(
-                    HOOK,
-                    cwd or os.getcwd(),
-                    lambda s: {**s, "container_id": new_container_id},
-                )
-            except Exception as exc:  # noqa: BLE001 - update_state does not raise by contract; the net under it
-                _warn(f"[{HOOK}] could not persist container_id: {exc!r}")
-                _new_state, persist_reasons = {}, ["state_write_failed"]
-        if new_container_id is not None and _new_state.get("container_id") == new_container_id:
-            # The write landed on disk with the identity this mutate always
-            # sets, whatever `persist_reasons` says about HOW (R3-c01) --
-            # see the docstring above. Trust disk state over the reasons
-            # list. The `is not None` guard matters only for the branch
-            # right above, where there is nothing trustworthy to compare
-            # against at all: without it, an empty `_new_state` reading
-            # back `None` for a MISSING key would false-positive against a
-            # `new_container_id` that is ALSO `None`, and this would
-            # wrongly return early instead of falling through to append
-            # the failure row below.
-            return
-        if "state_write_failed" not in persist_reasons:
-            # A degraded lock or a repaired-corrupt-state whose OWN write
-            # this call cannot otherwise confirm is not this caller's
-            # failure to report (R3-c01): only a genuine
-            # `state_write_failed` means persisting itself is what broke.
-            return
-        # The row above already recorded this run's true reason; a persist
-        # failure found only now is a second, independent fact, not a
-        # correction of it -- see the "state_write_failed" paragraph above.
-        try:
-            _hook_state.record_run(
-                HOOK,
-                ok=False,
-                reason="state_write_failed",
-                elapsed_ms=0,
-                calls=None,
-                cwd=cwd,
-                extra={"detail": _short(f"container_id persist failed after this run ({reason})")},
-            )
-        except Exception as exc:  # record_run does not raise by contract; the net under it
-            _warn(f"[{HOOK}] could not record state_write_failed: {exc!r}")
 
     left_behind = _hook_runner.write_with_budget(write, _LEDGER_BUDGET_SECONDS, f"{HOOK}-ledger")
     if left_behind:
@@ -1813,7 +1678,6 @@ def main():
         "cwd": None,
         "calls": 0,
         "extra": {},
-        "persist_container_id": False,
         # An absolute time.monotonic() value, about _DEADLINE_SLACK_SECONDS
         # before the work budget itself expires: IngestClient refuses a
         # request it could not finish in time rather than this whole
@@ -1839,7 +1703,6 @@ def main():
         run.update(
             base_url=os.environ.get("NEXUS_API_URL", "").rstrip("/"),
             token=os.environ.get("NEXUS_API_TOKEN", ""),
-            state_root=_hook_state.state_root(),
             default_user_id=os.environ.get(_identity.DEFAULT_USER_ID_ENV),
             container_id=_identity.container_id(),
             aria_uuid=_identity.aria_uuid(),

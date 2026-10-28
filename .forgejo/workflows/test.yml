@@ -64,6 +64,7 @@ jobs:
       - name: Run hook unit tests
         run: |
           python3 - <<'PY'
+          import os
           import pathlib
           import sys
           import unittest
@@ -108,5 +109,14 @@ jobs:
               sys.exit(1)
 
           ok = unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
-          sys.exit(0 if ok else 1)
+          # The suite spawns daemon threads (the hooks' budget/deadline
+          # machinery abandons them on a timer, not deterministically); a
+          # still-warm one can race interpreter finalization into a
+          # segfault AFTER the OK line was already printed (seen once
+          # locally: "OK (skipped=1)" then exit 139). The verdict is
+          # decided here -- flush and skip finalization so an exit race can
+          # never turn a green run red.
+          sys.stdout.flush()
+          sys.stderr.flush()
+          os._exit(0 if ok else 1)
           PY

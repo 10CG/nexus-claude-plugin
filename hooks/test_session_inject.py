@@ -36,8 +36,10 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
+from datetime import datetime, timedelta, timezone
 
 import _hook_runner
 import _hook_state
@@ -123,6 +125,21 @@ def _load_module():
 _MOD = _load_module()
 
 
+def _load_handoff():
+    """handoff_sync, loaded the same way as _MOD: the A9-10 fixtures build
+    their rows' content through its ``_build_content`` distiller (the wire
+    shape D actually reads), so the two modules can only agree by both being
+    right."""
+    spec = importlib.util.spec_from_file_location(
+        "handoff_sync_for_inject_test", os.path.join(_HOOKS_DIR, "handoff_sync.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_HANDOFF = _load_handoff()
+
+
 # ── Subprocess driver (for fail-open / malformed-stdin tests) ───────────────────
 
 def _run_hook(stdin_text, env=None, drop=(), script=None, want_stderr=False):
@@ -187,6 +204,73 @@ def _profile_row(content, *, container_id="dev-claude-308", layer="summary",
             "metadata": meta}
 
 
+def _mem_row(content, *, row_id="m1", container_id="dev-claude-308",
+             layer="session_summary", branch="feat/inject", project="nexus",
+             created_at="2026-10-24T08:00:00Z", updated=None, **meta_extra):
+    """One GET /v1/memories row (MemoryResponse shape: top-level created_at,
+    metadata carries the provenance keys). ``project`` defaults to the scope
+    every _LedgerCase fixture runs under; pass another value (or None to
+    omit the key) to build a row the row-by-row check must drop."""
+    meta = {"container_id": container_id, "branch": branch}
+    if layer is not None:
+        meta["layer"] = layer
+    if project is not None:
+        meta["project"] = project
+    if updated is not None:
+        meta["aria.modified"] = updated
+    meta.update(meta_extra)
+    return {"memory_id": f"{container_id}::{row_id}", "id": row_id,
+            "content": content, "memory_type": "semantic", "metadata": meta,
+            "created_at": created_at}
+
+
+def _page(rows):
+    """One GET /v1/memories answer."""
+    return {"memories": list(rows), "total_count": len(rows), "limit": 100,
+            "offset": 0, "has_next": bool(rows)}
+
+
+def _fact_row(desc, *, row_id="f1", container_id="peer-a", project="nexus",
+              created_at="2026-10-20T08:00:00Z", modified="2026-10-24T09:00:00Z",
+              **meta_extra):
+    meta = {"container_id": container_id, "layer": "fact",
+            "aria.description": desc, "aria.modified": modified}
+    if project is not None:
+        meta["project"] = project
+    meta.update(meta_extra)
+    return {"memory_id": f"{container_id}::{row_id}", "id": row_id,
+            "content": desc, "memory_type": "fact", "metadata": meta,
+            "created_at": created_at}
+
+
+def _handoff_row(row_id, container, updated, *, title, created_at,
+                 branch="feat/inject"):
+    """One ``aria.source=handoff`` episode row whose content is what
+    handoff_sync actually stores: ``_build_content``'s H1 + §6 + §2 distill.
+    The §6 body is ``do <title>`` so a full render is distinguishable from
+    the one-title-line render of the same row's headline."""
+    body = f"# {title}\n\n## §6 Next session\n\ndo {title}\n\n## §2 未完成\n\ncarry {title}\n"
+    content, reason = _HANDOFF._build_content(body)
+    if reason is not None:
+        raise AssertionError(f"fixture body did not distill: {reason}")
+    return _mem_row(content, row_id=row_id, container_id=container,
+                    project="nexus", created_at=created_at, branch=branch,
+                    **{"aria.source": "handoff", "aria.updated_at": updated})
+
+
+# The standard happy-path queue for the D recipe: one episode page with own
+# rows, one empty fact page (the delta loop stops at an empty page), one
+# semantic POST. Tests tailor the pieces they care about.
+def _happy_queue(rows, facts=(), semantic=None):
+    if semantic is None:
+        semantic = {"profile": []}
+    q = [_page(rows), _page(facts)]
+    if facts:
+        q.append(_page([]))  # the fact loop stops on an EMPTY page
+    q.append(semantic)
+    return q
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Class FailOpen — every degenerate path must exit 0 with empty stdout.
 # ════════════════════════════════════════════════════════════════════════════════
@@ -241,155 +325,127 @@ class TestFailOpen(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════════
 
 class TestRender(unittest.TestCase):
-
-    def test_only_summary_layer_kept(self):
-        rows = [
-            _profile_row("settled one", layer="summary"),
-            _profile_row("raw obs", layer="observation"),
-            _profile_row("settled two", layer="summary"),
-        ]
-        kept = _MOD._settled_rows(rows)
-        contents = [r["content"] for r in kept]
-        self.assertIn("settled one", contents)
-        self.assertIn("settled two", contents)
-        self.assertNotIn("raw obs", contents)
-
-    def test_no_layer_key_takes_all(self):
-        """If NO row carries a layer key, all rows are taken (nothing to filter on)."""
-        rows = [_profile_row("a", layer=None), _profile_row("b", layer=None)]
-        kept = _MOD._settled_rows(rows)
-        self.assertEqual(len(kept), 2)
-
-    # ── 10CG/nexus-claude-plugin#32: the aggregator's layer is session_summary ──
+    """Rendering guarantees after the client layer filter was deleted
+    (TASK-007): layer truth is server-side + row-by-row verification; these
+    pin the bracket, the age anchor and the branch slot rendering."""
 
     @staticmethod
-    def _aggregated_row(content, *, branch="feat/x", container_id="dev-claude-308"):
-        """A row as `workers/session_aggregator.py` writes it: the provenance
-        keys only when the session's observations agree on one, and no
-        timestamp in the metadata."""
-        meta = {"layer": "session_summary", "session_id": "s-1", "source_activity_count": 3,
-                "observation_ids": ["t::u::a"], "aggregation_hash": "h"}
-        if branch is not None:
-            meta["branch"] = branch
-        if container_id is not None:
-            meta["container_id"] = container_id
-        return {"memory_id": "m2", "content": content, "memory_type": "episodic", "metadata": meta}
+    def _agg(content, **kw):
+        return _mem_row(content, layer="session_summary", **kw)
 
-    def test_a_profile_of_aggregated_summaries_is_rendered(self):
-        """The bug itself: a profile holding only session_summary rows used to
-        render nothing, so the brief fell back to July's migrated summaries."""
-        rows = [self._aggregated_row("episode one"), _profile_row("raw obs", layer="observation")]
-        brief = _MOD._render(_MOD._settled_rows(rows))
-        self.assertIsNotNone(brief)
-        self.assertIn("episode one", brief)
-        self.assertNotIn("raw obs", brief)
+    def test_a_row_renders_with_container_age_branch(self):
+        line = _MOD._episode_line(
+            self._agg("hello", container_id="dev-a", branch="feat/x",
+                      created_at="2026-10-24T06:00:00Z")
+        )
+        self.assertTrue(line.startswith("  • [dev-a · "), line)
+        self.assertIn(" · feat/x] hello", line)
 
-    def test_session_summary_goes_first_and_each_layer_keeps_the_backend_order(self):
-        # Backend order runs against both content and id, so a secondary sort
-        # key on either would show up as a reordering.
-        rows = [
-            _profile_row("migrated y", layer="summary"),
-            _profile_row("raw obs", layer="observation"),
-            self._aggregated_row("episode z"),
-            _profile_row("migrated b", layer="summary"),
-            self._aggregated_row("episode a"),
-        ]
-        for row, memory_id in zip(rows, ("m-4", "m-5", "m-3", "m-2", "m-1")):
-            row["memory_id"] = memory_id
-        kept = [r["content"] for r in _MOD._settled_rows(rows)]
-        self.assertEqual(kept, ["episode z", "episode a", "migrated y", "migrated b"])
+    def test_the_age_is_read_from_the_top_level_created_at(self):
+        """TASK-007: the age anchor moved to the list endpoint's top-level
+        created_at (the pinned successor of the old `age is ?` fixture).
+        The timestamp is RELATIVE: a fixed date made this pin rot exactly
+        one day after it was written (CI green at 04:32Z, red by 08:00Z)."""
+        one_day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        line = _MOD._episode_line(
+            self._agg("hello", created_at=one_day_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      branch="main")
+        )
+        self.assertIn(" · 1d · ", line)  # not "?" anymore
 
-    def test_a_profile_of_only_observations_renders_nothing(self):
-        """The rows carry a layer, just not a settled one: that is not the
-        no-layer case, and observations must not fall through into the brief."""
-        rows = [_profile_row("obs 1", layer="observation"), _profile_row("obs 2", layer="observation")]
-        self.assertEqual(_MOD._settled_rows(rows), [])
-        self.assertIsNone(_MOD._render(_MOD._settled_rows(rows)))
+    def test_a_missing_timestamp_renders_a_question_mark(self):
+        row = self._agg("hello", created_at=None, branch="main")
+        line = _MOD._episode_line(row)
+        self.assertIn(" · ? · ", line)
+
+    def test_a_handoff_rows_age_anchors_on_aria_updated_at(self):
+        """A9-10: handoff content is rewritten on every sync; created_at would
+        show the FIRST write, not the last."""
+        row = self._agg("h", created_at="2026-10-01T00:00:00Z", branch="main",
+                        **{"aria.source": "handoff", "aria.updated_at": "2026-10-24T06:00:00Z"})
+        line = _MOD._episode_line(row)
+        self.assertNotIn("23d", line)   # a created_at anchor would say weeks
+        self.assertNotIn(" · ? · ", line)
+
+    def test_the_migrated_summary_branch_slot_is_a_dash(self):
+        """A migrated `summary` never had a branch: "-" says none, where "?"
+        would suggest one went missing."""
+        line = _MOD._episode_line(_profile_row("old", layer="summary", branch=""))
+        self.assertTrue(line.endswith("· -] old"), line)
 
     def test_an_empty_branch_is_rendered_like_a_missing_one(self):
-        migrated = _profile_row("old", layer="summary", branch="")
-        episode = self._aggregated_row("new", branch="")
-        lines = _MOD._render(_MOD._settled_rows([migrated, episode])).splitlines()
-        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
-        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
+        line = _MOD._episode_line(self._agg("new", branch=""))
+        self.assertTrue(line.endswith("· ?] new"), line)
 
     def test_a_blank_or_non_string_branch_is_rendered_like_a_missing_one(self):
         """Whitespace leaves the same empty slot an empty string did, and a
         branch that is not a string is not a branch."""
         for value in ("  ", "\t", 0, 7, ["main"]):
             with self.subTest(value=value):
-                row = self._aggregated_row("x", branch=value)
-                self.assertTrue(_MOD._render(_MOD._settled_rows([row])).endswith("· ?] x"))
+                row = self._agg("x", branch=value)
+                self.assertTrue(_MOD._episode_line(row).endswith("· ?] x"))
 
-    def test_a_layer_value_that_is_not_a_known_string_is_dropped_not_raised(self):
-        """`in` on the rank table hashes the value: a list would raise and take
-        every other row down with it."""
-        rows = [self._aggregated_row("keep"), _profile_row("list", layer=["summary"]),
-                _profile_row("number", layer=7), _profile_row("unknown", layer="fact")]
-        self.assertEqual([r["content"] for r in _MOD._settled_rows(rows)], ["keep"])
+    def test_long_content_is_capped_not_wrapped(self):
+        line = _MOD._episode_line(self._agg("x" * 400, branch="main"))
+        self.assertTrue(line.endswith("…"))
+        self.assertLessEqual(len(line), 360)  # bracket + 300 capped content
 
-    def test_branch_shows_dash_for_a_migrated_summary_and_question_mark_otherwise(self):
-        migrated = _profile_row("old", layer="summary")
-        del migrated["metadata"]["branch"]
-        mixed_session = self._aggregated_row("new", branch=None)  # no unique branch
-        brief = _MOD._render(_MOD._settled_rows([migrated, mixed_session]))
-        lines = brief.splitlines()
-        self.assertTrue(lines[1].endswith("· ?] new"), lines[1])
-        self.assertTrue(lines[2].endswith("· -] old"), lines[2])
-
-    def test_an_aggregated_row_renders_its_provenance_with_an_unknown_age(self):
-        """Neither the aggregator's metadata nor a profile row carries a
-        timestamp, so the age is '?' until workflow D (TASK-007) reads
-        `created_at` from the list endpoint. Pinned so that change is seen."""
-        brief = _MOD._render(_MOD._settled_rows([self._aggregated_row("did it", branch="feat/us-037")]))
-        self.assertIn("[dev-claude-308 · ? · feat/us-037] did it", brief)
-
-    def test_render_has_provenance(self):
-        rows = [_profile_row("did the thing", container_id="dev-claude-308",
-                             branch="feat/us-037")]
-        brief = _MOD._render(_MOD._settled_rows(rows))
+    def test_render_assembles_episodes_then_facts(self):
+        brief = _MOD._render(
+            [self._agg("episode one", branch="main")],
+            [_fact_row("fact one")],
+        )
         self.assertIsNotNone(brief)
-        self.assertIn("dev-claude-308", brief)
-        self.assertIn("feat/us-037", brief)
-        self.assertIn("did the thing", brief)
-        # provenance bracket form [container · age · branch]
-        self.assertIn("[dev-claude-308 ·", brief)
+        self.assertIn("episode one", brief)
+        self.assertIn("fact one", brief)
+        self.assertLess(brief.index("episode one"), brief.index("Facts since last session:"))
 
-    def test_render_empty_is_none(self):
-        self.assertIsNone(_MOD._render([]))
+    def test_render_returns_none_when_nothing_survives(self):
+        self.assertIsNone(_MOD._render([], []))
 
-    def test_age_formatting(self):
-        # ~2 hours ago -> "Nh"
-        from datetime import datetime, timedelta, timezone
-        two_h = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-        meta = {"valid_from": two_h}
-        self.assertTrue(_MOD._age(meta).endswith("h"))
-        # missing -> '?'
-        self.assertEqual(_MOD._age({}), "?")
+    def test_the_fact_line_renders_only_the_description(self):
+        row = _fact_row("the description", container_id="peer-a")
+        row["content"] = "the full content body that must NOT be rendered"
+        line = _MOD._fact_line(row)
+        self.assertIn("the description", line)
+        self.assertNotIn("full content body", line)
 
+    def test_one_unencodable_row_does_not_cost_the_whole_brief(self):
+        # One row carrying a lone surrogate made the stdout write raise
+        # UnicodeEncodeError, and every other row went down with it.
+        bad = self._agg("lone surrogate: \udcff", branch="main")
+        good = self._agg("fine", branch="main")
+        brief = _MOD._render([bad, good], [])
+        self.assertIn("fine", brief)
 
-# ════════════════════════════════════════════════════════════════════════════════
-# Class RequestParams — capture the outgoing request body via monkeypatched urllib.
-# ════════════════════════════════════════════════════════════════════════════════
 
 class TestRequestParams(unittest.TestCase):
+    """Request-shape pins for the D recipe (episode GET + semantic POST);
+    the tier-1/tier-2 fixtures were replaced by TestRecipe's project-level
+    retry and peer look-up cases."""
 
     def setUp(self):
         self._orig_urlopen = _MOD.urllib.request.urlopen
         self._orig_branch = _MOD._current_branch
-        # Force a deterministic branch so metadata_filter is predictable.
+        # Force a deterministic branch so the episode URL is predictable.
         _MOD._current_branch = lambda cwd: "feat/inject"
         os.environ["NEXUS_API_URL"] = "https://nexus.example/v1"
         os.environ["NEXUS_DEFAULT_USER_ID"] = "nexus"
         os.environ["NEXUS_CONTAINER_ID"] = "dev-claude-308"
         os.environ["NEXUS_API_TOKEN"] = "tok123"
+        # Deterministic project scope so the semantic segment is sent.
+        patcher = mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         _MOD.urllib.request.urlopen = self._orig_urlopen
         _MOD._current_branch = self._orig_branch
-        for k in ("NEXUS_API_URL", "NEXUS_DEFAULT_USER_ID", "NEXUS_CONTAINER_ID",
-                  "NEXUS_API_TOKEN"):
-            os.environ.pop(k, None)
+        for key in ("NEXUS_API_URL", "NEXUS_DEFAULT_USER_ID",
+                    "NEXUS_CONTAINER_ID", "NEXUS_API_TOKEN"):
+            os.environ.pop(key, None)
 
     def _run_main_capturing(self, responses, stdin_event):
         """``sys.stderr`` is saved and restored too (Amendment A9-21), not
@@ -414,68 +470,58 @@ class TestRequestParams(unittest.TestCase):
             sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
         return cap, out
 
-    def test_body_uses_profile_limit_not_limit(self):
-        resp = {"profile": [_profile_row("hello world")], "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
-        self.assertEqual(len(cap.requests), 1)
-        _, body, headers = cap.requests[0]
+    @staticmethod
+    def _queue(episode_rows):
+        return [_page(episode_rows), _page([]), {"profile": []}]
+
+    def test_the_semantic_body_uses_profile_limit_not_limit(self):
+        cap, out = self._run_main_capturing(
+            self._queue([_mem_row("hello world", branch="feat/inject", project="nexus")]),
+            {"cwd": _HOOKS_DIR},
+        )
+        semantic = [r for r in cap.requests if "context/retrieve" in r[0]]
+        self.assertEqual(len(semantic), 1)
+        _, body, _ = semantic[0]
         self.assertIn("profile_limit", body, "request body must use profile_limit")
         self.assertEqual(body["profile_limit"], 10)
         self.assertNotIn("limit", body, "request body must NOT contain a bare `limit` field")
         self.assertEqual(body["ranking_strategy"], "quality_rerank")
-        self.assertEqual(body["recent_hours"], 72)
 
     def test_user_agent_header_present(self):
-        resp = {"profile": [_profile_row("hello")], "total_latency_ms": 1}
-        cap, _ = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
+        cap, _ = self._run_main_capturing(
+            self._queue([_mem_row("hello", branch="feat/inject", project="nexus")]), {"cwd": _HOOKS_DIR}
+        )
         _, _, headers = cap.requests[0]
         # urllib title-cases header keys.
-        joined = " ".join(headers.keys())
         self.assertIn("User-agent", headers, f"User-Agent header required (CF 1010). Got: {headers}")
         self.assertIn("X-nexus-source", headers)
 
-    def test_metadata_filter_has_branch_and_container(self):
-        resp = {"profile": [_profile_row("hello")], "total_latency_ms": 1}
-        cap, _ = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
-        _, body, _ = cap.requests[0]
-        mf = body.get("metadata_filter")
-        self.assertIsNotNone(mf, "tier-1 request must carry metadata_filter")
-        self.assertEqual(mf.get("branch"), "feat/inject")
-        self.assertEqual(mf.get("container_id"), "dev-claude-308")
+    def test_the_episode_page_carries_layer_branch_and_limit(self):
+        cap, _ = self._run_main_capturing(
+            self._queue([_mem_row("hello", branch="feat/inject", project="nexus")]), {"cwd": _HOOKS_DIR}
+        )
+        url = cap.requests[0][0]
+        self.assertIn("/memories?", url)
+        self.assertIn("layer=session_summary", url)
+        self.assertIn("branch=feat%2Finject", url)
+        self.assertIn("limit=100", url)
 
-    def test_empty_profile_triggers_second_unfiltered_request(self):
-        """Tier 1 empty -> tier 2 (no metadata_filter) project-level fallback."""
-        tier1 = {"profile": [], "total_latency_ms": 1}
-        tier2 = {"profile": [_profile_row("project level hit")], "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([tier1, tier2], {"cwd": _HOOKS_DIR})
-        self.assertEqual(len(cap.requests), 2, "empty tier-1 must trigger a second request")
-        _, body1, _ = cap.requests[0]
-        _, body2, _ = cap.requests[1]
-        self.assertIn("metadata_filter", body1, "tier-1 carries metadata_filter")
-        self.assertNotIn("metadata_filter", body2, "tier-2 fallback must omit metadata_filter")
-        # And the tier-2 hit must be rendered.
-        self.assertIn("project level hit", out)
-
-    def test_known_limit_own_episodes_in_tier_one_keep_tier_two_from_running(self):
-        """Pinned known limit (10CG/nexus-claude-plugin#32 interim fix): this
-        container's aggregated episode on the branch satisfies tier 1, so the
-        project-level tier 2 -- the only source of the other container's rows
-        and of the migrated summaries -- is never sent. Workflow D (change 2
-        TASK-007) replaces the tiers; this test is expected to change then."""
-        own = TestRender._aggregated_row("my own episode", branch="feat/inject")
-        tier1 = {"profile": [own], "total_latency_ms": 1}
-        tier2 = {"profile": [_profile_row("other container episode", container_id="dev-claude2")],
-                 "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([tier1, tier2], {"cwd": _HOOKS_DIR})
-        self.assertEqual(len(cap.requests), 1)
-        self.assertIn("my own episode", out)
-        self.assertNotIn("other container episode", out)
+    def test_branch_omitted_when_no_branch(self):
+        """Non-git dir (branch None) -> no branch parameter at all."""
+        _MOD._current_branch = lambda cwd: None
+        cap, _ = self._run_main_capturing(
+            [_page([_mem_row("hello", branch=None, project="nexus")]), _page([]), {"profile": []}],
+            {"cwd": _HOOKS_DIR},
+        )
+        first = cap.requests[0][0]
+        self.assertNotIn("branch=", first, first)
 
     def test_output_shape_and_provenance(self):
-        resp = {"profile": [_profile_row("did a refactor", container_id="dev-claude-308",
-                                         branch="feat/inject")],
-                "total_latency_ms": 1}
-        cap, out = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
+        cap, out = self._run_main_capturing(
+            self._queue([_mem_row("did a refactor", container_id="dev-claude-308",
+                                  branch="feat/inject", project="nexus")]),
+            {"cwd": _HOOKS_DIR},
+        )
         parsed = json.loads(out)
         hso = parsed["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "SessionStart")
@@ -484,30 +530,17 @@ class TestRequestParams(unittest.TestCase):
         self.assertIn("[dev-claude-308 ·", ctx)
         self.assertIn("feat/inject", ctx)
 
-    def test_branch_omitted_when_no_branch(self):
-        """Non-git dir (branch None) -> metadata_filter has container_id but no branch."""
-        _MOD._current_branch = lambda cwd: None
-        resp = {"profile": [_profile_row("hello")], "total_latency_ms": 1}
-        cap, _ = self._run_main_capturing([resp], {"cwd": _HOOKS_DIR})
-        _, body, _ = cap.requests[0]
-        mf = body.get("metadata_filter")
-        self.assertIsNotNone(mf)
-        self.assertNotIn("branch", mf, "branch key must be omitted when branch is unknown")
-        self.assertIn("container_id", mf)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# Class NonVacuity — prove the suite can go red.
-# ════════════════════════════════════════════════════════════════════════════════
 
 class TestNonVacuity(unittest.TestCase):
 
     def test_render_actually_filters(self):
-        """If _settled_rows were a no-op, this would keep the observation row.
-        Asserting it is dropped proves the filter is live."""
-        rows = [_profile_row("keep", layer="summary"),
-                _profile_row("drop", layer="observation")]
-        kept_contents = [r["content"] for r in _MOD._settled_rows(rows)]
+        """If _verify_rows were a no-op, this would keep the observation row.
+        Asserting it is dropped proves the row-by-row check is live."""
+        run = {"extra": {}}
+        rows = [_mem_row("keep", layer="session_summary"),
+                _mem_row("drop", layer="observation")]
+        kept_contents = [r["content"] for r in _MOD._verify_rows(
+            rows, run, layer="session_summary")]
         triggered = False
         try:
             self.assertIn("drop", kept_contents)  # intentionally wrong
@@ -565,6 +598,15 @@ class _LedgerCase(unittest.TestCase):
             "NEXUS_API_TOKEN": "tok123",
         }))
         self._patch(mock.patch.object(_MOD, "_current_branch", return_value="feat/inject"))
+        # Deterministic project scope for every fixture in this family
+        # (owner ruling 2026-10-25: an underivable scope now silences the
+        # whole D, so a fixture that "just worked" unscoped would make zero
+        # calls instead -- scope it like TestRecipe does and give the rows a
+        # matching metadata.project via the _mem_row/_fact_row defaults).
+        self._patch(mock.patch.object(
+            _identity, "project_key",
+            return_value=("nexus", _identity.PROJECT_SOURCE_ENV),
+        ))
         # The ledger directory is keyed by the project slug, which shells out to
         # git. Patched on _identity: both the hook and _hook_state reach it by
         # attribute, which is what makes this patch land (a `from` import would
@@ -595,33 +637,38 @@ class _LedgerCase(unittest.TestCase):
 class TestLedger(_LedgerCase):
 
     def test_a_successful_injection_records_one_clean_run(self):
-        out, _ = self._main(_UrlopenCapture([{"profile": [_profile_row("hello")]}]))
+        out, _ = self._main(_UrlopenCapture([_page([_mem_row("hello", branch="feat/inject")]), _page([]), {"profile": []}]))
         self.assertIn("hello", out)
         entries = self._entries()
         self.assertEqual(len(entries), 1)
         entry = entries[0]
         self.assertEqual(
             (entry["hook"], entry["ok"], entry["reason"], entry["calls"]),
-            ("session-inject", True, "none", 1),
+            ("session-inject", True, "none", 3),
         )
         self.assertIs(type(entry["elapsed_ms"]), int)
         self.assertGreaterEqual(entry["elapsed_ms"], 0)
-        self.assertEqual((entry["tier"], entry["rows"]), (1, 1))
+        self.assertEqual((entry["episodes"], entry["facts"], entry["semantic"]), (1, 0, 0))
 
     def test_the_project_level_fallback_counts_both_calls(self):
-        cap = _UrlopenCapture([{"profile": []}, {"profile": [_profile_row("tier two")]}])
+        cap = _UrlopenCapture([
+            _page([]),  # branch-scoped episode page: empty
+            _page([_mem_row("project level hit", branch=None)]),  # branchless retry
+            _page([]),  # fact page
+            {"profile": []},  # semantic
+        ])
         out, _ = self._main(cap)
-        self.assertIn("tier two", out)
+        self.assertIn("project level hit", out)
         entry = self._entries()[-1]
-        self.assertEqual((entry["reason"], entry["calls"], entry["tier"]), ("none", 2, 2))
+        self.assertEqual((entry["reason"], entry["calls"]), ("none", 4))
 
     def test_nothing_to_inject_is_a_recorded_skip_not_silence(self):
         """Exit 0 with no stdout is also what a broken hook looks like. The
         ledger is the only thing that tells the two apart."""
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([]), {"profile": []}]))
         self.assertEqual(out, "")
         entry = self._entries()[-1]
-        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (True, "nothing_to_do", 2))
+        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (True, "nothing_to_do", 4))
         self.assertFalse(_hook_state.is_failure_reason(entry["reason"]))
 
     def test_no_backend_configured_is_a_recorded_skip_and_makes_no_call(self):
@@ -653,13 +700,13 @@ class TestLedger(_LedgerCase):
                 entries = self._entries()
                 self.assertEqual(len(entries), count, "every run appends exactly one record")
                 entry = entries[-1]
-                self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, expected, 1))
+                self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, expected, 3))
                 self.assertIn(expected, err)
 
     def test_the_second_call_failing_still_counts_two_calls(self):
         """`calls` is attempts, not successes: a baseline that undercounts the
         calls made on the failing path is wrong exactly when it is read."""
-        responses = iter([_FakeResponse({"profile": []})])
+        responses = iter([_FakeResponse(_page([])), _FakeResponse(_page([]))])
 
         def urlopen(req, timeout=None):
             try:
@@ -669,7 +716,7 @@ class TestLedger(_LedgerCase):
 
         self._main(urlopen)
         entry = self._entries()[-1]
-        self.assertEqual((entry["reason"], entry["calls"]), ("http_error", 2))
+        self.assertEqual((entry["reason"], entry["calls"]), ("http_error", 4))
 
     def test_a_two_hundred_that_is_not_json_is_an_http_error(self):
         """A proxy or challenge page. `unknown` would be true and useless."""
@@ -697,12 +744,12 @@ class TestLedger(_LedgerCase):
             return {}
 
         with mock.patch.object(_hook_state, "record_run", side_effect=spy):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("first things first")]}]))
+            self._main(_UrlopenCapture([_page([_mem_row("first things first", branch="feat/inject")]), _page([])]))
         self.assertIn("first things first", seen["stdout"])
 
     def test_a_ledger_that_blows_up_does_not_take_the_hook_down(self):
         with mock.patch.object(_hook_state, "record_run", side_effect=RuntimeError("disk on fire")):
-            out, err = self._main(_UrlopenCapture([{"profile": [_profile_row("still here")]}]))
+            out, err = self._main(_UrlopenCapture([_page([_mem_row("still here", branch="feat/inject")]), _page([])]))
         self.assertIn("still here", out)
         self.assertIn("could not record", err)
         self.assertIn("disk on fire", err)
@@ -711,9 +758,9 @@ class TestLedger(_LedgerCase):
 class TestSourceHeader(_LedgerCase):
 
     def test_every_remote_call_carries_name_slash_version(self):
-        cap = _UrlopenCapture([{"profile": []}, {"profile": [_profile_row("x")]}])
+        cap = _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []}])
         self._main(cap)
-        self.assertEqual(len(cap.requests), 2)
+        self.assertEqual(len(cap.requests), 3)
         for _, _, headers in cap.requests:  # urllib title-cases header keys
             self.assertEqual(headers.get("X-nexus-source"), f"sessionstart-hook/{_plugin_version()}")
 
@@ -726,18 +773,37 @@ class TestSourceHeader(_LedgerCase):
 
 class TestIdentityIsShared(_LedgerCase):
 
-    def test_user_id_and_container_id_come_from_the_shared_module(self):
-        """Not `equal to what _identity would say` -- *the same call*. The write
-        side uses it too, and two derivations that merely agree today are how
-        the two sides end up keying one project differently."""
-        cap = _UrlopenCapture([{"profile": [_profile_row("x")]}])
-        with mock.patch.object(_identity, "user_id", return_value="pinned-user") as user_id, \
-                mock.patch.object(_identity, "container_id", return_value="pinned-container"):
+    def test_identity_comes_from_the_shared_module_on_the_calling_thread(self):
+        """P1 (A10): the worker's identity values are pre-read on the CALLING
+        thread -- main() calls the SHARED `_identity` derivations (the same
+        ones the write side uses; two derivations that merely agree today are
+        how the two sides end up keying one project differently) exactly once
+        and hands them down in `run`. The worker itself must not reach any
+        env-reading identity function (TestTheWorkerThreadDoesNotReadIts
+        Environment pins that statically)."""
+        cap = _UrlopenCapture([
+            _page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []},
+        ])
+        with mock.patch.object(_identity, "container_id", return_value="pinned-container") as container_id:
             self._main(cap)
-        user_id.assert_called_once_with(self.cwd)
-        _, body, _ = cap.requests[0]
-        self.assertEqual(body["user_id"], "pinned-user")
-        self.assertEqual(body["metadata_filter"]["container_id"], "pinned-container")
+        container_id.assert_called_once_with()
+        # the user_id half: NEXUS_DEFAULT_USER_ID set -> that value, verbatim
+        self.assertIn("user_id=nexus", cap.requests[0][0])
+
+    def test_the_user_id_falls_back_to_the_shared_slug_derivation(self):
+        """...and unset -> the SAME shared `_identity.project_slug` call the
+        write side keys on, made exactly once on the calling thread."""
+        cap = _UrlopenCapture([
+            _page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []},
+        ])
+        with mock.patch.dict(os.environ):
+            del os.environ["NEXUS_DEFAULT_USER_ID"]
+            with mock.patch.object(_identity, "project_slug", return_value="pinned-slug") as slug:
+                self._main(cap)
+        # project_slug is ALSO the ledger directory key, so "exactly once"
+        # cannot hold; the pin is the shared call AND its value on the wire
+        self.assertIn(mock.call(self.cwd), slug.call_args_list)
+        self.assertIn("user_id=pinned-slug", cap.requests[0][0])
 
 
 class TestStateDirectory(unittest.TestCase):
@@ -792,7 +858,7 @@ class TestSharedModulesUnavailable(_LedgerCase):
         self.assertIsNone(mod._hook_state)
         with mock.patch.object(mod, "_current_branch", return_value="feat/inject"):
             out, err = self._main(
-                _UrlopenCapture([{"profile": [_profile_row("ledgerless")]}]), mod=mod
+                _UrlopenCapture([_page([_mem_row("ledgerless", branch="feat/inject")]), _page([])]), mod=mod
             )
         self.assertIn("ledgerless", out)
         self.assertIn("ledger unavailable", err)
@@ -910,7 +976,7 @@ class TestLedgerStepIsBounded(_LedgerCase):
         began = time.monotonic()
         with mock.patch.object(_hook_state, "record_run", side_effect=stall), \
                 mock.patch.object(_MOD, "_LEDGER_BUDGET_SECONDS", 0.2):
-            out, err = self._main(_UrlopenCapture([{"profile": [_profile_row("kept")]}]))
+            out, err = self._main(_UrlopenCapture([_page([_mem_row("kept", branch="feat/inject")]), _page([])]))
         self.assertLess(time.monotonic() - began, 5, "main() waited for the stalled write")
         self.assertIn("kept", out, "the brief must already be out")
         self.assertIn("still running", err)
@@ -964,27 +1030,45 @@ class TestBackendSaidItFailed(_LedgerCase):
     project with no memories."""
 
     def test_a_reported_profile_failure_is_not_a_clean_skip(self):
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
         failed = {"profile": None, "errors": {"profile": "connection pool exhausted"}}
-        out, err = self._main(_UrlopenCapture([failed, failed]))
+        out, err = self._main(_UrlopenCapture([_page([]), _page([]), _page([]), failed]))
         self.assertEqual(out, "")
         entry = self._entries()[-1]
-        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, "http_error", 2))
+        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]), (False, "http_error", 4))
         self.assertEqual(entry["backend_errors"], ["profile"])
         self.assertIn("profile", err)
 
     def test_what_did_come_back_is_still_injected(self):
         """`recent` and `profile` are merged server-side, so one can fail
         while the other returns rows. Inject them AND report the failure."""
-        partial = {"profile": [_profile_row("half an answer")], "errors": {"recent": "timeout"}}
-        out, _ = self._main(_UrlopenCapture([partial]))
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+        # The 200-with-errors shape now lands on the SEMANTIC segment; what
+        # came back (its own episode page) is injected AND the failure is
+        # reported -- the #613 contract made the two distinguishable at last.
+        partial = {"profile": None, "errors": {"profile": "timeout"}}
+        out, _ = self._main(_UrlopenCapture([
+            _page([_mem_row("half an answer", branch="feat/inject", project="nexus")]), _page([]), partial,
+        ]))
         self.assertIn("half an answer", out)
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (False, "http_error"))
-        self.assertEqual(entry["backend_errors"], ["recent"])
+        self.assertEqual(entry["backend_errors"], ["profile"])
 
     def test_a_failure_in_a_layer_this_hook_does_not_read_is_not_its_problem(self):
-        unrelated = {"profile": [_profile_row("fine")], "errors": {"graph": "neo4j down"}}
-        self._main(_UrlopenCapture([unrelated]))
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+        # errors this segment does not read (graph) is not its problem.
+        unrelated = {"profile": [], "errors": {"graph": "neo4j down"}}
+        out, _ = self._main(_UrlopenCapture([
+            _page([_mem_row("fine", branch="feat/inject", project="nexus")]), _page([]), unrelated,
+        ]))
+        self.assertIn("fine", out)
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (True, "none"))
         self.assertNotIn("backend_errors", entry)
@@ -992,14 +1076,20 @@ class TestBackendSaidItFailed(_LedgerCase):
     def test_a_body_of_the_wrong_shape_is_an_http_error_not_an_empty_result(self):
         for body in ([], "a string", {"profile": "not a list"}, {"profile": [1, 2]}):
             with self.subTest(body=body):
-                self._main(_UrlopenCapture([body, body]))
+                self._main(_UrlopenCapture([body, body, body]))
                 entry = self._entries()[-1]
                 self.assertEqual((entry["ok"], entry["reason"]), (False, "http_error"))
 
     def test_an_honest_empty_profile_is_still_a_skip(self):
         """The other half: `profile: null` with no `errors` is what the backend
         sends when there is nothing, and must stay quiet."""
-        self._main(_UrlopenCapture([{"profile": None}, {"profile": None, "errors": None}]))
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+        self._main(_UrlopenCapture([
+            _page([]), _page([]), _page([]),
+            {"profile": None}, {"profile": None, "errors": None},
+        ]))
         entry = self._entries()[-1]
         self.assertEqual((entry["ok"], entry["reason"]), (True, "nothing_to_do"))
 
@@ -1010,20 +1100,35 @@ class _FakeBackend:
     """A real HTTP server on 127.0.0.1, for the few things only a real socket
     and a real interpreter exit can show."""
 
-    def __init__(self, body, status=200, content_type="application/json"):
+    def __init__(self, bodies, status=200, content_type="application/json"):
+        """Serve ``bodies`` in order (one per request, any method), repeating
+        the last one if the hook asks for more -- the D recipe's episode GET,
+        fact GETs and semantic POST need different answers off one socket."""
         self.seen = []
-        payload = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        payloads = [
+            body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+            for body in bodies
+        ]
+        lock = threading.Lock()
+        queue = list(payloads)
         seen = self.seen
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(handler):
+            def _serve(handler):
                 handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
-                seen.append({k.lower(): v for k, v in handler.headers.items()})
+                with lock:
+                    seen.append({k.lower(): v for k, v in handler.headers.items()})
+                    payload = queue.pop(0) if len(queue) > 1 else queue[0]
                 handler.send_response(status)
                 handler.send_header("Content-Type", content_type)
                 handler.send_header("Content-Length", str(len(payload)))
                 handler.end_headers()
                 handler.wfile.write(payload)
+
+            def do_POST(handler):
+                handler._serve()
+
+            do_GET = do_POST  # the D recipe's episode/fact pages are GETs
 
             def log_message(handler, *args):
                 pass
@@ -1063,7 +1168,7 @@ class TestWhatTheLedgerSays(_LedgerCase):
         """`type is int and >= 0` let both "always 0" and "seconds, not
         milliseconds" through, and the visibility baseline is read off this."""
         with mock.patch.object(_MOD.time, "monotonic", _Clock()):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]))
+            self._main(_UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])]))
         elapsed = self._entries()[-1]["elapsed_ms"]
         self.assertGreaterEqual(elapsed, 250)
         self.assertEqual(elapsed % 250, 0, elapsed)
@@ -1074,7 +1179,7 @@ class TestWhatTheLedgerSays(_LedgerCase):
         elsewhere = os.path.join(self.tmp.name, "some-other-project")
         os.makedirs(elsewhere)
         with mock.patch.object(_identity, "project_slug", side_effect=os.path.basename):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]), stdin_text=json.dumps({"cwd": elsewhere}))
+            self._main(_UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([])]), stdin_text=json.dumps({"cwd": elsewhere}))
         expected = os.path.join(self.state_dir, "some-other-project", "session-inject.json")
         self.assertTrue(os.path.isfile(expected), os.listdir(self.state_dir))
 
@@ -1086,8 +1191,16 @@ class TestWhatTheLedgerSays(_LedgerCase):
         def like_the_real_one(cwd):
             return os.path.basename(cwd.rstrip("/"))
 
+        # cwd 123 falls back to os.getcwd() -- a real git repo here -- so pin
+        # the project scope to a fixed value to keep this about the cwd
+        # tolerance alone (underivable would now silence the whole D, owner
+        # ruling 2026-10-25, and the queue would never be consumed).
+        self._patch(mock.patch.object(
+            _identity, "project_key",
+            return_value=("nexus", _identity.PROJECT_SOURCE_ENV),
+        ))
         with mock.patch.object(_identity, "project_slug", side_effect=like_the_real_one):
-            self._main(_UrlopenCapture([{"profile": [_profile_row("x")]}]), stdin_text=json.dumps({"cwd": 123}))
+            self._main(_UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []}]), stdin_text=json.dumps({"cwd": 123}))
         ledgers = glob.glob(os.path.join(self.state_dir, "*", "session-inject.json"))
         self.assertEqual(len(ledgers), 1, "the run left no record")
         with open(ledgers[0], encoding="utf-8") as fh:
@@ -1149,7 +1262,7 @@ class TestTheBriefIsReallyOut(_LedgerCase):
         events = []
         out = _EventfulStdout(events)
         with mock.patch.object(_hook_state, "record_run", side_effect=lambda *a, **k: events.append("record")), \
-                mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([{"profile": [_profile_row("x")]}])), \
+                mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []}])), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
                 mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", io.StringIO()):
             _MOD.main()
@@ -1164,7 +1277,7 @@ class TestTheBriefIsReallyOut(_LedgerCase):
             def write(self, text):
                 raise BrokenPipeError("reader went away")
 
-        with mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([{"profile": [_profile_row("x")]}])), \
+        with mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([_page([_mem_row("x", branch="feat/inject")]), _page([]), {"profile": []}])), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
                 mock.patch.object(sys, "stdout", Broken()), mock.patch.object(sys, "stderr", io.StringIO()):
             _MOD.main()
@@ -1174,8 +1287,8 @@ class TestTheBriefIsReallyOut(_LedgerCase):
     def test_one_unencodable_row_does_not_cost_the_whole_brief(self):
         """A lone surrogate in one row raised UnicodeEncodeError on the write,
         and every other row went with it."""
-        rows = [_profile_row("good row"), _profile_row("bad \ud800 row")]
-        out, _ = self._main(_UrlopenCapture([{"profile": rows}]))
+        rows = [_mem_row("good row", branch="feat/inject"), _mem_row("bad \ud800 row", branch="feat/inject")]
+        out, _ = self._main(_UrlopenCapture([_page(rows), _page([]), {"profile": []}]))
         self.assertIn("good row", out)
         json.loads(out).get("hookSpecificOutput")["additionalContext"].encode("utf-8")
         self.assertEqual(self._entries()[-1]["reason"], "none")
@@ -1190,10 +1303,19 @@ class TestAsARealProcess(unittest.TestCase):
         self.cwd = os.path.join(self.tmp.name, "proj")
         os.makedirs(self.cwd)
         self.state = os.path.join(self.tmp.name, "state")
-        self.backend = _FakeBackend({"profile": [_profile_row("from a real socket")]})
+        # A real process derives the project scope for real: give it the env
+        # path (owner ruling 2026-10-25 -- underivable means NO calls, so
+        # these end-to-end fixtures must scope themselves or go silent).
+        self.project_dir = os.path.join(self.tmp.name, "nexus")
+        os.makedirs(self.project_dir)
+        self.backend = _FakeBackend([
+            _page([_mem_row("from a real socket", branch=None)]), _page([]),
+            {"profile": []},
+        ])
         self.addCleanup(self.backend.close)
         self.env = dict(_NO_PROXY, NEXUS_API_URL=self.backend.url, NEXUS_HOOK_STATE_DIR=self.state,
-                        NEXUS_DEFAULT_USER_ID="nexus")
+                        NEXUS_DEFAULT_USER_ID="nexus",
+                        CLAUDE_PROJECT_DIR=self.project_dir)
 
     def _last_entry(self):
         (ledger,) = glob.glob(os.path.join(self.state, "*", "session-inject.json"))
@@ -1573,9 +1695,13 @@ class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):
         already do. Neither test above covers this: both hit the
         ``"result" not in outcome`` branch instead (garbage stdin / a
         stalled worker), never this ``else`` branch at all."""
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
         capture = _UrlopenCapture([
-            {"profile": [_profile_row("despite the backend error")],
-             "errors": {"profile": "boom upstream"}},
+            _page([_mem_row("despite the backend error", branch="feat/inject", project="nexus")]),
+            _page([]),
+            {"profile": None, "errors": {"profile": "boom upstream"}},
         ])
         with mock.patch.object(urllib.request, "urlopen", capture):
             self._run_with_broken_stderr(json.dumps({"cwd": self.cwd}))
@@ -1589,7 +1715,7 @@ class TestRecordRunsBeforeTheDiagnosticPrint(_LedgerCase):
         same way. Neither test above reaches this block at all: garbage
         stdin and a stalled worker each short-circuit before ``brief`` is
         ever computed, let alone written."""
-        capture = _UrlopenCapture([{"profile": [_profile_row("a settled row")]}])
+        capture = _UrlopenCapture([_page([_mem_row("a settled row", branch="feat/inject")]), _page([])])
         with mock.patch.object(urllib.request, "urlopen", capture), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
                 mock.patch.object(sys, "stdout", _RaisingStdout()), \
@@ -1674,6 +1800,14 @@ class _ReportCase(_LedgerCase):
 
     def setUp(self):
         super().setUp()
+        # The fact marker is seeded too: a fresh state would otherwise make
+        # every test here a "first run" whose baseline note rides systemMessage
+        # (TASK-007). Tests that WANT the first-run shape overwrite this.
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st,
+            _MOD._FACT_MARKER_KEY: "2026-09-20T10:00:00Z",
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
         self._write_ledger("session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")])
         self._write_ledger("handoff-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="handoff-sync")])
         self._write_ledger("memory-sync", [_entry("none", "2026-09-20T10:00:00Z", hook="memory-sync")])
@@ -1685,7 +1819,8 @@ class _ReportCase(_LedgerCase):
             fh.write(entries if isinstance(entries, str) else json.dumps(entries))
 
     def _start(self, urlopen=None):
-        out, err = self._main(urlopen or _UrlopenCapture([{"profile": [_profile_row("the brief")]}]))
+        out, err = self._main(urlopen or _UrlopenCapture(
+            [_page([_mem_row("the brief", branch="feat/inject")]), _page([]), {"profile": []}]))
         return (json.loads(out) if out else None), err
 
     def _system_message(self, urlopen=None):
@@ -1829,7 +1964,7 @@ class TestReportDelivery(_ReportCase):
 
     def test_a_report_with_nothing_to_inject_still_goes_out(self):
         self._write_ledger("session-capture", [_entry("http_error", "2026-09-21T09:00:00Z")])
-        parsed, _ = self._start(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        parsed, _ = self._start(_UrlopenCapture([_page([]), _page([]), _page([]), {"profile": []}]))
         self.assertIn("session-capture", parsed["systemMessage"])
         ctx = parsed["hookSpecificOutput"]["additionalContext"]
         self.assertTrue(ctx.startswith("[nexus-memory]"))
@@ -1854,7 +1989,7 @@ class TestReportDelivery(_ReportCase):
 
     def test_nothing_to_report_and_nothing_to_inject_is_still_silent(self):
         self._write_ledger("session-capture", [_entry("none", "2026-09-21T20:00:00Z")])
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         self.assertEqual(out, "")
 
     def test_the_reported_marker_lives_in_state_next_to_the_container_id(self):
@@ -1911,7 +2046,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
 
     def test_a_newly_expected_hook_is_not_reported_on_the_first_start_after_it_appears(self):
         self._established_project()
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out) if out else None
         self.assertIsNone(parsed, "handoff-sync must not be reported on its grace-period start")
         state, reasons = _hook_state.read_state("session-inject", self.cwd)
@@ -1920,9 +2055,9 @@ class TestUpgradeGracePeriod(_LedgerCase):
 
     def test_the_hook_is_reported_missing_on_the_following_start(self):
         self._established_project()
-        self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # the grace-period start
+        self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))  # the grace-period start
 
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # the NEXT one
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))  # the NEXT one
         parsed = json.loads(out)
         self.assertIn("handoff-sync", parsed["systemMessage"])
         self.assertIn("never", parsed["systemMessage"])
@@ -1931,7 +2066,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
         """A6-2's rule, kept: session-inject's OWN ledger has no entries at
         all -- the very first SessionStart, before either hook has had a
         chance to run -- stays quiet regardless of `seen_expected_ledgers`."""
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out) if out else None
         self.assertIsNone(parsed)
 
@@ -1946,7 +2081,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
             "session-inject", [_entry("none", "2026-09-20T10:00:00Z", hook="session-inject")]
         )
         # session-capture ledger absent; no seen_expected_ledgers state key.
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out)
         self.assertIn("session-capture", parsed["systemMessage"])
         self.assertIn("never", parsed["systemMessage"])
@@ -1974,7 +2109,7 @@ class TestUpgradeGracePeriod(_LedgerCase):
             self.cwd,
             lambda s: {**s, _MOD._SEEN_EXPECTED_LEDGERS_KEY: ["session-capture", ["nested", "list"]]},
         )
-        out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))
+        out, _ = self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))
         parsed = json.loads(out)
         self.assertIn("session-capture", parsed["systemMessage"])  # the report still works
         state, reasons = _hook_state.read_state("session-inject", self.cwd)
@@ -2019,12 +2154,62 @@ class TestR3T02PersistentStateReadFailureSelfHeals(_LedgerCase):
 
         with mock.patch.object(_hook_state, "open", create=True, side_effect=flaky_open), \
                 mock.patch.object(_hook_state.os, "replace", side_effect=spying_replace):
-            self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # round 1: read fails, self-heals
+            self._main(_UrlopenCapture([_page([]), _page([]), _page([])]))  # round 1: read fails, self-heals
             out, _ = self._main(_UrlopenCapture([{"profile": []}, {"profile": []}]))  # round 2: healed
         parsed = json.loads(out) if out else None
         self.assertIsNotNone(parsed, "memory-sync's missing ledger must be reported once state has healed")
         self.assertIn("memory-sync", parsed["systemMessage"])
         self.assertIn("never", parsed["systemMessage"])
+
+
+class TestTheWorkerThreadDoesNotReadItsEnvironment(unittest.TestCase):
+    """P1 (A10, proposal.md Amendment A10 「给 TASK-007」): the work runs on a
+    thread that can only be ABANDONED, never safely stopped. Every
+    environment input it needs -- stdin, NEXUS_API_URL / TOKEN, the project
+    dir env, the identity values -- is read ONCE on the calling thread
+    (main) and handed down as data in `run`; the worker and every function
+    it reaches must not read os.environ / sys.stdin itself. R10-1 / R10-2
+    established that neither a runtime lens alone nor a static lens alone
+    catches violations: the runtime nail is the whole suite driving main()
+    with values that only exist in `run`; THIS is the static nail, at the
+    source level."""
+
+    # These run on the calling thread (or at import time): main pre-reads
+    # everything there on purpose. _record also runs on the calling thread
+    # -- but its NESTED writer runs on the abandonable ledger thread, so
+    # nested defs are always checked, never allowlisted through their
+    # enclosing function.
+    _ALLOWED_TOP_LEVEL = {"main", "_silence_stdout", "_silence_stderr", "_import_warn"}
+
+    def test_no_worker_reachable_function_reads_environment_or_stdin(self):
+        import ast
+
+        with open(_HOOK_SCRIPT, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+
+        offenders = []
+
+        def check(fn, allowlisted):
+            if not allowlisted:
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Attribute) and node.attr in ("environ", "stdin"):
+                        offenders.append(f"{fn.name}: `.{node.attr}` read")
+                    if isinstance(node, ast.Name) and node.id == "getenv":
+                        offenders.append(f"{fn.name}: getenv()")
+            for node in fn.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    check(node, allowlisted=False)  # nested defs: never exempt
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                check(node, allowlisted=node.name in self._ALLOWED_TOP_LEVEL)
+
+        # main() is allowlisted (it IS the calling thread, and its reads are
+        # the whole point of P1); everything else landing here is a violation.
+        self.assertEqual(
+            offenders, [],
+            "worker-reachable env/stdin reads (move them to main(), hand the "
+            "values down in `run`): " + "; ".join(offenders))
 
 
 class TestExpectedLedgersMatchTheManifest(unittest.TestCase):
@@ -2051,6 +2236,650 @@ class TestExpectedLedgersMatchTheManifest(unittest.TestCase):
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             self.assertIn(mod.HOOK, _MOD._EXPECTED_LEDGERS, f"{script} leaves ledger {mod.HOOK!r}")
+
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Class Recipe — workflow D (change 2 TASK-007): episodes + fact delta +
+# semantic segment, verification, grouping, marker rules, budget.
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestRecipe(_LedgerCase):
+    """The D recipe's acceptance fixtures (detailed-tasks TASK-007)."""
+
+    def setUp(self):
+        super().setUp()
+        # Deterministic project scope: CLAUDE_PROJECT_DIR-derived in prod,
+        # patched here (tmp cwds are not git repos -- the real fallback would
+        # answer None and disable project scoping entirely).
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV)
+        ))
+
+    def _capture(self, responses, stdin_text=None):
+        cap = _UrlopenCapture(responses)
+        out, err = self._main(cap, stdin_text=stdin_text)
+        return cap, out, err
+
+    # ── episode: verification ──────────────────────────────────────────────
+
+    def test_episode_rows_are_verified_row_by_row(self):
+        """A row the page should not have returned (observation layer, wrong
+        branch, other project) is dropped and counted as filter_suspect."""
+        rows = [
+            _mem_row("right", project="nexus"),
+            _mem_row("wrong layer", layer="observation", row_id="m2", project="nexus"),
+            _mem_row("wrong branch", branch="other", row_id="m3", project="nexus"),
+            _mem_row("wrong project", project="kairos", row_id="m4"),
+        ]
+        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        self.assertIn("right", out)
+        self.assertNotIn("wrong layer", out)
+        self.assertNotIn("wrong branch", out)
+        self.assertNotIn("wrong project", out)
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "filter_suspect")
+        self.assertEqual(entries[-1].get("filter_suspect"), 3)
+
+    def test_the_episode_page_scopes_layer_branch_and_project(self):
+        rows = [_mem_row("hello", project="nexus")]
+        cap, _, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        first = cap.requests[0][0]
+        self.assertIn("/memories?", first)
+        self.assertIn("layer=session_summary", first)
+        self.assertIn("branch=feat%2Finject", first)
+        self.assertIn("project=nexus", first)
+        self.assertIn("limit=100", first)
+
+    # ── episode: grouping + peer look-ups ──────────────────────────────────
+
+    def test_own_rows_fill_to_five(self):
+        rows = [_mem_row(f"own-{i}", row_id=f"m{i}", project="nexus") for i in range(7)]
+        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        for i in range(5):
+            self.assertIn(f"own-{i}", out)
+        self.assertNotIn("own-5", out)
+
+    def test_peers_first_and_own_keeps_a_slot(self):
+        rows = (
+            [_mem_row(f"peer-a-{i}", row_id=f"a{i}", container_id="peer-a", project="nexus") for i in range(3)]
+            + [_mem_row(f"own-{i}", row_id=f"o{i}", project="nexus") for i in range(3)]
+        )
+        cap, out, _ = self._capture(_happy_queue(rows, semantic={"profile": []}))
+        self.assertIn("peer-a-0", out)
+        self.assertIn("peer-a-1", out)
+        self.assertNotIn("peer-a-2", out)  # 2 per peer group
+        self.assertIn("own-0", out)        # own keeps at least one slot
+
+    def test_a_remembered_peer_is_looked_up_when_the_page_has_no_peer_rows(self):
+        """The pinned known-limit case: 100 own rows must not keep the peer's
+        latest episode out of the brief -- grouping can only REORDER rows the
+        page returned, so the peer gets a look-up of its own."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "seen_containers": ["peer-a"],
+        })
+        own = [_mem_row(f"own-{i}", row_id=f"m{i}", project="nexus") for i in range(10)]
+        peer = [_mem_row("peer-latest", row_id="p1", container_id="peer-a", project="nexus")]
+        cap = _UrlopenCapture([
+            _page(own),                      # episode page: own rows only
+            _page(peer),                     # peer look-up
+            _page([]),                       # fact page 1 (empty)
+            {"profile": []},                 # semantic
+        ])
+        out, _ = self._main(cap)
+        self.assertIn("peer-latest", out)
+        peer_url = cap.requests[1][0]
+        self.assertIn("container_id=peer-a", peer_url)
+        self.assertIn("limit=2", peer_url)
+
+    def test_peer_absent_when_remembered_peers_have_nothing_either(self):
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "seen_containers": ["peer-a"],
+        })
+        own = [_mem_row("own-0", project="nexus")]
+        cap = _UrlopenCapture([
+            _page(own), _page([]), _page([]), {"profile": []},
+        ])
+        out, _ = self._main(cap)
+        self.assertIn("own-0", out)
+        entries = self._entries()
+        self.assertEqual(entries[-1].get("peer_absent"), 1)
+
+    def test_empty_branch_page_retries_once_without_branch(self):
+        cap = _UrlopenCapture([
+            _page([]),                                   # branch-scoped: empty
+            _page([_mem_row("proj-level", branch=None, project="nexus")]),
+            _page([]), _page([]),                        # fact pages
+            {"profile": []},
+        ])
+        out, _ = self._main(cap)
+        self.assertIn("proj-level", out)
+        urls = [u for u, _, _ in cap.requests]
+        branchless = [u for u in urls if "branch=" not in u and "/memories" in u]
+        self.assertTrue(branchless, f"expected a branchless retry, got {urls}")
+        # the retry drops the BRANCH, never the PROJECT: the project-level
+        # fallback must not turn into a cross-project query
+        self.assertTrue(all("project=nexus" in u for u in branchless), branchless)
+
+    # ── semantic segment ───────────────────────────────────────────────────
+
+    def test_semantic_request_is_project_scoped_and_bare(self):
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        body = cap.requests[-1][1]
+        self.assertEqual(body.get("layers"), ["semantic"])
+        self.assertFalse(body.get("include_graph"))
+        self.assertFalse(body.get("include_history"))
+        self.assertEqual(body.get("metadata_filter"), {"project": "nexus"})
+        self.assertTrue(body.get("query"))
+
+    def test_semantic_rows_are_project_verified_and_ai_profile_is_ignored(self):
+        sem = {"profile": [_profile_row("other project row")], "ai_profile": {"k": "v"}}
+        # the semantic row carries no project metadata -> dropped as suspect
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")], semantic=sem))
+        self.assertNotIn("other project row", out)
+        self.assertNotIn("ai_profile", out)
+        self.assertNotIn("\"k\": \"v\"", out)
+
+    def test_errors_profile_means_failure_but_the_rest_still_renders(self):
+        sem = {"profile": None, "errors": {"profile": "boom"}}
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")], semantic=sem))
+        self.assertIn("ep", out)  # the episode segment still renders
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "http_error")
+        self.assertEqual(entries[-1].get("backend_errors"), ["profile"])
+
+    def test_no_project_means_no_scoped_query_at_all(self):
+        """Underivable project -> NO remote call, period (owner ruling
+        2026-10-25, task007-closeout-rulings.md §2 [1]): episode/fact pages
+        sent without `project` only LOOK scoped -- they would render every
+        project's rows with the row-by-row project check off too. The round
+        is a recorded skip (nothing_to_do), never a cross-project brief.
+        The empty queue makes ANY call fail the capture."""
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=(None, _identity.PROJECT_SOURCE_GIT)
+        ))
+        cap = _UrlopenCapture([])
+        out, _ = self._main(cap)
+        self.assertEqual(out, "")
+        self.assertEqual(cap.requests, [])
+        entry = self._entries()[-1]
+        self.assertEqual((entry["ok"], entry["reason"], entry["calls"]),
+                         (True, "nothing_to_do", 0))
+        self.assertIsNone(entry.get("project"))
+
+    def test_the_worst_corner_makes_twelve_calls_and_not_more(self):
+        """Owner ruling 2026-10-25 (task007-closeout-rulings.md §1 [2]):
+        the call ceiling is 12 -- branch page + 2 remembered-peer look-ups
+        + the branchless retry + 2 MORE look-ups after it + 5 fact pages +
+        the semantic call. This corner is what the old recorded arithmetic
+        ("worst 10") undercounted; the pin keeps any future path from
+        quietly exceeding the ceiling."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._SEEN_CONTAINERS_KEY: ["peer-a", "peer-b"],
+        })
+        own = _mem_row("own-only", project="nexus", branch=None)
+        fact_page = lambda: _page([_fact_row("f", row_id="f1", project="nexus",
+                                             created_at="2026-10-23T08:00:00Z")])
+        cap = _UrlopenCapture([
+            _page([]),                    # branch-scoped episode page: empty
+            _page([]), _page([]),         # tier-1 peer look-ups (peer-a, peer-b)
+            _page([own]),                 # branchless retry: own rows only
+            _page([]), _page([]),         # tier-2 peer look-ups, again
+            fact_page(), fact_page(), fact_page(), fact_page(), fact_page(),
+            {"profile": []},              # semantic
+        ])
+        out, _ = self._main(
+            cap, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("own-only", out)
+        entry = self._entries()[-1]
+        self.assertEqual(entry["calls"], 12)
+        self.assertEqual(entry["reason"], "none")
+        self.assertEqual(entry["fact_delta_truncated"], 1)
+
+    # ── fact delta ─────────────────────────────────────────────────────────
+
+    def test_fact_pages_carry_the_cursor_and_stop_at_an_empty_page(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        f1 = _fact_row("fact-1", row_id="f1", project="nexus",
+                       created_at="2026-10-23T08:00:00Z")
+        f2 = _fact_row("fact-2", row_id="f2", project="nexus",
+                       created_at="2026-10-22T08:00:00Z")
+        cap = _UrlopenCapture([
+            _page([_mem_row("ep", project="nexus")]),  # episode
+            _page([f1]),                               # fact page 1
+            _page([f2]),                               # fact page 2
+            _page([]),                                 # fact page 3: empty -> stop
+            {"profile": []},                           # semantic
+        ])
+        out, _ = self._main(cap, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("fact-1", out)
+        self.assertIn("fact-2", out)
+        fact_urls = [u for u, _, _ in cap.requests if "layer=fact" in u]
+        self.assertEqual(len(fact_urls), 3)
+        self.assertNotIn("offset=", fact_urls[0])
+        self.assertIn("updated_after=", fact_urls[0])
+        self.assertIn(f"before_created_at={urllib.parse.quote(f1['created_at'])}", fact_urls[1])
+        self.assertIn("before_id=f1", fact_urls[1])
+        # clean startup round -> the marker advanced past the pre-round moment
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertIn(_MOD._FACT_MARKER_KEY, state)
+
+    def test_a_page_of_own_rows_does_not_end_the_delta_scan(self):
+        """R1-C1 (post_implementation R1): the delta loop ends on a RAW-empty
+        page, never on one whose rows were all dropped (own container /
+        verification failures). A first run after install is exactly an
+        own-backfill-filled window -- breaking there would permanently lose
+        the peer rows on later pages, and the marker would then advance past
+        rows that were never read. The cursor likewise rides the RAW page's
+        last row."""
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        own = [_fact_row(f"own-{i}", row_id=f"o{i}", container_id="dev-claude-308",
+                         project="nexus", created_at="2026-10-24T09:00:00Z")
+               for i in range(2)]
+        peer = _fact_row("peer-fact", row_id="p1", project="nexus",
+                         created_at="2026-10-23T08:00:00Z")
+        cap = _UrlopenCapture([
+            _page([_mem_row("ep", project="nexus")]),
+            _page(own),      # fact page 1: ALL OWN -> filtered empty, scan continues
+            _page([peer]),   # fact page 2: the peer row behind the own wall
+            _page([]),       # fact page 3: raw-empty -> the end of the delta
+            {"profile": []},
+        ])
+        out, _ = self._main(
+            cap, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("peer-fact", out)
+        self.assertNotIn("own-0", out)  # still never rendered
+        # the page-2 cursor rode the RAW page-1 last row (an OWN row, there
+        # was no kept row at all); the page-3 cursor rode page 2's peer row
+        fact_urls = [u for u, _, _ in cap.requests if "before_created_at" in u]
+        self.assertEqual(len(fact_urls), 2, cap.requests)
+        self.assertIn(urllib.parse.quote("2026-10-24T09:00:00Z"), fact_urls[0])
+        self.assertIn("before_id=o1", fact_urls[0])
+        self.assertIn(urllib.parse.quote("2026-10-23T08:00:00Z"), fact_urls[1])
+        self.assertIn("before_id=p1", fact_urls[1])
+
+    def test_a_failed_fact_page_keeps_the_episodes_and_the_marker(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+
+        def exploding_second_page(req, timeout=None):
+            url = req.full_url
+            if "layer=fact" in url and "before_created_at" in url:
+                raise urllib.error.URLError("page 2 down")
+            if "/memories" in url:
+                if "layer=fact" in url:
+                    return _FakeResponse(_page([_fact_row("fact-1", row_id="f1", project="nexus")]))
+                return _FakeResponse(_page([_mem_row("ep", project="nexus")]))
+            return _FakeResponse({"profile": []})
+
+        out, _ = self._main(exploding_second_page,
+                            stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("ep", out)      # segment 1 survived segment 2's failure
+        self.assertNotIn("fact-1", out)  # the delta never completed
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "http_error")
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_KEY), marker)  # not advanced
+
+    def test_an_episode_segment_failure_still_renders_the_facts(self):
+        """The other leg of segment independence (proposal D): the episode
+        page blowing up costs the brief its episodes, NOT its fact delta --
+        each segment has its own try, and the failure lands as this round's
+        reason without taking the delta's rows down with it."""
+        def episode_down(req, timeout=None):
+            if "layer=session_summary" in req.full_url:
+                raise urllib.error.URLError("episode backend down")
+            if "layer=fact" in req.full_url:
+                return _FakeResponse(_page([_fact_row(
+                    "fact-survivor", row_id="f1", project="nexus",
+                    created_at="2026-10-23T08:00:00Z")]))
+            return _FakeResponse({"profile": []})
+
+        out, _ = self._main(
+            episode_down, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        self.assertIn("fact-survivor", out)
+        entries = self._entries()
+        self.assertEqual(entries[-1]["reason"], "http_error")
+
+    def test_compact_never_advances_the_marker(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        cap, out, _ = self._capture(
+            _happy_queue([_mem_row("ep", project="nexus")],
+                         facts=[_fact_row("fact-1", row_id="f1", project="nexus")]),
+            stdin_text=json.dumps({"cwd": self.cwd, "source": "compact"}),
+        )
+        self.assertIn("fact-1", out)
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_KEY), marker)
+
+    def test_fact_delta_dedupes_and_drops_own_container_rows(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        dup = _fact_row("fact-dup", row_id="f1", project="nexus",
+                        created_at="2026-10-23T08:00:00Z")
+        later = _fact_row("fact-2", row_id="f2", project="nexus",
+                          created_at="2026-10-22T08:00:00Z")
+        own = _fact_row("own fact", row_id="f3", container_id="dev-claude-308",
+                        project="nexus", created_at="2026-10-23T09:00:00Z")
+        cap = _UrlopenCapture([
+            _page([_mem_row("ep", project="nexus")]),
+            _page([dup, own]),
+            _page([dup, later]),   # dial-back overlap: f1 seen again
+            _page([]),
+            {"profile": []},
+        ])
+        out, _ = self._main(cap)
+        self.assertEqual(out.count("fact-dup"), 1)
+        self.assertIn("fact-2", out)
+        self.assertNotIn("own fact", out)
+
+    def test_truncated_delta_flags_and_keeps_the_marker(self):
+        marker = "2026-10-24T07:00:00Z"
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: marker,
+            _MOD._FACT_MARKER_USER_KEY: "nexus",
+        })
+        full = [_fact_row(f"fact-{i}", row_id=f"f{i}", project="nexus",
+                          created_at=f"2026-10-2{i}T08:00:00Z") for i in range(3)]
+        cap = _UrlopenCapture(
+            [_page([_mem_row("ep", project="nexus")])]
+            + [_page(full)] * _MOD._FACT_MAX_PAGES   # never an empty page
+            + [{"profile": []}]
+        )
+        out, _ = self._main(cap, stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        entries = self._entries()
+        self.assertEqual(entries[-1].get("fact_delta_truncated"), 1)
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_KEY), marker)
+
+    # ── first run / baseline / A9-10 / budget ──────────────────────────────
+
+    def test_first_run_reports_the_baseline(self):
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        self.assertIn("baseline", out)
+        # the note names the 7-day window and rides the user-visible channel
+        self.assertIn("7 days", out)
+        self.assertIn("baseline", json.loads(out)["systemMessage"])
+
+    # ── identity (A9-11) and the marker's user_id binding ─────────────────
+
+    def test_a_container_id_change_is_reported_once_with_the_remedy(self):
+        """A9-11: the change is a NOTE on systemMessage and the brief prelude
+        -- never this hook's own ledger reason -- and it names the old value,
+        the new value, and the remedy (the env override)."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "container_id": "dev-a",
+        })
+        cap, out, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        message = json.loads(out)["systemMessage"]
+        self.assertIn("container_id changed from dev-a to dev-claude-308", message)
+        self.assertIn("NEXUS_CONTAINER_ID=dev-a", message)
+        entry = self._entries()[-1]
+        self.assertEqual(entry["reason"], "none")  # a note, not a reason
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-claude-308")
+        # and exactly once: the next start does not repeat THE CHANGE (the
+        # baseline note may legitimately repeat until a startup round
+        # advances the marker, and a tmp state dir has no SessionEnd hooks)
+        cap2, out2, _ = self._capture(_happy_queue([_mem_row("ep", project="nexus")]))
+        self.assertNotIn(
+            "container_id changed", json.loads(out2).get("systemMessage", ""))
+
+    def test_the_new_container_id_persists_only_after_a_successful_stdout_write(self):
+        """A9-11: reporting a change the session never saw would eat it
+        forever -- a start whose stdout write fails leaves the OLD
+        container_id in state, so the next start reports it again."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "container_id": "dev-a",
+        })
+
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("reader went away")
+
+        cap = _UrlopenCapture(_happy_queue([_mem_row("ep", project="nexus")]))
+        with mock.patch.object(urllib.request, "urlopen", cap), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", Broken()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            _MOD.main()
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get("container_id"), "dev-a")
+
+    def test_a_user_id_change_rebounds_the_marker_and_says_so(self):
+        """The fact marker is bound to user_id (owner 2026-10-17): a
+        different user_id restarts the delta from the 7-day baseline, with a
+        note naming both values -- the marker must never silently skip the
+        new pool's earlier rows."""
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, _MOD._FACT_MARKER_KEY: "2026-10-20T07:00:00Z",
+            _MOD._FACT_MARKER_USER_KEY: "someone-else",
+        })
+        cap, out, _ = self._capture(
+            _happy_queue([_mem_row("ep", project="nexus")]),
+            stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        message = json.loads(out)["systemMessage"]
+        self.assertIn("rebound", message)
+        self.assertIn("someone-else", message)
+        self.assertIn("'nexus'", message)
+        # the delta re-read from the baseline, not from the stale marker
+        fact_urls = [u for u, _, _ in cap.requests if "layer=fact" in u]
+        self.assertTrue(fact_urls, cap.requests)
+        self.assertNotIn(urllib.parse.quote("2026-10-20T07:00:00"), fact_urls[0])
+        # and the marker's binding moved to the current user
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state.get(_MOD._FACT_MARKER_USER_KEY), "nexus")
+        self.assertIn(_MOD._FACT_MARKER_KEY, state)
+
+    def test_handoff_rows_render_newest_per_container_in_full(self):
+        """A9-10, the spec's own-3 + peer-2 shape: per container only the
+        newest handoff (by aria.updated_at) renders in full; the other three
+        are one title line each. Content is what handoff_sync actually stores
+        (_build_content's H1 + §6 + §2 distill), and the brief stays within
+        budget with the fact delta still rendered."""
+        rows = [  # page order as the endpoint returns it (created_at DESC)
+            _handoff_row("h1", "dev-claude-308", "2026-10-24T07:00:00Z",
+                         title="own newest", created_at="2026-10-24T08:00:00Z"),
+            _handoff_row("h4", "peer-a", "2026-10-24T06:00:00Z",
+                         title="peer newest", created_at="2026-10-24T06:30:00Z"),
+            _handoff_row("h2", "dev-claude-308", "2026-10-23T07:00:00Z",
+                         title="own older", created_at="2026-10-23T08:00:00Z"),
+            _handoff_row("h5", "peer-a", "2026-10-23T06:00:00Z",
+                         title="peer older", created_at="2026-10-23T06:30:00Z"),
+            _handoff_row("h3", "dev-claude-308", "2026-10-22T07:00:00Z",
+                         title="own oldest", created_at="2026-10-22T08:00:00Z"),
+        ]
+        facts = [_fact_row("fact-still-rendered", row_id="f1", project="nexus",
+                           created_at="2026-10-23T08:00:00Z")]
+        cap, out, _ = self._capture(_happy_queue(rows, facts=facts))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        # the newest of EACH container renders its §6 body...
+        self.assertIn("do own newest", brief)
+        self.assertIn("do peer newest", brief)
+        # ...the other three rows are one title line each: headline present,
+        # §6 body absent
+        for older in ("own older", "own oldest", "peer older"):
+            self.assertIn(older, brief)
+            self.assertNotIn(f"do {older}", brief)
+        # budget: within 4000 chars with the fact delta still rendered
+        self.assertLessEqual(len(brief), 4000)
+        self.assertIn("Facts since last session:", brief)
+        self.assertIn("fact-still-rendered", brief)
+
+    def test_two_containers_one_handoff_each_render_both_in_full(self):
+        """A9-10's other fixture shape: one handoff per container means no
+        group has an older row to demote -- both render in full, within
+        budget, facts still rendered."""
+        rows = [
+            _handoff_row("h1", "dev-claude-308", "2026-10-24T07:00:00Z",
+                         title="own only", created_at="2026-10-24T08:00:00Z"),
+            _handoff_row("h2", "peer-a", "2026-10-24T06:00:00Z",
+                         title="peer only", created_at="2026-10-24T06:30:00Z"),
+        ]
+        facts = [_fact_row("fact-still-rendered", row_id="f1", project="nexus",
+                           created_at="2026-10-23T08:00:00Z")]
+        cap, out, _ = self._capture(_happy_queue(rows, facts=facts))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("do own only", brief)
+        self.assertIn("do peer only", brief)
+        self.assertLessEqual(len(brief), 4000)
+        self.assertIn("fact-still-rendered", brief)
+
+    def test_a_handoff_without_a_six_section_falls_back_to_the_whole_document(self):
+        """A9-10: a handoff with no §6 renders its WHOLE entry, line-boundary
+        capped at ~1500 chars -- never just the H1. The §2 carry list is
+        exactly what such a handoff must not lose."""
+        body = ("# no six section\n\n## §2 未完成\n\n"
+                + "\n".join(f"carry item {i:02d} - a line of carried work"
+                            for i in range(80)) + "\n")
+        content, reason = _HANDOFF._build_content(body)
+        self.assertIsNone(reason)
+        row = _mem_row(content, row_id="h1", container_id="peer-a", project="nexus",
+                       created_at="2026-10-24T08:00:00Z",
+                       **{"aria.source": "handoff", "aria.updated_at": "2026-10-24T07:00:00Z"})
+        cap, out, _ = self._capture(_happy_queue([row]))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("carry item 00", brief)     # §2 content renders, not just the H1
+        self.assertNotIn("carry item 79", brief)  # the whole-doc cap bites at ~1500
+        self.assertLessEqual(len(brief), 4000)
+
+    def test_the_brief_stays_within_the_budget_and_facts_go_first(self):
+        long_desc = "描" * 600
+        facts = [_fact_row(long_desc, row_id=f"f{i}", project="nexus",
+                           created_at=f"2026-10-2{i}T08:00:00Z") for i in range(8)]
+        episodes = [_mem_row("episode-keep", project="nexus")]
+        cap, out, _ = self._capture(_happy_queue(episodes, facts=facts, semantic={"profile": []}))
+        payload = json.loads(out)
+        brief = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(brief), 4000)
+        self.assertIn("episode-keep", brief)
+        self.assertIn("Facts since last session:", brief)  # facts still present
+
+
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# A9-20 + A10 D4 — one-time reasons survive burial; state-write failures land
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestOneTimeReasonsSurviveBurial(_ReportCase):
+
+    def test_a_same_round_burial_is_read_out_of_also_failed(self):
+        """worst_reason crowded dedup_merged out of the row's own scalar (an
+        http_error from a later file won the priority table); the report
+        still names it, reading the row's also_failed."""
+        self._write_ledger("handoff-sync", [
+            {**_entry("http_error", "2026-09-21T09:00:00Z", hook="handoff-sync"),
+             "also_failed": ["dedup_merged"]},
+        ])
+        parsed, _ = self._start()
+        self.assertIn("dedup_merged", parsed["systemMessage"])
+
+    def test_a_previous_round_burial_is_reported_on_the_next_start(self):
+        """Two SessionEnds before one SessionStart: the dedup round's row was
+        buried under a later unchanged row before any start could see it as
+        the last row. The scanner reads it out from below."""
+        self._write_ledger("memory-sync", [
+            _entry("dedup_merged", "2026-09-21T09:00:00Z", hook="memory-sync"),
+            _entry("unchanged", "2026-09-21T10:00:00Z", hook="memory-sync"),
+        ])
+        parsed, _ = self._start()
+        self.assertIn("dedup_merged", parsed["systemMessage"])
+        # And exactly once: the next start is quiet about it.
+        parsed2, _ = self._start()
+        self.assertNotIn("dedup_merged", (parsed2 or {}).get("systemMessage", ""))
+
+    def test_a_report_the_stdout_never_carried_is_delivered_again(self):
+        """The reported mark persists only after a successful stdout write
+        (A9-11): a start whose stdout failed re-delivers the finding."""
+        self._write_ledger("session-capture", [
+            _entry("http_error", "2026-09-21T09:00:00Z", hook="session-capture"),
+        ])
+        # First start: the brief write itself fails, so the mark never
+        # lands. main() is called directly (not via _main, whose own stdout
+        # StringIO would shadow the broken one).
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("reader went away")
+
+        with mock.patch.object(urllib.request, "urlopen", _UrlopenCapture([
+                    _page([_mem_row("row", branch="feat/inject")]), _page([]),
+                ])), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", Broken()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            _MOD.main()
+        message = self._system_message()
+        self.assertIsNotNone(message, "the finding is re-delivered after the lost stdout")
+
+
+class TestStateWriteFailureLands(_LedgerCase):
+    """A10 D4, both legs: a state persist that fails AFTER this round's
+    ledger row was written appends a second, independent state_write_failed
+    row -- never folded back into the row it postdates; and a state file
+    that keeps failing to READ (not ENOENT) lands `unknown` in THIS round's
+    row instead of passing silently."""
+
+    def test_a_failing_state_persist_appends_the_failure_row(self):
+        self._patch(mock.patch.object(
+            _identity, "project_key",
+            return_value=("nexus", _identity.PROJECT_SOURCE_ENV),
+        ))
+        self._patch(mock.patch.object(
+            _hook_state, "update_state", side_effect=OSError("disk full"),
+        ))
+        queue = lambda: _UrlopenCapture([
+            _page([_mem_row("row", branch="feat/inject", project="nexus")]),
+            _page([]), {"profile": []},
+        ])
+        self._main(queue())
+        entries = self._entries()
+        self.assertEqual([e["reason"] for e in entries[-2:]],
+                         ["none", "state_write_failed"])
+        # And the next SessionStart reports it (failure-class, A4-1).
+        out, _ = self._main(queue())
+        self.assertIn("state_write_failed", out)
+
+    def test_a_persistently_unreadable_state_lands_unknown_in_this_rounds_row(self):
+        """A10 D4, read side: the marker could not be read either, so the
+        delta runs from the baseline -- but the point here is that the read
+        failure is NOT silent: this round's row carries `unknown` (ok=False),
+        while the brief itself still renders (fail-open)."""
+        self._patch(mock.patch.object(
+            _identity, "project_key",
+            return_value=("nexus", _identity.PROJECT_SOURCE_ENV),
+        ))
+        self._patch(mock.patch.object(
+            _hook_state, "read_state", return_value=({}, ["unknown"]),
+        ))
+        out, _ = self._main(_UrlopenCapture([
+            _page([_mem_row("row", branch="feat/inject", project="nexus")]),
+            _page([]), {"profile": []},
+        ]))
+        self.assertIn("row", out)  # fail-open: the brief still renders
+        entry = self._entries()[-1]
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertFalse(entry["ok"])
+        self.assertTrue(entry["state_read_unknown"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
