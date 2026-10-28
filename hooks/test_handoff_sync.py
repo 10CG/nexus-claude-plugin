@@ -1995,6 +1995,22 @@ class TestOwnerGrouping(_HandoffDirCase):
         self.assertEqual(result, (None, "identity_unresolved"))
         self.assertIn("u1.md", extra["detail"])
 
+    def test_many_uncertain_candidates_report_the_count_in_its_own_extra_key(self):
+        """R2 review: the count of uncertain candidates rides in a SEPARATE
+        extra key rather than an inline detail marker -- detail passes
+        through _short's 200-char cap, and an inline "(+N more)" appended
+        before the cap was measured to arrive half-cut with real-length
+        names ("(+35 "), which is worse than no marker at all. The own
+        key is never truncated, whatever the detail shows."""
+        self._mkdir()
+        for i in range(7):  # > 5: the detail slice is bounded, the key is not
+            self._uncertain(f"2026-09-1{i}-1000-u.md", updated_at=f"2026-09-1{i}T00:00:00Z")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertEqual(extra["uncertain_candidates"], 7)
+        self.assertLessEqual(len(extra["detail"]), 200)  # bounded, never the count's carrier
+
     def test_empty_own_group_with_only_others_is_quiet_not_owner(self):
         self._mkdir()
         self._other("t1.md", updated_at="2026-09-10T00:00:00Z")

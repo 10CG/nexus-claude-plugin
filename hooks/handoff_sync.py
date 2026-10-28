@@ -942,12 +942,16 @@ def _locate(handoff_dir, extra=None, *, identity):
             # R1 review: the [:5] slice is bounded, but the BOUND must be
             # visible -- 40 uncertain candidates reporting 5 silently is
             # exactly the ledger-quietly-lying shape this file keeps closing.
-            shown = ", ".join(f"{name}({raw!r})" for name, _ts, raw in uncertain[:5])
-            hidden = len(uncertain) - 5
-            if hidden > 0:
-                shown = f"{shown} (+{hidden} more)"
+            # R2 review: the count rides in its OWN extra key, never inside
+            # the detail string -- detail passes through _short's 200-char
+            # cap, and an inline marker appended before the cap was measured
+            # to arrive HALF-CUT ("(+35 ") with real-length names, which is
+            # worse than no marker. A separate key is never truncated.
+            if extra is not None:
+                extra["uncertain_candidates"] = len(uncertain)
             parts.append(
-                "no own-container candidate; unresolved owner-container: " + shown
+                "no own-container candidate; unresolved owner-container: "
+                + ", ".join(f"{name}({raw!r})" for name, _ts, raw in uncertain[:5])
             )
             detail = "; ".join(parts)
             if extra is not None:
