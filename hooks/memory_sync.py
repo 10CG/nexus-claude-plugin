@@ -813,7 +813,7 @@ def _current_fingerprint():
     return "sha256:" + digest.hexdigest()
 
 
-def _build_memory_metadata(key, project_name, slug, frontmatter, modified):
+def _build_memory_metadata(key, project_name, slug, frontmatter, modified, project=None):
     """§3.3 + X1's two added keys for this row. A source key that is absent
     from ``frontmatter`` is simply omitted (PATCH is a shallow merge, §4):
     sending nothing for a key leaves the stored value alone."""
@@ -823,6 +823,12 @@ def _build_memory_metadata(key, project_name, slug, frontmatter, modified):
         "aria.memory_dir": key,  # X1
         "aria.project": project_name,  # X1
     }
+    # X1-policy (TASK-007): the provenance `project` key (the backend's
+    # allowlisted filter key), alongside the older aria.project. Without it
+    # the D's fact delta would drop every one of these rows as
+    # filter_suspect in their own project. Only written when derivable.
+    if project:
+        metadata["project"] = project
     if frontmatter.get("type"):
         metadata["aria.memory_type"] = frontmatter["type"]
     if frontmatter.get("description"):
@@ -1382,7 +1388,7 @@ def _advance_cursor_only(state_path, next_cursor):
     return persist_reasons
 
 
-def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_path, *, next_cursor=None):
+def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_path, *, next_cursor=None, project=None):
     """Attempt to sync one memory file as a ``layer=fact`` row. Returns
     ``(reasons, aborts, calls)``. Tallies into ``run["extra"]`` as it goes
     (K08) -- see ``_tally_result``.
@@ -1485,7 +1491,9 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
         return reasons, False, 0
     content, truncated = _cap_for_wire(body, _CONTENT_CAP)  # K06: capped post-redaction
     modified = frontmatter.get("modified") or _mtime_iso(st)
-    metadata = _build_memory_metadata(key, project_name, slug, frontmatter, modified)
+    metadata = _build_memory_metadata(
+        key, project_name, slug, frontmatter, modified, project=project
+    )
     metadata["aria.truncated"] = truncated  # Amendment A8: always explicit
 
     outcome = _upsert_retrying_404(
@@ -2003,8 +2011,26 @@ def _collect(run):
     key, degraded = _identity.memory_dir_key(cwd)
     run["key"] = key
     run["extra"]["memory_dir"] = key
-    toplevel, _ = _identity.project_root(cwd)
-    project_name = os.path.basename(toplevel) if toplevel else os.path.basename(cwd.rstrip("/"))
+    # X1-policy (TASK-007): these are fact-layer rows, and the D's fact delta
+    # queries them with project=<slug> plus row-by-row metadata.project
+    # verification -- so the scope key must be THE shared derivation
+    # (_identity.project_key: CLAUDE_PROJECT_DIR first, linked worktree
+    # resolved to its main worktree), not a private toplevel basename. The
+    # git-source fallback is ledger-reported like in session_capture.
+    # ``aria.project`` keeps a string value even when project_key could not
+    # resolve one (its historical cwd-basename answer); only the provenance
+    # ``project`` key is left absent in that case.
+    project, project_source = _identity.project_key(cwd, run.get("project_env_dir"))
+    if project_source == _identity.PROJECT_SOURCE_GIT:
+        run["extra"]["project_source"] = "git_fallback"
+    if project is None:
+        toplevel, _ = _identity.project_root(cwd)
+        aria_project = (
+            os.path.basename(toplevel) if toplevel
+            else os.path.basename(cwd.rstrip("/"))
+        )
+    else:
+        aria_project = project
 
     local_files, indeterminate, list_reason = _list_memory_files(_memory_dir(run["config_dir"], key))
     run["extra"]["local_files"] = len(local_files)
@@ -2315,7 +2341,7 @@ def _collect(run):
                 aborted = True
                 break
             r, ab, c = _sync_file(
-                client, key, project_name, slug, local_files[slug], fingerprint, run, state_path,
+                client, key, aria_project, slug, local_files[slug], fingerprint, run, state_path, project=project,
             )
             reasons.extend(r)
             run["calls"] += c
@@ -2346,7 +2372,7 @@ def _collect(run):
                     aborted = True
                     break
                 r, ab, c = _sync_file(
-                    client, key, project_name, slug, local_files[slug], fingerprint, run, state_path,
+                    client, key, aria_project, slug, local_files[slug], fingerprint, run, state_path, project=project,
                     next_cursor=i,
                 )
                 reasons.extend(r)
@@ -2484,6 +2510,10 @@ def main():
             # environment input -- see P1's own docstring paragraph for why
             # that stays inside _collect).
             default_user_id=os.environ.get("NEXUS_DEFAULT_USER_ID"),
+            # X1-policy (TASK-007): CLAUDE_PROJECT_DIR, read once HERE --
+            # the worker thread passes it to _identity.project_key as data
+            # (which itself never reads the environment).
+            project_env_dir=os.environ.get("CLAUDE_PROJECT_DIR"),
             container_id=_identity.container_id(),  # NEXUS_CONTAINER_ID or the hostname; no cwd needed
         )
     except Exception as exc:  # noqa: BLE001 - recorded below, exactly like a worker exception

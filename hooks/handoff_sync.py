@@ -1015,7 +1015,7 @@ def _external_id(root, doc_path):
     return rel.replace(os.sep, "/")
 
 
-def _build_metadata(session_id, branch, frontmatter, owner_container_uuid):
+def _build_metadata(session_id, branch, frontmatter, owner_container_uuid, project=None):
     """§3.2 + Amendment A8-1's ``aria.*`` set for this row. ``branch`` and
     each ``aria.*`` key are omitted when the source value is absent (a PATCH
     is a shallow merge; sending nothing for a key leaves the stored value
@@ -1030,6 +1030,14 @@ def _build_metadata(session_id, branch, frontmatter, owner_container_uuid):
     metadata = {"session_id": session_id, "aria.source": "handoff"}
     if branch:
         metadata["branch"] = branch
+    # X1-policy (TASK-007): the project scope key. Without it a handoff
+    # episode fails the read side's row-by-row `metadata.project` check (the
+    # D filters by project) and would be dropped as filter_suspect even in
+    # its own project. Same derivation as session_capture/memory_sync:
+    # _identity.project_key, CLAUDE_PROJECT_DIR first, git-toplevel fallback
+    # reported by the caller.
+    if project:
+        metadata["project"] = project
     if frontmatter.get("track-id"):
         metadata["aria.track_id"] = frontmatter["track-id"]
     if owner_container_uuid:
@@ -1134,7 +1142,15 @@ def _collect(run):
     content = _cap_for_wire(content)  # R2-c08: the cap must hold post-redaction too
 
     # ---- write path: owner + content both passed ----
-    metadata = _build_metadata(session_id, _current_branch(cwd), frontmatter, doc_uuid)
+    # X1-policy (TASK-007): project scope for the episode's metadata. The
+    # git-source fallback is ledger-reported for the same reason as in
+    # session_capture: a silent fallback would look "env-resolved" forever.
+    project, project_source = _identity.project_key(
+        cwd, os.environ.get(_identity.PROJECT_DIR_ENV)
+    )
+    if project_source == _identity.PROJECT_SOURCE_GIT:
+        run["extra"]["project_source"] = "git_fallback"
+    metadata = _build_metadata(session_id, _current_branch(cwd), frontmatter, doc_uuid, project)
 
     state, _state_reasons = _hook_state.read_state(HOOK, cwd)
     drift_reasons = _hook_state.identity_drift(

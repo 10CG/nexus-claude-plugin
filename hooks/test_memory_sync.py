@@ -1281,6 +1281,20 @@ class TestMetadataBuilding(unittest.TestCase):
         self.assertEqual(meta["aria.description"], "d")
         self.assertEqual(meta["aria.origin_session"], "s1")
 
+    def test_provenance_project_is_written_when_derived(self):
+        """X1-policy (TASK-007): these are fact-layer rows; the D's fact
+        delta queries them with project=<slug> and verifies metadata.project
+        row by row -- absent, they all read as filter_suspect."""
+        meta = _MOD._build_memory_metadata("k", "nexus", "slug", {}, "2026-01-01T00:00:00Z", project="nexus")
+        self.assertEqual(meta["project"], "nexus")
+        self.assertEqual(meta["aria.project"], "nexus")
+
+    def test_provenance_project_is_omitted_when_underivable(self):
+        meta = _MOD._build_memory_metadata("k", "nexus", "slug", {}, "2026-01-01T00:00:00Z", project=None)
+        self.assertNotIn("project", meta)
+        # aria.project keeps its historical always-a-string value either way
+        self.assertEqual(meta["aria.project"], "nexus")
+
 
 # ════════════════════════════════════════════════════════════════════════
 # End-to-end against a real loopback backend

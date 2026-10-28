@@ -1798,6 +1798,22 @@ class TestCaptureBudgetFailsOpen(_LedgerCase):
         )
 
 
+    def test_project_scope_key_is_written_when_derived(self):
+        """X1-policy (TASK-007): every activity carries the provenance
+        `project` key so the backend can scope observation rows and the
+        aggregator can take the mode into session_summary."""
+        acts = _MOD._build_activities(
+            [("edit_file", {"tool": "Edit", "summary": "/a.py"})], "c", None, "s1", {}, "nexus"
+        )
+        self.assertEqual(acts[0]["activity_data"]["project"], "nexus")
+
+    def test_project_scope_key_is_omitted_when_underivable(self):
+        acts = _MOD._build_activities(
+            [("edit_file", {"tool": "Edit", "summary": "/a.py"})], "c", None, "s1", {}, None
+        )
+        self.assertNotIn("project", acts[0]["activity_data"])
+
+
 class TestReadActivitiesIsTheSharedReader(unittest.TestCase):
     """read_activities / select_activities / _MAX_ACTIVITIES / _HIGH_VALUE_ACTIONS
     are imported across repos by nexus:scripts/replay_session_capture.py.

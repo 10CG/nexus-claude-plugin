@@ -590,6 +590,93 @@ class TestPluginVersion(unittest.TestCase):
                 self.assertEqual(_identity.plugin_version(), good)
 
 
+class TestProjectKey(unittest.TestCase):
+    """X1-policy (owner 2026-10-14/17): the provenance `project` scope key.
+
+    CLAUDE_PROJECT_DIR wins (session startup dir, does not follow `cd`), a
+    linked worktree resolves to its MAIN worktree, and without the env var
+    the answer comes from the cwd git toplevel with source="git" so callers
+    can ledger-report the fallback.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        # _SLUG_CACHE is keyed by cwd; unique tmp dirs keep tests isolated,
+        # but clear our keys anyway so nothing leaks into later tests.
+        self._cache = _identity._SLUG_CACHE
+        self.addCleanup(self._cache.clear)
+
+    def _repo(self, name):
+        repo = os.path.join(self._tmp.name, name)
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        return repo
+
+    def test_env_dir_wins_over_cwd_repo(self):
+        """The env value is the session startup dir; a cwd that `cd`-ed into
+        a different repo must not change the answer."""
+        main = self._repo("nexus")
+        other = self._repo("somewhere-else")
+        env_dir = os.path.join(main, "sub")
+        os.makedirs(env_dir)
+        self.assertEqual(
+            _identity.project_key(other, env_dir),
+            ("nexus", _identity.PROJECT_SOURCE_ENV),
+        )
+
+    def test_linked_worktree_resolves_to_main_worktree(self):
+        """A session started in a linked worktree reports the MAIN worktree's
+        basename, so both worktrees of one checkout answer the same."""
+        main = self._repo("handoff-project")
+        subprocess.run(
+            ["git", "-C", main, "commit", "-q", "--allow-empty", "-m", "init"],
+            check=True, capture_output=True,
+        )
+        linked = os.path.join(self._tmp.name, "linked")
+        subprocess.run(
+            ["git", "-C", main, "worktree", "add", "-q", linked],
+            check=True, capture_output=True,
+        )
+        self.assertEqual(
+            _identity.project_key(linked, linked),
+            ("handoff-project", _identity.PROJECT_SOURCE_ENV),
+        )
+
+    def test_env_dir_outside_any_repo_uses_its_basename(self):
+        plain = os.path.join(self._tmp.name, "plain-project")
+        os.makedirs(plain)
+        cwd = self._repo("unrelated")
+        self.assertEqual(
+            _identity.project_key(cwd, plain),
+            ("plain-project", _identity.PROJECT_SOURCE_ENV),
+        )
+
+    def test_git_fallback_when_env_missing(self):
+        repo = self._repo("fallback-repo")
+        sub = os.path.join(repo, "deep")
+        os.makedirs(sub)
+        self.assertEqual(
+            _identity.project_key(sub, None),
+            ("fallback-repo", _identity.PROJECT_SOURCE_GIT),
+        )
+
+    def test_no_env_and_no_repo_is_none(self):
+        """Neither resolves: writers omit the key, the D omits the scoped
+        query entirely -- never an unscoped query that only looks scoped."""
+        nowhere = os.path.join(self._tmp.name, "no-repo-here")
+        os.makedirs(nowhere)
+        with mock.patch("subprocess.run", side_effect=OSError("no git")):
+            self.assertEqual(_identity.project_key(nowhere, None), (None, "git"))
+
+    def test_git_unreachable_with_env_set_still_answers_env(self):
+        with mock.patch("subprocess.run", side_effect=OSError("no git")):
+            self.assertEqual(
+                _identity.project_key("/any/cwd", "/sessions/some-project"),
+                ("some-project", _identity.PROJECT_SOURCE_ENV),
+            )
+
+
 class TestSourceHeader(unittest.TestCase):
     def test_shape_is_name_slash_version(self):
         with mock.patch.object(_identity, "plugin_version", return_value="9.9.9"):

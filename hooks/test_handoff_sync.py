@@ -1569,6 +1569,17 @@ class TestMetadata(unittest.TestCase):
         meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa")
         self.assertEqual(meta["branch"], "main")
 
+    def test_project_is_present_when_derived(self):
+        """X1-policy (TASK-007): handoff episodes carry the provenance
+        `project` key, or the D's row-by-row check drops them in their own
+        project."""
+        meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa", "nexus")
+        self.assertEqual(meta["project"], "nexus")
+
+    def test_project_is_omitted_when_underivable(self):
+        meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa", None)
+        self.assertNotIn("project", meta)
+
     def test_each_aria_key_is_omitted_when_its_frontmatter_value_is_absent(self):
         meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa")
         for key in ("aria.track_id", "aria.phase", "aria.status", "aria.updated_at"):
