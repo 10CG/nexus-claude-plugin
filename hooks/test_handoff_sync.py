@@ -1051,6 +1051,31 @@ class TestLocate(_HandoffDirCase):
         os.symlink("sub/x.md", os.path.join(self.handoff_dir, "latest.md"))
         self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("z.md", None))
 
+    def test_a_symlinked_handoff_dir_still_routes_the_link_text_to_the_undecidable_report(self):
+        """R1 review (post_implementation): the dangling-symlink judgement
+        must resolve BOTH sides -- a handoff_dir reached through a symlink
+        component (the lexical dirname would never equal the realpath'd
+        directory) used to send a link text naming a top-level undecidable
+        entry down the QUIET "points at a non-candidate" fallback instead
+        of the R4-c03 report. The A9-19 backstop still reported the entry
+        whole-round, but with a detail that named the entry instead of the
+        POINTER -- this pins the direct route ("pointer target could not
+        be resolved")."""
+        real = self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-target.md"),
+            os.path.join(self.handoff_dir, "gone.md"),
+        )
+        os.symlink("gone.md", os.path.join(self.handoff_dir, "latest.md"))
+        alias = os.path.join(self.tmp.name, "alias-handoff")
+        os.symlink(real, alias)
+        extra = {}
+        result = _MOD._locate(alias, extra, identity=self.identity)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("pointer target could not be resolved", extra["detail"])
+        self.assertIn("gone.md", extra["detail"])
+
     def test_a_dangling_latest_md_symlink_whose_link_text_names_an_undecidable_entry_is_pointer_unresolved(self):
         """A9-23's one loud leg for a dangling symlink: the link TEXT
         resolves into the directory's top level and names an entry that is
@@ -3631,6 +3656,31 @@ class TestWritePath(_WriteCase):
         meta = self.requests[3]["json"]["metadata"]
         self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
 
+    def test_an_unparseable_updated_at_goes_in_under_the_synthetic_id(self):
+        """R1 review (qa lens): one of A9-1's own "cannot prove" legs, named
+        in the gate's comment but never pinned -- a frontmatter updated-at
+        that does not parse cannot be compared against the session start,
+        so the synthetic id, never a guess."""
+        # A POINTER-selected own document: the no-pointer scan would refuse
+        # an unparseable updated-at at _locate already (its own exit), so
+        # this leg of A9-1's gate is only reachable through a pointer.
+        self._write("2026-09-20-1000-x.md", updated_at="not-a-timestamp")
+        _write_latest_pointer(self.handoff_dir, "2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="this-very-session")
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+
+    def test_an_unreadable_transcript_path_goes_in_under_the_synthetic_id(self):
+        """R1 review (qa lens): the other unpinned leg -- a transcript_path
+        that is SET but names nothing readable (here: no such file) is the
+        same "cannot prove" as an absent one."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(event={"transcript_path": os.path.join(self.tmp.name, "no-such-transcript.jsonl")})
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+
     def test_a_failed_write_leaves_a_later_session_on_the_synthetic_id(self):
         """A9-1's S1/S2 fixture: S1 chose the document (real attribution)
         but its write failed; S2 -- a LATER session, same document still
@@ -3725,6 +3775,24 @@ class TestRuns(unittest.TestCase):
         }
         env.update(extra_env)
         return _run_main(_MOD, {"cwd": cwd, "session_id": session_id}, env)
+
+    def test_the_wire_project_key_equals_the_derivation_and_the_git_fallback_is_ledgered(self):
+        """R1 review (post_implementation, qa lens): X1-policy's acceptance
+        is a CONSUMER-side claim -- the POSTed metadata["project"] equals
+        what _identity.project_key derives from the SAME cwd (not merely
+        that the parameter plumbs into _build_metadata), and the git-source
+        fallback (no CLAUDE_PROJECT_DIR in the run env) is ledger-reported
+        as project_source=git_fallback."""
+        _write_handoff(self.handoff_dir, "2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(self.repo)
+        meta = self.backend.requests[1]["json"]["metadata"]
+        expected, source = _identity.project_key(self.repo, None)
+        self.assertEqual(meta["project"], expected)
+        self.assertEqual(source, _identity.PROJECT_SOURCE_GIT)
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.repo)
+        self.assertTrue(entries)
+        self.assertEqual(entries[-1]["project_source"], "git_fallback")
 
     def test_subdirectory_cwd_gives_the_same_external_id(self):
         _write_handoff(self.handoff_dir, "2026-09-20-1000-x.md", owner=f"owner/{LOCAL_UUID}")

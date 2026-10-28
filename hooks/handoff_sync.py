@@ -512,13 +512,23 @@ def _pointer_target(handoff_dir):
                 text = os.readlink(path)
             except OSError as exc:
                 return None, f"{exc!r}"
-            lexically = text if os.path.isabs(text) else os.path.join(handoff_dir, text)
-            lexically = os.path.normpath(lexically)
+            lexically = os.path.normpath(
+                text if os.path.isabs(text) else os.path.join(handoff_dir, text)
+            )
+            # R1 review (post_implementation): the DIRECTORY half of the
+            # joined path is resolved (realpath), the BASENAME half stays
+            # lexical -- never realpath the whole thing: realpath resolves
+            # THROUGH a final dangling symlink and hands back the TARGET's
+            # path, which would quietly re-route a link naming a top-level
+            # undecidable entry away from the R4-c03 report; and never
+            # compare a lexical dirname against a realpath'd directory (a
+            # handoff_dir behind a symlink component never compares equal).
             try:
+                resolved_parent = os.path.realpath(os.path.dirname(lexically))
                 real_dir = os.path.realpath(handoff_dir)
             except OSError:
-                real_dir = handoff_dir
-            if os.path.dirname(lexically) == real_dir:
+                resolved_parent, real_dir = os.path.dirname(lexically), handoff_dir
+            if resolved_parent == real_dir:
                 return os.path.basename(lexically), None
             # Names something outside the directory / in a subdirectory /
             # an excluded name: in NO list, the quiet "points at a
@@ -929,9 +939,15 @@ def _locate(handoff_dir, extra=None, *, identity):
             parts = []
             if pointer_unresolved is not None:
                 parts.append(f"latest.md: {pointer_unresolved}")
+            # R1 review: the [:5] slice is bounded, but the BOUND must be
+            # visible -- 40 uncertain candidates reporting 5 silently is
+            # exactly the ledger-quietly-lying shape this file keeps closing.
+            shown = ", ".join(f"{name}({raw!r})" for name, _ts, raw in uncertain[:5])
+            hidden = len(uncertain) - 5
+            if hidden > 0:
+                shown = f"{shown} (+{hidden} more)"
             parts.append(
-                "no own-container candidate; unresolved owner-container: "
-                + ", ".join(f"{name}({raw!r})" for name, _ts, raw in uncertain[:5])
+                "no own-container candidate; unresolved owner-container: " + shown
             )
             detail = "; ".join(parts)
             if extra is not None:
