@@ -1513,28 +1513,47 @@ class TestContent(unittest.TestCase):
 
 
 class TestOptOut(unittest.TestCase):
-    """R1-c05: `nexus-ingest: skip` recognised past exact-lowercase-match."""
+    """R1-c05 + A9-5 (owner ruling 2026-10-01, 发版前修改): `_opted_out` is
+    three-state. ``skip`` / ``false`` / ``no`` / ``off`` / ``0`` are the
+    opt-out (the author's clear intent in every spelling); ``true`` / ``yes``
+    / ``on`` / ``1`` upload; ANY OTHER value is ``unparsable`` -- this key
+    exists only to let the author control the upload, so an unrecognised
+    value must not read as permission (the pre-A9 behaviour ingested it and
+    recorded a clean row)."""
 
     def test_exact_lowercase_skip_opts_out(self):
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "skip"}), "skip")
 
     def test_mixed_and_upper_case_skip_opts_out(self):
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "Skip"}))
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "SKIP"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "Skip"}), "skip")
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "SKIP"}), "skip")
 
     def test_an_inline_comment_after_skip_still_opts_out(self):
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip  # has a secret in §6"}))
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip # reason"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "skip  # has a secret in §6"}), "skip")
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "skip # reason"}), "skip")
 
-    def test_missing_key_does_not_opt_out(self):
-        self.assertFalse(_MOD._opted_out({}))
+    def test_missing_key_is_allow(self):
+        self.assertEqual(_MOD._opted_out({}), "allow")
 
-    def test_unrecognised_values_do_not_opt_out(self):
-        """false/no/off are left ingesting -- an explicitly OPEN question
-        (Amendment A9), not a guess made by this fix."""
-        for value in ("false", "no", "off", "true", "none"):
+    def test_false_no_off_zero_all_opt_out(self):
+        """A9-5: `false / no / off / 0` 视同 skip -- the author meant "do not
+        upload"; the pre-A9 code ingested these and the ledger row looked
+        clean."""
+        for value in ("false", "no", "off", "0", "False", "NO", "OFF"):
             with self.subTest(value=value):
-                self.assertFalse(_MOD._opted_out({"nexus-ingest": value}))
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "skip")
+
+    def test_true_yes_on_one_all_allow(self):
+        for value in ("true", "yes", "on", "1", "TRUE", "Yes"):
+            with self.subTest(value=value):
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "allow")
+
+    def test_every_other_value_is_unparsable(self):
+        """A9-5: anything unrecognised refuses the upload (`file_unparsable`
+        at the caller) instead of reading as permission."""
+        for value in ("none", "maybe", "skip-me-not", ""):
+            with self.subTest(value=value):
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "unparsable")
 
     def test_a_quoted_value_with_an_inline_comment_still_opts_out(self):
         """R2-c02: _split_frontmatter only strips a matching pair of quotes
@@ -1543,16 +1562,16 @@ class TestOptOut(unittest.TestCase):
         last character, so a quoted `"skip"  # reason` / `'skip' # reason`
         value still carries its quotes by the time it reaches here. Both
         quote styles must still be recognised once the comment is gone."""
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": '"skip"  # leaked a token'}))
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "'skip' # leaked a token"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": '"skip"  # leaked a token'}), "skip")
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "'skip' # leaked a token"}), "skip")
 
-    def test_a_value_merely_containing_skip_does_not_opt_out(self):
+    def test_a_value_merely_containing_skip_is_unparsable(self):
         """R2-c15: guards the exact-match comparison against a future
         widening to a substring check (e.g. `"skip" in value`), which would
         silently opt out documents whose value merely mentions "skip"."""
         for value in ("skipped", "no-skip-please", "unskippable"):
             with self.subTest(value=value):
-                self.assertFalse(_MOD._opted_out({"nexus-ingest": value}))
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "unparsable")
 
 
 class TestMetadata(unittest.TestCase):
@@ -1786,6 +1805,28 @@ class TestOwnerAndOptOut(_WriteCase):
         a server-side row was soft-deleted; the opt-out must still be
         honoured, or the row gets recreated on the very next SessionEnd."""
         self._write("2026-09-20-1000-x.md", nexus_ingest='"skip"  # leaked a token in §6')
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "opted_out")
+
+    def test_an_unrecognised_nexus_ingest_value_refuses_the_upload(self):
+        """A9-5 (owner 2026-10-01): the key exists only to control the
+        upload, so a value this hook does not recognise must not read as
+        permission. `file_unparsable` (already in the failure table -- no
+        new reason), the ORIGINAL value in the detail, zero requests, and
+        a reported failure every session until the value is fixed."""
+        self._write("2026-09-20-1000-x.md", nexus_ingest="maybe")
+        self._run()
+        self.assertEqual(self.requests, [])
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "file_unparsable")
+        self.assertIn("maybe", entry["detail"])
+        self.assertFalse(entry["ok"])
+
+    def test_nexus_ingest_false_is_the_opted_out_skip(self):
+        """A9-5 end to end: `false` is the opt-out, a quiet skip with zero
+        requests -- the same row shape `skip` itself produces."""
+        self._write("2026-09-20-1000-x.md", nexus_ingest="false")
         self._run()
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "opted_out")

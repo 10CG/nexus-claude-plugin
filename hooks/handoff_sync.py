@@ -753,10 +753,22 @@ _parse_instant = _ingest_client._parse_instant
 
 
 def _opted_out(frontmatter):
-    """True when ``nexus-ingest`` selects the opt-out (R1-c05, TASK-005 R1
-    fix round; quoted values R2-c02). Strips a trailing inline ``# reason``
-    comment, then -- same as ``_split_frontmatter`` -- one level of matching
-    quotes, before normalising case and comparing -- this frontmatter
+    """``"skip"`` / ``"allow"`` / ``"unparsable"`` -- the A9-5 three-state
+    reading of ``nexus-ingest`` (owner ruling 2026-10-01, 发版前修改).
+
+    ``skip`` / ``false`` / ``no`` / ``off`` / ``0`` are the opt-out (the
+    author's clear intent in every spelling -- the pre-A9 code ingested the
+    last four of these and the ledger row looked clean); ``true`` / ``yes``
+    / ``on`` / ``1`` upload; EVERY OTHER value -- including the empty
+    string once normalised -- is ``"unparsable"``: this key exists only to
+    let the author control the upload, so an unrecognised value must not
+    read as permission. The caller records the existing failure reason
+    ``file_unparsable`` (no new reason) with the ORIGINAL value in the
+    detail, reported every session until the value is fixed.
+
+    Normalisation is unchanged from R1-c05 / R2-c02: strip a trailing
+    inline ``# reason`` comment, then -- same as ``_split_frontmatter`` --
+    one level of matching quotes, before normalising case. This frontmatter
     dialect is flat ``key: string`` only (session-handoff.md §2.3.8.3;
     Aria's own simple parser keeps an inline comment verbatim on the value
     exactly like ``_split_frontmatter`` above does), so ``Skip`` / ``SKIP``
@@ -772,18 +784,19 @@ def _opted_out(frontmatter):
     a human editing frontmatter by hand is likely to use) reaches here
     still wearing its quotes, comment removed but quotes intact, and used
     to compare unequal to the bare word ``skip``.
-
-    Only the literal ``skip`` is recognised once normalised: ``false`` /
-    ``no`` / ``off`` are left ingesting, an open question for Amendment A9,
-    not a guess made here.
     """
     value = frontmatter.get("nexus-ingest")
     if not isinstance(value, str):
-        return False
+        return "allow"  # key absent: nothing was opted, upload is the default
     value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         value = value[1:-1]
-    return value.strip().lower() == "skip"
+    value = value.strip().lower()
+    if value in ("skip", "false", "no", "off", "0"):
+        return "skip"
+    if value in ("true", "yes", "on", "1"):
+        return "allow"
+    return "unparsable"  # the caller puts the ORIGINAL frontmatter value in the detail
 
 
 # ── content: H1 -> §6 -> §2, capped ─────────────────────────────────────
@@ -1118,8 +1131,19 @@ def _collect(run):
 
     frontmatter, body = _split_frontmatter(text)
 
-    if _opted_out(frontmatter):
+    opt_out = _opted_out(frontmatter)
+    if opt_out == "skip":
         return "opted_out"  # checked before the owner check (§3.2 recovery path)
+    if opt_out == "unparsable":
+        # A9-5 (owner 2026-10-01): an unrecognised value is a refusal, not
+        # permission. file_unparsable is already in the failure table, so
+        # no new reason and no new table entry -- and the ORIGINAL value
+        # goes in the detail, so whoever reads the ledger can fix the
+        # document without reproducing the run.
+        raw_value = frontmatter.get("nexus-ingest")
+        run["extra"]["detail"] = _short(f"nexus-ingest={raw_value!r} is not a recognised value")
+        _warn(f"[{HOOK}] {run['extra']['detail']}")
+        return "file_unparsable"
 
     local_uuid = _identity.aria_uuid()
     doc_uuid = _identity.owner_container_uuid(frontmatter.get("owner-container"))
