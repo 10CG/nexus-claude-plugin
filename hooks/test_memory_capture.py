@@ -576,6 +576,45 @@ class TestFailOpen(unittest.TestCase):
 # The hook tolerates 'prompt', 'user_prompt', and 'userPrompt' key names.
 # ════════════════════════════════════════════════════════════════════════════════
 
+class TestSystemContentSkip(unittest.TestCase):
+    """10CG/nexus-claude-plugin#48 item 2 (owner 2026-10-10): harness-delivered
+    system content (task notifications, system notices) arrives as a USER turn;
+    it is never the user stating a preference -- skip before any
+    classification, fail-open silent. The 2026-10-08 incident: a subagent's
+    audit RESULT inside a <task-notification> matched capture_positive and the
+    hook nudged "remember" for what was an audit verdict."""
+
+    def test_a_task_notification_with_preference_text_is_skipped(self):
+        prompt = (
+            "<task-notification>task bymmy4m31 completed</task-notification>\n"
+            "The audit result: I prefer pnpm for all future TypeScript work."
+        )
+        stdout, code = _run_hook(_hook_json(prompt))
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, b"", "system content must not nudge")
+
+    def test_a_system_notice_marker_is_skipped(self):
+        prompt = "[SYSTEM NOTIFICATION - NOT USER INPUT]\nI always use Y."
+        stdout, code = _run_hook(_hook_json(prompt))
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, b"", "system notice must not nudge")
+
+    def test_the_marker_anywhere_in_the_turn_skips(self):
+        prompt = "Prologue text.\n[system notification - not user input]\nI like dark mode."
+        stdout, code = _run_hook(_hook_json(prompt))
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, b"")
+
+    def test_the_same_preference_without_a_marker_still_nudges(self):
+        # Control (non-vacuity): without a marker the same preference text
+        # still routes to a WRITE nudge -- the skip is marker-gated, not a
+        # blanket silencing of preference prompts.
+        prompt = "I prefer pnpm over npm."
+        stdout, code = _run_hook(_hook_json(prompt))
+        self.assertEqual(code, 0)
+        self.assertGreater(len(stdout), 0)
+
+
 class TestPromptKeyVariants(unittest.TestCase):
     """_extract_prompt() accepts 3 key names; verify hook fires for each."""
 
@@ -1426,6 +1465,7 @@ if __name__ == "__main__":
         TestPrecisionNoOverFire,
         TestOutputContract,
         TestFailOpen,
+        TestSystemContentSkip,
         TestPromptKeyVariants,
         TestNonVacuityProof,
         # T4 read-path classes (mcp-read-path-routing FU)

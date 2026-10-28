@@ -131,6 +131,26 @@ def _extract_prompt(event):
     return None
 
 
+# System-delivered content markers (10CG/nexus-claude-plugin#48 item 2, owner
+# 2026-10-10): task-completion notifications and other harness-injected system
+# turns arrive as USER turns, and their text can carry preference-shaped
+# phrases from a subagent's RESULT -- an audit verdict was once "remembered"
+# this way (2026-10-08 incident). These turns are not the user stating
+# anything; skip them entirely, before any classification, fail-open silent.
+_SYSTEM_CONTENT_MARKERS = (
+    "<task-notification>",
+    "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+)
+
+
+def _is_system_content(prompt):
+    """True when the prompt is harness/system-delivered content rather than
+    something the user typed (#48 item 2). Containment, case-insensitive --
+    the marker may sit anywhere in the turn's text."""
+    lowered = prompt.lower()
+    return any(marker.lower() in lowered for marker in _SYSTEM_CONTENT_MARKERS)
+
+
 def main():
     # Load shared rule set from this script's own directory so it resolves
     # correctly under ${CLAUDE_PLUGIN_ROOT}.
@@ -146,6 +166,9 @@ def main():
     prompt = _extract_prompt(event)
     if prompt is None:
         return  # missing prompt -> fail-open silent
+
+    if _is_system_content(prompt):
+        return  # system-delivered content (#48 item 2) -> fail-open silent
 
     intent = _classify(prompt, rules)
     if intent is None:
