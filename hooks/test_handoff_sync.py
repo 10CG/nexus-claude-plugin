@@ -410,6 +410,12 @@ class _HandoffDirCase(unittest.TestCase):
         self.cwd = os.path.join(self.tmp.name, "proj")
         os.makedirs(self.cwd)
         self.handoff_dir = os.path.join(self.cwd, "docs", "handoff")
+        # A9-2/A9-3: the identity bundle _locate groups candidates by. A
+        # FIXED hostname, never the real one -- this suite's hostname-shaped
+        # fixtures (simonfish/dev-claude2) happen to be the dev machine's
+        # actual hostname, so a live read would make them pass here and fail
+        # on CI (A9-3's own pitfall note).
+        self.identity = {"uuid": LOCAL_UUID, "hostname": "ci-box", "label": None}
 
     def _mkdir(self):
         os.makedirs(self.handoff_dir, exist_ok=True)
@@ -423,13 +429,13 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")  # newer, not pointed to
         _write_latest_pointer(self.handoff_dir, "a.md")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_pointer_missing_falls_back_to_newest_updated_at(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_a_tie_in_updated_at_is_broken_by_filename(self):
         """R3-c11: `_locate`'s fallback keeps the FIRST candidate that beats
@@ -452,39 +458,39 @@ class TestLocate(_HandoffDirCase):
         with mock.patch.object(
             _MOD.os, "listdir", return_value=["z-owned-by-other.md", "a-owned-by-me.md"]
         ):
-            self.assertEqual(_MOD._locate(self.handoff_dir), ("a-owned-by-me.md", None))
+            self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a-owned-by-me.md", None))
 
     def test_multi_track_banner_without_a_pointer_falls_back(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         _write_latest_pointer(self.handoff_dir, "a.md", style="banner")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_arrow_style_pointer_falls_back(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         _write_latest_pointer(self.handoff_dir, "a.md", style="arrow")  # points at a, the OLDER one
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))  # arrow ignored -> newest wins
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))  # arrow ignored -> newest wins
 
     def test_pointer_to_a_non_candidate_falls_back(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         _write_latest_pointer(self.handoff_dir, "deleted-file.md")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_no_dir_is_no_handoff(self):
         self.assertFalse(os.path.isdir(self.handoff_dir))
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
     def test_only_latest_and_readme_is_no_handoff(self):
         self._mkdir()
         _write_latest_pointer(self.handoff_dir, "irrelevant.md")
         with open(os.path.join(self.handoff_dir, "README.md"), "w", encoding="utf-8") as fh:
             fh.write("# About this directory\n")
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
     def test_a_lowercase_readme_is_excluded_case_insensitively(self):
         """Ruling 6 (TASK-005 R1 fix round, R1-c12): the exclusion of
@@ -505,7 +511,7 @@ class TestLocate(_HandoffDirCase):
             fh.write("# About this directory\n")
         with open(os.path.join(self.handoff_dir, "LATEST.md"), "w", encoding="utf-8") as fh:
             fh.write("nothing useful\n")
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
     def test_pointer_target_with_a_directory_prefix_resolves_via_basename(self):
         """R1-c28: the Aria collector pattern's target group is normalised
@@ -523,7 +529,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")  # newer, not pointed to
         with open(os.path.join(self.handoff_dir, "latest.md"), "w", encoding="utf-8") as fh:
             fh.write("# Latest\n\n**Latest**: [a.md](docs/handoff/a.md)\n")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_an_unreadable_directory_is_pointer_unresolved_not_quiet(self):
         """Ruling 5 (TASK-005 R1 fix round, R1-c06): a docs/handoff directory
@@ -543,7 +549,7 @@ class TestLocate(_HandoffDirCase):
             self.skipTest("running as a user unaffected by chmod 000 (e.g. root)")
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
@@ -559,7 +565,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         with mock.patch.object(_MOD.os, "listdir", side_effect=PermissionError(13, "denied")), \
                 mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
@@ -600,7 +606,7 @@ class TestLocate(_HandoffDirCase):
                 with mock.patch.object(_MOD.os, "stat", side_effect=exc), \
                         mock.patch.object(_MOD.os, "lstat", side_effect=exc), \
                         mock.patch.object(sys, "stderr", stderr):
-                    result = _MOD._locate(self.handoff_dir)
+                    result = _MOD._locate(self.handoff_dir, identity=self.identity)
                 self.assertEqual(result, (None, "pointer_unresolved"))
                 self.assertIn("docs/handoff", stderr.getvalue())
 
@@ -627,7 +633,7 @@ class TestLocate(_HandoffDirCase):
             self.skipTest("running as a user unaffected by chmod (e.g. root)")
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
@@ -663,7 +669,7 @@ class TestLocate(_HandoffDirCase):
 
         with mock.patch.object(_MOD.os, "stat", side_effect=failing_stat), \
                 mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         # latest.md names b.md: the unstattable a.md sibling never enters
         # the comparison, so the round resolves b.md cleanly.
         self.assertEqual(result, ("b.md", None))
@@ -694,7 +700,7 @@ class TestLocate(_HandoffDirCase):
         os.symlink(os.path.join(self.tmp.name, "does-not-exist"), self.handoff_dir)
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
 
     def test_a_dangling_md_symlink_candidate_is_pointer_unresolved_not_quiet(self):
@@ -714,7 +720,7 @@ class TestLocate(_HandoffDirCase):
         )
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("dangling.md", stderr.getvalue())
 
@@ -727,7 +733,7 @@ class TestLocate(_HandoffDirCase):
         never catches it, because the dangling link sits one level up."""
         docs = os.path.dirname(self.handoff_dir)
         os.symlink(os.path.join(self.tmp.name, "nonexistent-docs-target"), docs)
-        result = _MOD._locate(self.handoff_dir)
+        result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
 
     def test_a_valid_docs_symlink_without_a_handoff_dir_stays_quiet(self):
@@ -748,7 +754,7 @@ class TestLocate(_HandoffDirCase):
         real_target = os.path.join(self.tmp.name, "real-docs-target")
         os.makedirs(real_target)
         os.symlink(real_target, docs)
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
     def test_a_single_eloop_entry_in_the_fallback_scan_is_pointer_unresolved_whole_round(self):
         """A9-19 (owner ruling 2026-10-01, option A 全报): the no-pointer
@@ -767,7 +773,7 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("loop.md", extra["detail"])
         self.assertIn("OSError(", extra["detail"])  # the error TYPE travels with the name
@@ -797,7 +803,7 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         with mock.patch.object(_MOD.os, "stat", side_effect=failing_stat), \
                 mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("b.md", extra["detail"])
         self.assertIn("OSError(", extra["detail"])
@@ -825,7 +831,7 @@ class TestLocate(_HandoffDirCase):
             self.skipTest("running as a user unaffected by chmod 000 (e.g. root)")
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("2026-09-20-new.md", stderr.getvalue())
         self.assertNotEqual(result, (os.path.basename(older), None))  # never silently the older one
@@ -853,7 +859,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open), \
                 mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("2026-09-20-new.md", stderr.getvalue())
         self.assertNotEqual(result, (os.path.basename(older), None))  # never silently the older one
@@ -883,7 +889,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         extra = {}
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("2026-09-29-new.md", extra["detail"])
         self.assertIn("2026-09-29-new.md", stderr.getvalue())
@@ -917,7 +923,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         extra = {}
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", extra["detail"])
         self.assertIn("latest.md", stderr.getvalue())
@@ -947,7 +953,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open), \
                 mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", stderr.getvalue())
         self.assertIn("latest.md", extra["detail"])
@@ -971,7 +977,7 @@ class TestLocate(_HandoffDirCase):
             os.path.join(self.tmp.name, "does-not-exist-target.md"),
             os.path.join(self.handoff_dir, "latest.md"),
         )
-        result = _MOD._locate(self.handoff_dir)
+        result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, ("b.md", None))
 
     def test_a_self_referential_latest_md_symlink_with_multiple_candidates_falls_back_quietly(self):
@@ -985,7 +991,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         loop_path = os.path.join(self.handoff_dir, "latest.md")
         os.symlink(loop_path, loop_path)
-        result = _MOD._locate(self.handoff_dir)
+        result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, ("b.md", None))
 
     def test_a_healthy_latest_md_symlink_into_the_directory_is_a_pointer(self):
@@ -1005,7 +1011,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         os.symlink("a.md", os.path.join(self.handoff_dir, "latest.md"))  # names the OLDER one
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_an_absolute_latest_md_symlink_into_the_directory_is_a_pointer(self):
         """A9-23: the same judgement must not depend on the link text being
@@ -1015,7 +1021,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         b = _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         os.symlink(b, os.path.join(self.handoff_dir, "latest.md"))
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_a_latest_md_symlink_pointing_into_a_subdirectory_does_not_mis_match_a_top_level_same_name(self):
         """A9-23: the symlink-pointer judgement is by FULL PATH (both sides
@@ -1034,7 +1040,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "z.md", updated_at="2026-09-20T00:00:00Z")
         _write_handoff(sub, "x.md", updated_at="2026-09-25T00:00:00Z")
         os.symlink("sub/x.md", os.path.join(self.handoff_dir, "latest.md"))
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("z.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("z.md", None))
 
     def test_a_dangling_latest_md_symlink_whose_link_text_names_an_undecidable_entry_is_pointer_unresolved(self):
         """A9-23's one loud leg for a dangling symlink: the link TEXT
@@ -1053,7 +1059,7 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("gone.md", extra["detail"])
         self.assertIn("gone.md", stderr.getvalue())
@@ -1071,7 +1077,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("not a regular file", extra["detail"])
 
@@ -1089,7 +1095,7 @@ class TestLocate(_HandoffDirCase):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_an_unresolved_latest_md_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
         """R6-c01: the exemption above counts ONLY `candidates`, the
@@ -1115,7 +1121,7 @@ class TestLocate(_HandoffDirCase):
         )
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", extra["detail"])
 
@@ -1138,7 +1144,7 @@ class TestLocate(_HandoffDirCase):
             os.path.join(self.handoff_dir, "latest.md"),
         )
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("b.md", extra["detail"])
         self.assertIn("FileNotFoundError", extra["detail"])
@@ -1163,32 +1169,32 @@ class TestLocate(_HandoffDirCase):
 
         extra = {}
         with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", extra["detail"])
 
     def test_an_unresolved_latest_mds_single_candidate_with_no_parseable_updated_at_still_names_latest_md_in_detail(self):
-        """R6-c02: the single-entry exemption falls through with
-        `target=None` (never a real filename) to the newest-`updated-at`
-        scan -- so when the lone candidate ALSO has no parseable
-        `updated-at`, this run reaches `_locate`'s OWN final "none with a
-        parseable updated-at" exit. That exit used to build its `detail`
-        from scratch, discarding the `pointer_unresolved` reason
-        `_pointer_target` already computed -- so a session where BOTH
+        """R6-c02, under A9-2: the single-entry exemption falls through
+        with `target=None` (never a real filename) to the grouped scan --
+        and the lone candidate (no owner-container, no parseable
+        `updated-at`) lands in the UNCERTAIN group, so the run exits
+        identity_unresolved with an empty own group. The R6-c02 courtesy
+        itself is what must survive the A9-2 rewrite: a session where BOTH
         `latest.md` (here, a directory) AND the single candidate's
-        frontmatter are broken reported a ledger `detail` that only
-        mentions frontmatter, sending whoever reads it to fix the wrong
-        file, and no stderr line naming `latest.md` at all."""
+        frontmatter are broken reports a `detail` naming BOTH files, not
+        one that only mentions the frontmatter and sends whoever reads it
+        to fix the wrong file."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "track-id: x", "---"])
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
         extra = {}
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
-        self.assertEqual(result, (None, "pointer_unresolved"))
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
         self.assertIn("latest.md", extra["detail"])
         self.assertIn("not a regular file", extra["detail"])
+        self.assertIn("a.md", extra["detail"])
         self.assertIn("latest.md", stderr.getvalue())
 
     def test_an_unstattable_latest_md_is_pointer_unresolved_not_a_silent_older_pick(self):
@@ -1224,7 +1230,7 @@ class TestLocate(_HandoffDirCase):
                 stderr = io.StringIO()
                 with mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat), \
                         mock.patch.object(sys, "stderr", stderr):
-                    result = _MOD._locate(self.handoff_dir, extra)
+                    result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
                 self.assertEqual(result, (None, "pointer_unresolved"))
                 self.assertNotEqual(result, (os.path.basename(older), None))
                 self.assertIn("latest.md", extra["detail"])
@@ -1254,7 +1260,7 @@ class TestLocate(_HandoffDirCase):
         with open(real_pointer, "w", encoding="utf-8") as fh:
             fh.write("# Latest\n\n**Latest**: [a.md](./a.md)\n")
         os.symlink(real_pointer, os.path.join(self.handoff_dir, "latest.md"))
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_a_missing_latest_md_with_multiple_candidates_still_falls_back_quietly(self):
         """Control for the whole group above: latest.md genuinely ABSENT
@@ -1264,7 +1270,7 @@ class TestLocate(_HandoffDirCase):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_a_closed_stderr_does_not_turn_an_unlistable_directory_into_http_error(self):
         """R3-c04: the old code printed `[{HOOK}] {detail}` with a bare
@@ -1281,7 +1287,7 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         with mock.patch.object(_MOD, "_candidates", side_effect=OSError("denied")), \
                 mock.patch.object(sys, "stderr", _BrokenStderr()):
-            result = _MOD._locate(self.handoff_dir, extra)  # must not raise BrokenPipeError
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)  # must not raise BrokenPipeError
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("could not be listed", extra["detail"])
 
@@ -1297,30 +1303,43 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         with mock.patch.object(_MOD, "_candidates", side_effect=OSError("denied")), \
                 mock.patch.object(sys, "stderr", io.StringIO()):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("could not be listed", extra["detail"])
 
-    def test_pointer_unresolved_records_a_detail_when_no_candidate_resolves(self):
+    def test_a_lone_unparseable_frontmatter_candidate_is_identity_unresolved_with_a_detail(self):
+        """A4-5's loud leg, under A9-2: a candidate with no parseable
+        owner-container is UNCERTAIN, and an empty own group with uncertain
+        candidates present reports identity_unresolved (still a failure
+        class, still naming the candidate) -- the pre-A9 run reached the
+        blunter "none with a parseable updated-at" pointer_unresolved
+        instead."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "not: a-known-key", "---"])
         _write_latest_pointer(self.handoff_dir, "does-not-exist.md")
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
-        self.assertEqual(result, (None, "pointer_unresolved"))
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
         self.assertIn("candidate", extra["detail"])
+        self.assertIn("a.md", extra["detail"])
 
     # -- Amendment A4-5 pair: the SAME directory shape, contents-only diff --
 
     def test_a4_5_leg_empty_dir_is_no_handoff(self):
         self._mkdir()
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
-    def test_a4_5_leg_broken_frontmatter_and_unmatched_pointer_is_pointer_unresolved(self):
+    def test_a4_5_leg_broken_frontmatter_and_unmatched_pointer_stays_loud(self):
+        """A4-5's A/B pair: the SAME shape as the empty-dir leg above, one
+        broken candidate added, must stay a REPORTED failure. Under A9-2
+        the reason is identity_unresolved (a lone unparseable-owner
+        candidate is uncertain, and an empty own group with uncertain
+        present is C1's reportable case), not the old blunter
+        pointer_unresolved -- loud either way, which is the pair's point."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "not: a-known-key", "---"])
         _write_latest_pointer(self.handoff_dir, "does-not-exist.md")
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "pointer_unresolved"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "identity_unresolved"))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1800,7 +1819,164 @@ class TestPointerTargetReadSafety(_HandoffDirCase):
         target, unresolved = result.get("pointer", (None, None))
         self.assertIsNone(target)
         self.assertIsNotNone(unresolved)
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# A9-2 / A9-3: owner grouping -- selection rules and the hostname/label split
+# ════════════════════════════════════════════════════════════════════════
+
+class TestOwnerGrouping(_HandoffDirCase):
+    """A9-2 (owner ruling 2026-10-01, 套餐 A 兜底): candidates are grouped
+    by owner-container into own / others / uncertain BEFORE any selection;
+    the fixtures here are the ruling's own acceptance list."""
+
+    def _other(self, name, **kw):
+        kw.setdefault("owner", f"owner/{OTHER_UUID}")
+        return _write_handoff(self.handoff_dir, name, **kw)
+
+    def _uncertain(self, name, owner="simonfish/ci-box", **kw):
+        """owner = the identity's hostname (or below, its label) with a
+        non-uuid first segment: A9-3's uncertain shape."""
+        return _write_handoff(self.handoff_dir, name, owner=owner, **kw)
+
+    # -- _owner_group unit level --
+
+    def test_uuid_equal_is_own_and_unequal_is_others(self):
+        identity = self.identity
+        self.assertEqual(_MOD._owner_group({"owner-container": f"o/{LOCAL_UUID}"}, identity), "own")
+        self.assertEqual(_MOD._owner_group({"owner-container": f"o/{OTHER_UUID}"}, identity), "others")
+
+    def test_missing_owner_container_is_uncertain(self):
+        self.assertEqual(_MOD._owner_group({}, self.identity), "uncertain")
+        self.assertEqual(_MOD._owner_group({"owner-container": "  "}, self.identity), "uncertain")
+
+    def test_hostname_shaped_second_segment_matches_the_hostname(self):
+        """A9-3: equals THIS machine's hostname -> uncertain (possibly this
+        machine before uuid pinning), never a quiet others."""
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/ci-box"}, self.identity), "uncertain"
+        )
+
+    def test_hostname_shaped_second_segment_matching_the_label_is_uncertain(self):
+        identity = {**self.identity, "label": "devbox-a"}
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/DevBox-A"}, identity), "uncertain"
+        )
+
+    def test_an_empty_label_never_matches_anything(self):
+        """A9-3: label None/empty is not participating -- an owner second
+        segment that is ALSO empty never reaches the comparison, and a
+        non-empty second segment never equals the empty label."""
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/"}, self.identity), "uncertain"
+        )
+        self.assertIsNone(self.identity["label"])
+
+    def test_hostname_shaped_matching_neither_hostname_nor_label_is_others(self):
+        """A9-3's quiet leg: a hostname that is clearly somebody else's
+        machine reads not_owner at the selection level, not the
+        every-session identity_unresolved the pre-A9 code reported
+        (10cg.local / truffle-hound-v2 were reporting exactly this noise)."""
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/dev-claude2"}, self.identity),
+            "others",
+        )
+
+    # -- selection rules --
+
+    def test_pointer_to_an_own_document_is_followed(self):
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine.md", updated_at="2026-09-10T00:00:00Z")
+        self._other("b-newer-theirs.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "a-mine.md")
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity), ("a-mine.md", None)
+        )
+
+    def test_pointer_to_someone_elses_document_takes_the_own_newest(self):
+        """The A9-2 positive fixture: nexus's own shape -- latest.md points
+        at the OTHER container's handoff; this container's own newest (not
+        the pointer's document, and not an old not_owner skip) is selected."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "2026-09-19-old-mine.md", updated_at="2026-09-19T00:00:00Z")
+        self._other("2026-09-20-new-theirs.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "2026-09-20-new-theirs.md")
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity),
+            ("2026-09-19-old-mine.md", None),
+        )
+
+    def test_pointer_to_an_uncertain_document_is_identity_unresolved(self):
+        """A9-2: never quietly pass over an uncertain-group document for
+        this container's older one -- that is TASK-001 C1's silent stop."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine-old.md", updated_at="2026-09-10T00:00:00Z")
+        self._uncertain("b-uncertain.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "b-uncertain.md")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertIn("b-uncertain.md", extra["detail"])
+
+    def test_no_pointer_takes_the_own_newest(self):
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine-old.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b-mine-new.md", updated_at="2026-09-20T00:00:00Z")
+        self._other("z-newest-theirs.md", updated_at="2026-09-30T00:00:00Z")
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity), ("b-mine-new.md", None)
+        )
+
+    def test_no_pointer_with_a_newer_uncertain_candidate_is_identity_unresolved(self):
+        """A9-2's own-group guard: an uncertain candidate NEWER than the
+        own-group pick may be this container's own newest document with a
+        legacy owner field -- it blocks the pick."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine.md", updated_at="2026-09-10T00:00:00Z")
+        self._uncertain("b-uncertain-newer.md", updated_at="2026-09-20T00:00:00Z")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertIn("b-uncertain-newer.md", extra["detail"])
+
+    def test_no_pointer_with_only_older_uncertain_candidates_takes_the_own_newest(self):
+        """The corpus case (nexus: 20 uncertain candidates, all old): an
+        uncertain candidate with no comparable or an OLDER timestamp does
+        not hold the round hostage."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine-new.md", updated_at="2026-09-20T00:00:00Z")
+        self._uncertain("old-uncertain.md", updated_at="2026-08-01T00:00:00Z")
+        self._uncertain("no-ts-uncertain.md", updated_at=None)
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity), ("a-mine-new.md", None)
+        )
+
+    def test_empty_own_group_with_uncertain_candidates_is_identity_unresolved(self):
+        self._mkdir()
+        self._uncertain("u1.md", updated_at="2026-09-10T00:00:00Z")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertIn("u1.md", extra["detail"])
+
+    def test_empty_own_group_with_only_others_is_quiet_not_owner(self):
+        self._mkdir()
+        self._other("t1.md", updated_at="2026-09-10T00:00:00Z")
+        self._other("t2.md", updated_at="2026-09-20T00:00:00Z")
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "not_owner"))
+
+    def test_a_missing_local_uuid_is_identity_unresolved_even_with_a_pointer_hit(self):
+        """The local side of the old owner check, preserved: aria_uuid()
+        returning None is reportable, whatever the directory holds."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine.md", updated_at="2026-09-10T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "a-mine.md")
+        result = _MOD._locate(
+            self.handoff_dir, identity={**self.identity, "uuid": None}
+        )
+        self.assertEqual(result, (None, "identity_unresolved"))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1892,11 +2068,31 @@ class TestOwnerAndOptOut(_WriteCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "identity_unresolved")
 
-    def test_a_hostname_shaped_owner_container_is_identity_unresolved(self):
+    def test_a_hostname_shaped_owner_of_another_machine_is_quiet_not_owner(self):
+        """A9-3 (owner 2026-10-01): a hostname-shaped owner-container that
+        matches NEITHER this machine's hostname NOR its label is clearly
+        somebody else's -- a quiet not_owner, not the every-session
+        identity_unresolved the pre-A9 code recorded (10cg.local and
+        truffle-hound-v2 reported exactly that noise). gethostname is
+        STUBBED: the fixture value happens to be the dev machine's real
+        hostname, so a live read would pass here and fail on CI."""
         self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")
-        self._run()
+        with mock.patch("socket.gethostname", return_value="ci-box"):
+            self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "not_owner")
+
+    def test_a_hostname_shaped_owner_equal_to_this_hostname_is_identity_unresolved(self):
+        """A9-3's other half: the same shape, but the hostname IS this
+        machine's -- "possibly me before uuid pinning" (uncertain), and an
+        empty own group with uncertain candidates present is C1's
+        reportable case."""
+        self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")
+        with mock.patch("socket.gethostname", return_value="dev-claude2"):
+            self._run()
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "identity_unresolved")
+        self.assertIn("dev-claude2", self._last_entry()["detail"])
 
     def test_nexus_ingest_skip_is_opted_out_with_zero_requests(self):
         self._write("2026-09-20-1000-x.md", nexus_ingest="skip")
@@ -1904,13 +2100,18 @@ class TestOwnerAndOptOut(_WriteCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "opted_out")
 
-    def test_nexus_ingest_skip_is_checked_before_the_owner_check(self):
-        """A document that is BOTH someone else's AND opted out reports the
-        opt-out, not not_owner -- the digest's explicit ordering."""
+    def test_owner_selection_precedes_the_opt_out_check(self):
+        """A9-2 FLIPPED the old ordering (the digest's "opt-out checked
+        before the owner check"): owner grouping now happens inside
+        `_locate`, BEFORE the chosen document is even opened -- so a
+        document that is somebody else's AND opted out reports not_owner
+        and is never opened at all. The §3.2 recovery path is unaffected:
+        a document of THIS container's own group that opts out still
+        reports opted_out (pinned by the tests above)."""
         self._write("2026-09-20-1000-x.md", owner=f"owner/{OTHER_UUID}", nexus_ingest="skip")
         self._run()
         self.assertEqual(self.requests, [])
-        self.assertEqual(self._last_entry()["reason"], "opted_out")
+        self.assertEqual(self._last_entry()["reason"], "not_owner")
 
     def test_nexus_ingest_quoted_skip_with_inline_comment_is_opted_out(self):
         """R2-c02, end to end: the recovery path in memory-layers.md §3.2
@@ -2022,7 +2223,10 @@ class TestPointerUnresolvedIsReported(_WriteCase):
 
     def test_pointer_unresolved_is_reported_next_session_start(self):
         with open(os.path.join(self.handoff_dir, "a.md"), "w", encoding="utf-8") as fh:
-            fh.write("---\nnot: a-known-key\n---\nbody\n")  # no parseable updated-at
+            # own-group but NO parseable updated-at (A9-2 keeps this the
+            # pointer_unresolved leg; a no-owner frontmatter would exit
+            # identity_unresolved instead, which the grouping tests cover)
+            fh.write("---\nowner-container: owner/aaaaaaaa\ntrack-id: x\n---\nbody\n")
         _write_latest_pointer(self.handoff_dir, "does-not-exist.md")
         self._run()
         self.assertEqual(self._last_entry()["reason"], "pointer_unresolved")
@@ -2543,11 +2747,16 @@ class TestWritePath(_WriteCase):
         state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
         self.assertEqual(state.get("container_id"), "dev-box-a")
 
-        # A second, NEWER document owned by someone else -- `_locate`'s
-        # no-pointer fallback picks it over the first (ruling 1: newest
-        # updated-at wins across ALL candidates, ownership is checked only
-        # after). This container's own id has drifted to dev-box-b in the
-        # meantime, but `not_owner` is decided well before the write path.
+        # A second round whose directory holds NOTHING of this
+        # container's: the own document is gone, a newer foreign one sits
+        # in its place (A9-2: the own-group scan finds nothing, every
+        # candidate is provably somebody else's -> not_owner). This
+        # container's own id has drifted to dev-box-b in the meantime, but
+        # `not_owner` is decided well before the write path -- the old
+        # fixture kept the own document in place and relied on the pre-A9
+        # "newest wins across ALL candidates" rule, which A9-2 replaced
+        # with the own-group scan (that shape now re-ingests the own doc).
+        os.remove(os.path.join(self.handoff_dir, "2026-09-20-1000-x.md"))
         self._write(
             "2026-09-20-1100-y.md", owner=f"owner/{OTHER_UUID}", updated_at="2026-09-20T11:00:00Z",
         )
@@ -3225,8 +3434,12 @@ class TestWritePath(_WriteCase):
             self._run(session_id="sess-1")
         self.assertEqual(self.requests, [])
         entry = self._last_entry()
-        self.assertEqual(entry["reason"], "unknown")
-        self.assertIn("cannot read", entry["detail"])
+        # A9-2 moved the first read of a POINTED document into _locate (the
+        # owner grouping): the vanish race now surfaces there -- probe
+        # returns {} for the race, the document reads uncertain, and the
+        # empty own group reports identity_unresolved (still a failure
+        # class, still named) instead of the old post-locate "unknown".
+        self.assertEqual(entry["reason"], "identity_unresolved")
         findings, _marks = _INJECT_MOD._failure_report(self.cwd)
         self.assertTrue(any("handoff-sync" in f for f in findings), findings)
 
@@ -3253,8 +3466,14 @@ class TestWritePath(_WriteCase):
         self._run(session_id="sess-1")
         self.assertEqual(self.requests, [])
         entry = self._last_entry()
-        self.assertEqual(entry["reason"], "unknown")
-        self.assertIn("cannot read", entry["detail"])
+        # A9-2: the pointed document is probed for its owner BEFORE it is
+        # opened; the chmod read failure surfaces from that probe as
+        # pointer_unresolved (R3-c06's "cannot read to compare" for the
+        # pointer target), a failure class either way -- the pre-A9 run
+        # reported "unknown"/"cannot read" only after _locate had already
+        # returned the document.
+        self.assertEqual(entry["reason"], "pointer_unresolved")
+        self.assertIn("2026-09-20-1000-x.md", entry["detail"])
 
     def test_the_ledger_detail_is_truncated_to_200_chars(self):
         """R1-c30: `_short`'s cap, pinned end to end through the ledger."""
@@ -3265,24 +3484,22 @@ class TestWritePath(_WriteCase):
         self.assertEqual(entry["reason"], "rejected_422")
         self.assertLessEqual(len(entry["detail"]), 200)
 
-    def test_locate_does_not_filter_candidates_by_owner(self):
-        """Ruling 1 (TASK-005 R1 fix round, R1-c07): `_locate` picks the
-        newest `updated-at` across ALL candidates in the directory, never
-        checking frontmatter `owner-container` -- the owner check only runs
-        AFTER a single document has already been chosen. A newer handoff
-        written by a DIFFERENT container therefore wins over an older one
-        THIS container actually owns, and the older one is never even
-        considered: this run ends in `not_owner`, not a successful
-        ingestion of the older document. Deliberate (see Amendment A9): a
-        change here must be a deliberate decision, not an incidental
-        refactor -- this test exists so that decision shows up as a test
-        change, not a silent behaviour change.
+    def test_locate_filters_candidates_by_owner(self):
+        """A9-2 (owner 2026-10-01) FLIPPED the pre-A9 behaviour this test
+        used to pin (R1-c07: no owner filtering; a newer OTHER container's
+        document won, the older own document was never considered, and the
+        run ended not_owner with zero requests -- weeks of silent no-ingest
+        on the shared-pointer nexus checkout). The own-group newest is
+        selected and INGESTED even when a newer foreign document sits in
+        the same directory.
         """
         self._write("2026-09-19-old-mine.md", owner=f"owner/{LOCAL_UUID}", updated_at="2026-09-19T00:00:00Z")
         self._write("2026-09-20-new-theirs.md", owner=f"owner/{OTHER_UUID}", updated_at="2026-09-20T00:00:00Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run()
-        self.assertEqual(self.requests, [])
-        self.assertEqual(self._last_entry()["reason"], "not_owner")
+        self.assertEqual([r["method"] for r in self.requests], ["GET", "POST"])
+        self.assertEqual(self.requests[1]["json"]["metadata"]["aria.track_id"], "carry-x")
+        self.assertEqual(self._last_entry()["reason"], "none")
 
     def test_session_attribution_is_the_ingesting_session_not_the_documents_own(self):
         """Ruling 1 (TASK-005 R1 fix round, R1-c03): metadata.session_id is
@@ -3299,24 +3516,35 @@ class TestWritePath(_WriteCase):
         self.assertEqual(meta["session_id"], "this-very-session")
 
     def test_owner_container_frontmatter_value_is_recorded_on_identity_unresolved(self):
-        """R1-c10: the ledger `extra` used to stay `{}` on every reason that
-        returns before the write path -- a SessionStart failure report for
+        """R1-c10's courtesy, carried through the A9-2 rewrite: the ledger
+        `extra` used to stay `{}` on every reason that returns before the
+        write path -- a SessionStart failure report for
         `identity_unresolved` could not even say which frontmatter value
-        was the problem."""
-        self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")  # hostname-shaped
-        self._run()
+        was the problem. The uncertain-candidate exit still names the
+        candidate and its raw owner value (external_id is no longer
+        present -- under A9-2 no document was CHOSEN, so there is no
+        doc-relative id to record; the candidate name carries the same
+        information)."""
+        self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")  # == this hostname: uncertain
+        with mock.patch("socket.gethostname", return_value="dev-claude2"):
+            self._run()
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "identity_unresolved")
-        self.assertIn("simonfish/dev-claude2", entry["detail"])
-        self.assertEqual(entry["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertIn("2026-09-20-1000-x.md", entry["detail"])
 
-    def test_not_owner_and_opted_out_also_record_external_id(self):
-        """R1-c10, the other non-write branches: `not_owner` and `opted_out`
-        likewise say which document the run was about."""
+    def test_not_owner_records_no_document_and_opted_out_records_the_document(self):
+        """R1-c10, A9-2 edition: `not_owner` now exits inside `_locate`
+        with no document chosen (nothing to name -- the whole directory is
+        provably somebody else's), while `opted_out` follows selection of
+        an OWN document and still records its external_id."""
         self._write("2026-09-20-1000-x.md", owner=f"owner/{OTHER_UUID}")
         self._run()
         self.assertEqual(self._last_entry()["reason"], "not_owner")
-        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertNotIn("external_id", self._last_entry())
+        self._write("2026-09-20-1001-mine.md", owner=f"owner/{LOCAL_UUID}", nexus_ingest="skip")
+        self._run()
+        self.assertEqual(self._last_entry()["reason"], "opted_out")
+        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1001-mine.md")
 
 
 # ════════════════════════════════════════════════════════════════════════

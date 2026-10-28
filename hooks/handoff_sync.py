@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """SessionEnd handoff-ingestion hook for the nexus-memory plugin (workflow B,
 change 2 TASK-005): ingests the project's own, most recent Aria session
-handoff -- most recent project-wide, NOT most recent among the ones this
-container owns (R1-c07: locate never filters by owner; ownership is checked
-only AFTER the single newest candidate has already been picked, and a miss
-there ends the run in ``not_owner``, not a search for an older document this
-container does own -- Amendment A9) -- as a ``layer=session_summary`` episode
+handoff -- most recent AMONG THE ONES THIS CONTAINER OWNS (Amendment A9-2,
+owner ruling 2026-10-01: candidates are grouped by ``owner-container`` into
+own / others / uncertain before any selection; the pre-A9 R1-c07 behaviour
+picked the newest project-wide first and only then checked ownership, so a
+shared ``latest.md`` pointer at the OTHER container's document silenced this
+container's own ingestion under a quiet ``not_owner`` for weeks) -- as a
+``layer=session_summary`` episode
 (``docs/architecture/memory-layers.md`` §3.2), the same layer the session
 aggregator writes for an auto-summarised session -- a human-authored handoff
 is just another episode with ``aria.source=handoff`` provenance instead of an
 aggregator hash.
 
-One SessionEnd run ingests at most ONE handoff document: the project's own
-``docs/handoff/latest.md`` pointer, or -- when that pointer is absent,
-mismatched or stale -- whichever candidate's frontmatter ``updated-at`` is
-newest (Amendment A4-5, owner ruling 2026-09-21).
+One SessionEnd run ingests at most ONE handoff document: the ``latest.md``
+pointer (text or symlink, A9-23) when it resolves to a document of this
+container's own group, or -- otherwise -- whichever OWN-group candidate's
+frontmatter ``updated-at`` is newest (Amendment A4-5, owner ruling
+2026-09-21; A9-2).
 
 Design contract (proposal ``memory-layer-contract-and-aria-structured-
 ingestion`` workflow B; handoff format ``standards/conventions/session-
@@ -56,6 +59,7 @@ handoff.md`` §2.2 / §2.3):
 import json
 import os
 import re
+import socket
 import stat
 import sys
 import time
@@ -568,10 +572,76 @@ def _probe_frontmatter(path):
     return frontmatter
 
 
-def _locate(handoff_dir, extra=None):
+_GROUP_OWN = "own"
+_GROUP_OTHERS = "others"
+_GROUP_UNCERTAIN = "uncertain"
+
+
+def _owner_group(frontmatter, identity):
+    """``"own"`` / ``"others"`` / ``"uncertain"`` -- A9-2's three-way
+    grouping of one candidate by its ``owner-container``, judged against
+    ``identity`` (``{"uuid", "hostname", "label"}``, captured by the
+    caller and handed in as data -- this function never touches the
+    environment).
+
+    ``own``: the second segment is uuid-shaped and equals the local aria
+    uuid -- this container wrote it. ``others``: a uuid that differs, or a
+    non-uuid second segment that equals NEITHER the hostname NOR the
+    non-empty label (A9-3: clearly somebody else's machine -- a quiet
+    ``not_owner``, not the every-session ``identity_unresolved`` the
+    pre-A9 code recorded). ``uncertain``: everything that might still be
+    THIS machine in a historical state -- a missing ``owner-container`` (or
+    no parseable frontmatter at all), or a non-uuid second segment equal to
+    the hostname or the non-empty label (Aria's ``get_container_id`` used
+    to write exactly that before uuid pinning). The distinction is the
+    whole point: "uncertain" candidates must never be silently passed over
+    as if they were somebody else's (TASK-001 C1), so the selection rules
+    in ``_locate`` treat a newer uncertain candidate, or an empty own group
+    with uncertain candidates present, as ``identity_unresolved``.
+    """
+    raw = frontmatter.get("owner-container")
+    if not isinstance(raw, str) or not raw.strip():
+        return _GROUP_UNCERTAIN
+    doc_uuid = _identity.owner_container_uuid(raw)
+    if doc_uuid is not None:
+        return _GROUP_OWN if doc_uuid == identity["uuid"] else _GROUP_OTHERS
+    # A9-3: non-uuid second segment -- one cheap local comparison splits
+    # "clearly someone else's machine" (others, quiet) from "possibly this
+    # machine before uuid pinning" (uncertain, reportable). Case folded on
+    # both sides (aria_label lowercases its half for the same reason).
+    second = raw.rsplit("/", 1)[-1].strip().lower()
+    if not second:
+        return _GROUP_UNCERTAIN  # an owner half with no uuid half at all: "missing"
+    hostname = (identity["hostname"] or "").lower()
+    label = (identity["label"] or "").lower()
+    if second == hostname or (label and second == label):
+        return _GROUP_UNCERTAIN
+    return _GROUP_OTHERS
+
+
+def _locate(handoff_dir, extra=None, *, identity):
     """``(name, reason)``: the candidate filename (inside ``handoff_dir``) to
     ingest, or a reason when none could be located. Exactly one of the two
     is non-``None``.
+
+    ``identity`` (A9-2, required keyword) is ``{"uuid": str-or-None,
+    "hostname": str, "label": str-or-None}`` -- the local container's aria
+    uuid, hostname and aria label, captured by the CALLER and handed in as
+    data (never read here: this function runs on the round worker thread,
+    and environment/filesystem identity reads belong to the calling thread
+    -- the same env-once discipline the other SessionEnd hooks follow).
+    It drives the A9-2 owner grouping: candidates are grouped into
+    own/others/uncertain BEFORE any selection, a pointer is only followed
+    to an own-group document (a pointer at somebody else's document
+    selects this container's own newest instead -- the fix for shared
+    latest.md pointers, which used to silence this container's ingestion
+    under a quiet ``not_owner``), an uncertain-group document blocks with
+    ``identity_unresolved`` rather than being quietly passed over
+    (TASK-001 C1), and the no-pointer fallback compares the OWN group's
+    newest ``updated-at`` while a NEWER uncertain candidate blocks the
+    pick. The caller additionally returns ``not_owner`` (quiet) when every
+    candidate is provably somebody else's and ``identity_unresolved`` when
+    none are provably ours but some might be.
 
     Amendment A4-5 (owner ruling 2026-09-21): a project with no handoff
     directory, or one with nothing but a pointer and/or a README in it, is
@@ -717,7 +787,48 @@ def _locate(handoff_dir, extra=None):
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
     if target in candidates:  # None never matches a real filename
-        return target, None
+        # A9-2 (owner ruling 2026-10-01): a pointer is only ever followed
+        # to a document THIS container wrote -- the pre-A9 code followed it
+        # unconditionally and then failed the owner check, which is exactly
+        # how a shared pointer (nexus's latest.md pointing at the OTHER
+        # container's handoff) silenced this container's own ingestion for
+        # weeks: not_owner, a skip, zero requests, never reported beyond
+        # the ledger.
+        if identity["uuid"] is None:
+            # Same "cannot tell" as the old owner check: the LOCAL side is
+            # unreadable, so even a pointer-resolved candidate cannot be
+            # judged. Reportable, never a silent skip.
+            detail = "local aria uuid could not be determined"
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "identity_unresolved"
+        try:
+            target_frontmatter = _probe_frontmatter(os.path.join(handoff_dir, target))
+        except OSError as exc:
+            # R3-c06 for the pointed document specifically.
+            detail = f"{target}: pointer target could not be read: {exc!r}"
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "pointer_unresolved"
+        target_group = _owner_group(target_frontmatter, identity)
+        if target_group == _GROUP_OWN:
+            return target, None
+        if target_group == _GROUP_UNCERTAIN:
+            # A9-2: the pointer names a document whose ownership cannot be
+            # decided -- silently passing over it for this container's
+            # (older) own document would be exactly the C1 quiet-stop, so
+            # this reports instead.
+            detail = (
+                f"{target}: owner-container unresolved "
+                f"({target_frontmatter.get('owner-container')!r})"
+            )
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "identity_unresolved"
+        # _GROUP_OTHERS: fall through to the own-group newest scan below.
     if target is not None and target in undecidable_by_name:
         # R4-c03 / ruling 13: latest.md explicitly names this entry, and it
         # IS listed -- just unresolved (a dangling symlink, ELOOP, a
@@ -741,18 +852,19 @@ def _locate(handoff_dir, extra=None):
     if undecidable:
         # A9-19 (owner ruling 2026-10-01, option A 全报): this point is
         # only reached when NO usable pointer resolved (none at all, or
-        # one naming a non-candidate), so the choice below is about to be
-        # made by the newest-`updated-at` fallback scan -- and an entry
-        # that cannot even be stat-ed may be exactly the NEWEST document,
-        # silently excluded from that comparison. The other three
-        # "cannot tell" shapes (unlistable directory, all-undecidable,
-        # latest.md itself unresolved) already report; this used to be the
-        # one quiet hold-out, and "bad entry count 1 vs 2" decided whether
-        # the same damage reported or not. The whole round reports, the
-        # detail naming each entry and its error type. A WORKING pointer
-        # (the branch above) bypasses this scan entirely, which is the one
-        # shape A9-19 spares: a bad sibling must not sink a round whose
-        # choice was never in doubt.
+        # one naming a non-candidate or another container's document), so
+        # the choice below is about to be made by the newest-`updated-at`
+        # fallback scan -- and an entry that cannot even be stat-ed may be
+        # exactly the NEWEST document (own or not -- its owner cannot be
+        # read either), silently excluded from that comparison. The other
+        # three "cannot tell" shapes (unlistable directory,
+        # all-undecidable, latest.md itself unresolved) already report;
+        # this used to be the one quiet hold-out, and "bad entry count 1
+        # vs 2" decided whether the same damage reported or not. The whole
+        # round reports, the detail naming each entry and its error type.
+        # A WORKING pointer to an OWN document (the branch above) bypasses
+        # this scan entirely, which is the one shape A9-19 spares: a bad
+        # sibling must not sink a round whose choice was never in doubt.
         detail = (
             f"{len(undecidable)} candidate(s) in docs/handoff could not be resolved: "
             + ", ".join(f"{name} ({exc!r})" for name, exc in undecidable)
@@ -761,7 +873,19 @@ def _locate(handoff_dir, extra=None):
             extra["detail"] = _short(detail)
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
-    newest_name, newest_ts = None, None
+    if identity["uuid"] is None:
+        # Same check as the pointer branch, for the scan path: nothing can
+        # be grouped without the local uuid.
+        detail = "local aria uuid could not be determined"
+        if extra is not None:
+            extra["detail"] = _short(detail)
+        _warn(f"[{HOOK}] {detail}")
+        return None, "identity_unresolved"
+    # A9-2's grouped scan: the fallback comparison runs over the OWN group
+    # only -- every candidate is still probed (a newer UNCERTAIN candidate
+    # blocks the pick below), while OTHERS are simply not in the running,
+    # which is what fixes the shared-pointer shape end to end.
+    own, uncertain = [], []  # own: (name, ts); uncertain: (name, ts, raw owner)
     for name in candidates:
         try:
             frontmatter = _probe_frontmatter(os.path.join(handoff_dir, name))
@@ -778,10 +902,57 @@ def _locate(handoff_dir, extra=None):
                 extra["detail"] = _short(detail)
             _warn(f"[{HOOK}] {detail}")
             return None, "pointer_unresolved"
+        group = _owner_group(frontmatter, identity)
         ts = _parse_instant(frontmatter.get("updated-at"))
+        if group == _GROUP_OWN:
+            own.append((name, ts))
+        elif group == _GROUP_UNCERTAIN:
+            # The RAW owner value rides along (R1-c10): "which document,
+            # which value was the problem", without reproducing the run.
+            uncertain.append((name, ts, frontmatter.get("owner-container")))
+    if not own:
+        if uncertain:
+            # A9-2: nothing here is provably this container's, and
+            # something MIGHT be (uncertain) -- that is TASK-001 C1's
+            # reportable case, not a quiet not_owner. R6-c02's courtesy
+            # survives the A9-2 rewrite: when latest.md was ALSO broken
+            # (single-entry exemption let this scan run anyway), naming
+            # both files sends whoever reads the detail to fix the right
+            # one(s), not just the frontmatter.
+            parts = []
+            if pointer_unresolved is not None:
+                parts.append(f"latest.md: {pointer_unresolved}")
+            parts.append(
+                "no own-container candidate; unresolved owner-container: "
+                + ", ".join(f"{name}({raw!r})" for name, _ts, raw in uncertain[:5])
+            )
+            detail = "; ".join(parts)
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "identity_unresolved"
+        return None, "not_owner"  # every candidate is provably somebody else's: quiet
+    newest_name, newest_ts = None, None
+    for name, ts in own:
         if ts is not None and (newest_ts is None or ts > newest_ts):
             newest_name, newest_ts = name, ts
     if newest_name:
+        for _name, ts, _raw in uncertain:
+            # A9-2: an uncertain candidate that is NEWER than the own-group
+            # pick blocks it -- it may be this container's own newest
+            # document with an unparseable/legacy owner field. Uncertain
+            # candidates with no comparable timestamp do NOT block (the
+            # corpus: nexus's 20 uncertain candidates are all old documents
+            # that must not hold the round hostage).
+            if ts is not None and ts > newest_ts:
+                detail = (
+                    f"newer unresolved owner-container candidate than the own-group pick: "
+                    f"{_name}"
+                )
+                if extra is not None:
+                    extra["detail"] = _short(detail)
+                _warn(f"[{HOOK}] {detail}")
+                return None, "identity_unresolved"
         return newest_name, None
     # R6-c02: `pointer_unresolved`, when set, was computed by `_pointer_
     # target` above and then DELIBERATELY not acted on yet -- the
@@ -799,8 +970,8 @@ def _locate(handoff_dir, extra=None):
         detail = f"latest.md: {pointer_unresolved}"
     else:
         detail = (
-            f"{len(candidates)} candidate(s) in docs/handoff, none with a parseable "
-            f"updated-at and no pointer resolved to one"
+            f"{len(own)} own-container candidate(s) in docs/handoff, none with a "
+            f"parseable updated-at and no pointer resolved to one"
         )
     if extra is not None:
         extra["detail"] = _short(detail)
@@ -1218,11 +1389,21 @@ def _collect(run):
 
     session_id = event.get("session_id")
 
+    # A9-2/A9-3: the identity bundle `_locate` groups candidates by. Read
+    # here for now; the env-once round (P1 discipline, same as the other
+    # two SessionEnd hooks) moves these reads to main() and hands them
+    # down through `run` -- identical values, identical comparisons.
+    identity = {
+        "uuid": _identity.aria_uuid(),
+        "hostname": socket.gethostname(),
+        "label": _identity.aria_label(),
+    }
+
     toplevel, degraded = _identity.project_root(cwd)
     root = toplevel or cwd
     handoff_dir = os.path.join(root, "docs", "handoff")
 
-    name, locate_reason = _locate(handoff_dir, run["extra"])
+    name, locate_reason = _locate(handoff_dir, run["extra"], identity=identity)
     if locate_reason:
         return locate_reason
     doc_path = os.path.join(handoff_dir, name)
@@ -1245,7 +1426,7 @@ def _collect(run):
 
     opt_out = _opted_out(frontmatter)
     if opt_out == "skip":
-        return "opted_out"  # checked before the owner check (§3.2 recovery path)
+        return "opted_out"  # §3.2 recovery path: the owner check already passed in _locate
     if opt_out == "unparsable":
         # A9-5 (owner 2026-10-01): an unrecognised value is a refusal, not
         # permission. file_unparsable is already in the failure table, so
@@ -1257,20 +1438,12 @@ def _collect(run):
         _warn(f"[{HOOK}] {run['extra']['detail']}")
         return "file_unparsable"
 
-    local_uuid = _identity.aria_uuid()
+    # A9-2: the owner check has ALREADY passed -- `_locate` only ever
+    # hands back a document of this container's OWN group (a local uuid
+    # that could not be determined, or a not-provably-somebody-else's
+    # document, exits there with identity_unresolved / not_owner). The
+    # document's own uuid half is still needed for aria.owner_container.
     doc_uuid = _identity.owner_container_uuid(frontmatter.get("owner-container"))
-    if local_uuid is None or doc_uuid is None:
-        # Never silently `not_owner`: uuid could not be determined on either
-        # side, which is a different (and reportable) condition from "this
-        # is someone else's handoff". A pointer-resolved candidate whose
-        # frontmatter simply lacks `owner-container` falls through to here
-        # too -- it does not get a free pass on the owner check. The raw
-        # frontmatter value (R1-c10) says which of the two sides was the
-        # problem without having to reproduce the run to find out.
-        run["extra"]["detail"] = _short(f"owner-container={frontmatter.get('owner-container')!r}")
-        return "identity_unresolved"
-    if local_uuid != doc_uuid:
-        return "not_owner"
 
     content, content_reason = _build_content(body)
     if content_reason:
