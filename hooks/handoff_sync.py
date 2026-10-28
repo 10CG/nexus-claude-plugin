@@ -1431,20 +1431,22 @@ def _collect(run):
         run["cwd"] = event["cwd"]
     cwd = run["cwd"] or os.getcwd()
 
-    base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
+    base_url = run["base_url"]
     if not base_url:
         return "not_configured"  # the default for a fresh install; do nothing else
 
     payload_session_id = event.get("session_id")
 
-    # A9-2/A9-3: the identity bundle `_locate` groups candidates by. Read
-    # here for now; the env-once round (P1 discipline, same as the other
-    # two SessionEnd hooks) moves these reads to main() and hands them
-    # down through `run` -- identical values, identical comparisons.
+    # A9-2/A9-3: the identity bundle `_locate` groups candidates by. P1
+    # (TASK-013, the same env-once discipline the other two SessionEnd
+    # hooks follow): every input here was read ONCE by main(), on the
+    # calling thread, before this worker started -- aria_uuid/aria_label
+    # expanduser HOME, gethostname can raise, and this thread is one
+    # run_with_deadline can only ABANDON, never kill.
     identity = {
-        "uuid": _identity.aria_uuid(),
-        "hostname": socket.gethostname(),
-        "label": _identity.aria_label(),
+        "uuid": run["aria_uuid"],
+        "hostname": run["hostname"],
+        "label": run["aria_label"],
     }
 
     toplevel, degraded = _identity.project_root(cwd)
@@ -1540,18 +1542,21 @@ def _collect(run):
     # X1-policy (TASK-007): project scope for the episode's metadata. The
     # git-source fallback is ledger-reported for the same reason as in
     # session_capture: a silent fallback would look "env-resolved" forever.
-    project, project_source = _identity.project_key(
-        cwd, os.environ.get(_identity.PROJECT_DIR_ENV)
-    )
+    project, project_source = _identity.project_key(cwd, run["project_env"])
     if project_source == _identity.PROJECT_SOURCE_GIT:
         run["extra"]["project_source"] = "git_fallback"
     metadata = _build_metadata(session_id, _current_branch(cwd), frontmatter, doc_uuid, project)
 
-    state, _state_reasons = _hook_state.read_state(HOOK, cwd)
+    # P1: the state path resolved from the run's OWN state_root (read once
+    # by main()), never via read_state(HOOK, cwd) -- that form re-resolves
+    # state_root(), an environment read, on this worker thread. The joined
+    # path is byte-identical to _hook_state.state_path(HOOK, cwd).
+    state_path = os.path.join(run["state_root"], _identity.project_slug(cwd), f"{HOOK}.state.json")
+    state, _state_reasons = _hook_state.read_state_at(state_path)
     drift_reasons = _hook_state.identity_drift(
         previous=state.get("container_id"),
-        current=_identity.container_id(),
-        state_existed=_hook_state.state_exists(HOOK, cwd),
+        current=run["container_id"],
+        state_existed=os.path.exists(state_path),
     )
     if "identity_changed" in drift_reasons:
         # Recorded independently of the scalar `reason` this run ends on
@@ -1571,11 +1576,16 @@ def _collect(run):
         # `unknown` as the scalar `reason` either way.
         run["extra"]["identity_changed"] = True
 
+    # P1: token / container_id pre-read by main(); user_id INLINES
+    # _identity.user_id's own two-line body with the pre-captured override
+    # (calling the real one would read the environment on this thread when
+    # the override is None -- the same reason memory_sync inlines it).
+    user_id = run["default_user_id"] or _identity.project_slug(cwd)
     client = _ingest_client.IngestClient(
         base_url,
-        os.environ.get("NEXUS_API_TOKEN", ""),
-        _identity.user_id(cwd),
-        _identity.container_id(),
+        run["token"],
+        user_id,
+        run["container_id"],
         SOURCE_NAME,
         timeout=_HTTP_TIMEOUT_SECONDS,
         deadline=run["deadline"],
@@ -1791,6 +1801,43 @@ def main():
         "deadline": started + _WORK_BUDGET_SECONDS - _DEADLINE_SLACK_SECONDS,
     }
 
+    # P1 (TASK-013; the discipline memory_sync established with its own
+    # env-once round, review finding 6 of b3bb60d): every environment input
+    # the work below needs is read HERE, on THIS (the calling) thread,
+    # strictly before run_with_deadline starts the worker -- never inside
+    # _collect, which runs on a daemon thread run_with_deadline can only
+    # ABANDON, never kill. The worker reads every one of these back out of
+    # `run`; the static guard in test_handoff_sync walks the same call
+    # graph test_memory_sync's guard walks and fails on any environment
+    # read reachable from _collect. The list, in read order: the backend
+    # two, the state root (NEXUS_HOOK_STATE_DIR / expanduser), the user
+    # override, the container identity (NEXUS_CONTAINER_ID or the
+    # hostname), the A9-2/A9-3 bundle (aria uuid + label -- both
+    # expanduser HOME -- and the hostname again for the comparison), and
+    # CLAUDE_PROJECT_DIR for the X1-policy project key.
+    try:
+        run.update(
+            base_url=os.environ.get("NEXUS_API_URL", "").rstrip("/"),
+            token=os.environ.get("NEXUS_API_TOKEN", ""),
+            state_root=_hook_state.state_root(),
+            default_user_id=os.environ.get(_identity.DEFAULT_USER_ID_ENV),
+            container_id=_identity.container_id(),
+            aria_uuid=_identity.aria_uuid(),
+            aria_label=_identity.aria_label(),
+            hostname=socket.gethostname(),
+            project_env=os.environ.get(_identity.PROJECT_DIR_ENV),
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded below, exactly like a worker exception
+        # F3 (memory_sync's env-once review): a failure in these reads must
+        # not become an unrecorded, silent exit through __main__'s blanket
+        # handler -- it takes the SAME path a worker exception takes: an
+        # `unknown` row plus a stderr line.
+        outcome, left_behind = {"error": exc}, False
+    else:
+        outcome, left_behind = _hook_runner.run_with_deadline(
+            lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
+        )
+
     # _collect itself never calls print() DIRECTLY: the WORK stays off
     # stdio so an abandoned thread cannot interleave with anything main()
     # writes after giving up on it. Not quite absolute in practice, though
@@ -1804,9 +1851,8 @@ def main():
     # directly, and _ingest_client write to stderr from SEVERAL places
     # each -- the same "spooky abandoned thread" risk _hook_runner's own
     # docstring already names, not something this hook adds beyond it.
-    outcome, left_behind = _hook_runner.run_with_deadline(
-        lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
-    )
+    # (The run_with_deadline call itself now lives in the `else:` of the
+    # P1 pre-read above, mirroring memory_sync's F3 shape.)
 
     reason = "unknown"
     diagnostic = None

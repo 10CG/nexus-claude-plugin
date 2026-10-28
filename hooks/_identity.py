@@ -317,9 +317,22 @@ def project_key(cwd, env_dir):
     return normalize_slug(os.path.basename(toplevel.rstrip("/"))), PROJECT_SOURCE_GIT
 
 
-def user_id(cwd):
-    """The Nexus user_id rows are keyed by — same source as project_slug."""
-    return os.environ.get("NEXUS_DEFAULT_USER_ID") or project_slug(cwd)
+DEFAULT_USER_ID_ENV = "NEXUS_DEFAULT_USER_ID"  # public: same P1 pre-read pattern
+
+
+def user_id(cwd, default_user_id=None):
+    """The Nexus user_id rows are keyed by — same source as project_slug.
+
+    ``default_user_id`` serves the P1 discipline (change 2, A10): a caller
+    running its work on an abandonable thread passes the value of
+    ``DEFAULT_USER_ID_ENV`` that its CALLING thread pre-read; ``""`` means
+    "unset" (identical semantics to the or-chain, and no environment read
+    on the worker). Omitted (``None``, the default) reads the environment
+    here, exactly as this function always did.
+    """
+    if default_user_id is None:
+        default_user_id = os.environ.get(DEFAULT_USER_ID_ENV)
+    return default_user_id or project_slug(cwd)
 
 
 def current_branch(cwd):

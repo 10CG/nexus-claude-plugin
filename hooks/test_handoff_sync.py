@@ -47,6 +47,15 @@ import _identity
 import _ingest_client
 import _redact
 
+# P1's static guard shares the AST machinery test_memory_sync built for its
+# own env-once round -- one implementation, two modules pinned by it. The
+# import is side-effect-free (constants and class definitions only).
+from test_memory_sync import (  # noqa: E402
+    _environment_reads_reachable_from,
+    _parse_hook_module,
+    _worker_entry_points,
+)
+
 _HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 _HOOK_SCRIPT = os.path.join(_HOOKS_DIR, "handoff_sync.py")
 
@@ -3108,11 +3117,12 @@ class TestWritePath(_WriteCase):
 
         with mock.patch.object(
             _identity, "container_id",
-            # The two real calls _collect makes (identity_drift's
-            # `current=`, then the IngestClient constructor) return the
-            # new id normally; the THIRD is the protected precompute in
-            # `write()` itself, which is what this raises on.
-            side_effect=["dev-box-b", "dev-box-b", RuntimeError("transient container_id failure")],
+            # P1 (TASK-013) collapsed _collect's two calls (identity_
+            # drift's `current=`, then the IngestClient constructor) into
+            # ONE pre-read in main(); the SECOND and last call is the
+            # protected precompute in `write()` itself, which is what
+            # this raises on.
+            side_effect=["dev-box-b", RuntimeError("transient container_id failure")],
         ) as mock_container_id, mock.patch.object(
             _hook_state, "update_state", side_effect=failing_update_state
         ) as mock_update_state:
@@ -3130,7 +3140,7 @@ class TestWritePath(_WriteCase):
         # `update_state` should be visible here, not just coincidentally
         # still pass because both paths happen to set the same reason.
         mock_update_state.assert_not_called()
-        self.assertEqual(mock_container_id.call_count, 3)
+        self.assertEqual(mock_container_id.call_count, 2)  # main()'s pre-read + write()'s precompute
 
         entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
         reasons = [e["reason"] for e in entries]
@@ -4117,6 +4127,61 @@ class TestSubprocess(unittest.TestCase):
         )
         stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
         self.assertEqual((stdout, proc.returncode), (b"", 0))
+
+
+class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
+    """The static half of handoff_sync's env-once round (TASK-013, the P1
+    discipline memory_sync's own guard established): main() reads every
+    environment input once, on the calling thread; the worker (_collect,
+    on a thread run_with_deadline can only abandon) uses only what was
+    captured. Walks every function the worker can reach -- in
+    handoff_sync.py and, transitively, every hook module it imports -- and
+    fails on an environment read in any of them, taken or not."""
+
+    def test_no_function_the_worker_can_reach_reads_the_environment(self):
+        roots = _worker_entry_points(_parse_hook_module("handoff_sync"))
+        self.assertTrue(roots, "found no worker target in main() -- the check below would be vacuous")
+        reads, visited = _environment_reads_reachable_from(
+            [("handoff_sync", r) for r in roots]
+        )
+        self.assertEqual(reads, [], "a function the worker thread can reach reads the environment itself")
+        # Not vacuous: the walk really reached the worker's own work and
+        # crossed into the shared hook modules.
+        reached = {name for module, name in visited if module == "handoff_sync"}
+        for expected in ("_locate", "_pointer_target", "_candidates", "_session_start", "_opted_out"):
+            self.assertIn(expected, reached)
+        self.assertIn(("_ingest_client", "IngestClient"), visited)
+        self.assertIn(("_identity", "memory_dir_key"), visited)
+        self.assertIn(("_identity", "project_key"), visited)
+        # identity_drift is reached through the run-captured container_id,
+        # not through a fresh _identity.container_id() on the worker.
+        self.assertIn(("_hook_state", "read_state_at"), visited)
+
+    def test_the_same_walk_does_find_main_s_own_reads(self):
+        """The control: main() -- on the calling thread -- is where the
+        reads moved to, and the same analysis that finds none on the
+        worker path finds them there."""
+        reads, _visited = _environment_reads_reachable_from([("handoff_sync", "main")])
+        in_main = {read for module, function, read, _line in reads if (module, function) == ("handoff_sync", "main")}
+        self.assertIn("os.environ", in_main)
+        reached = {r[:3] for r in reads}
+        self.assertIn(("_hook_state", "state_root", "os.environ"), reached)
+        self.assertIn(("_identity", "container_id", "os.environ"), reached)
+        self.assertIn(("_identity", "aria_uuid", "os.path.expanduser"), reached)
+
+    def test_a_read_reintroduced_on_the_worker_path_is_caught(self):
+        """The mutation control (memory_sync's own test_each_way_back_in_
+        is_caught, one case): a late token read in _collect is found by
+        the same walk that finds none today."""
+        import ast as _ast
+        tree = _parse_hook_module("handoff_sync")
+        defs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+        defs["_collect"].body.insert(1, _ast.parse('os.environ.get("NEXUS_API_TOKEN")').body[0])
+        roots = _worker_entry_points(tree)
+        reads, _visited = _environment_reads_reachable_from(
+            [("handoff_sync", r) for r in roots], {"handoff_sync": tree}
+        )
+        self.assertIn(("handoff_sync", "_collect", "os.environ", mock.ANY), reads)
 
 
 if __name__ == "__main__":
