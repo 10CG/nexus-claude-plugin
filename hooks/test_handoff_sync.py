@@ -2012,6 +2012,19 @@ class _WriteCase(unittest.TestCase):
         with open(aria_file, "w", encoding="utf-8") as fh:
             fh.write(f"uuid: {LOCAL_UUID}\nlabel:\n")
         self._patch(mock.patch.object(_identity, "ARIA_CONTAINER_ID_FILE", aria_file))
+        # A9-1: a transcript whose earliest timestamped record (09:59:00)
+        # sits within the attribution tolerance of the default fixture's
+        # updated-at (10:00:00) -- so the default round attributes its row
+        # to the payload session and every pre-A9-1 expectation about
+        # metadata.session_id keeps its meaning. Includes the two real
+        # shapes A9-1's oracle handles: leading records with no timestamp,
+        # and out-of-order early timestamps.
+        self.transcript = os.path.join(self.tmp.name, "transcript.jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "mode", "mode": "default"}) + "\n")
+            fh.write(json.dumps({"type": "user", "timestamp": "2026-09-20T09:59:30.000Z"}) + "\n")
+            fh.write(json.dumps({"type": "user", "timestamp": "2026-09-20T09:59:00.000Z"}) + "\n")
+            fh.write(json.dumps({"type": "assistant", "timestamp": "2026-09-20T10:01:00.000Z"}) + "\n")
 
     def _patch(self, patcher):
         patcher.start()
@@ -2030,11 +2043,14 @@ class _WriteCase(unittest.TestCase):
             frontmatter, _body = _MOD._split_frontmatter(fh.read())
         return _MOD._build_metadata(session_id, BRANCH, frontmatter, LOCAL_UUID)
 
-    def _run(self, session_id="sess-1", **extra_env):
+    def _run(self, session_id="sess-1", event=None, **extra_env):
         env = {"NEXUS_API_URL": self.backend.url, "NEXUS_HOOK_STATE_DIR": self.state_dir,
                "NEXUS_DEFAULT_USER_ID": USER}
         env.update(extra_env)
-        return _run_main(_MOD, {"cwd": self.cwd, "session_id": session_id}, env)
+        payload = {"cwd": self.cwd, "session_id": session_id,
+                   "transcript_path": self.transcript}
+        payload.update(event or {})
+        return _run_main(_MOD, payload, env)
 
     @property
     def requests(self):
@@ -2696,12 +2712,18 @@ class TestWritePath(_WriteCase):
         if "abcd@db-host" not in result:
             self.assertNotIn("nexus:abcd", result)
 
-    def test_session_id_missing_is_loud_and_writes_nothing(self):
+    def test_session_id_missing_goes_in_under_the_synthetic_id(self):
+        """A9-1 supersedes the pre-A9 loud guard for a payload without a
+        session_id (the client's `session_summary without session_id`
+        check in _ingest_client.upsert still exists as the belt): the
+        ruling's else-branch is exactly "cannot attribute" -- the row goes
+        in under the synthetic id instead of writing nothing."""
         self._write("2026-09-20-1000-x.md")
-        with mock.patch("sys.stderr"):
-            self._run(session_id=None)
-        self.assertEqual(self.requests, [])
-        self.assertEqual(self._last_entry()["reason"], "unknown")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id=None)
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(self._last_entry()["reason"], "none")
 
     def test_identity_drift_reports_once(self):
         self._write("2026-09-20-1000-x.md")
@@ -3501,19 +3523,95 @@ class TestWritePath(_WriteCase):
         self.assertEqual(self.requests[1]["json"]["metadata"]["aria.track_id"], "carry-x")
         self.assertEqual(self._last_entry()["reason"], "none")
 
-    def test_session_attribution_is_the_ingesting_session_not_the_documents_own(self):
-        """Ruling 1 (TASK-005 R1 fix round, R1-c03): metadata.session_id is
-        always the CURRENT SessionEnd's session_id, never anything derived
-        from the handoff document itself -- there is nothing in a handoff
-        document that could tell us which session originally wrote it. This
-        is deliberate, not an oversight (see Amendment A9); a change here
-        must be deliberate, not incidental.
-        """
-        self._write("2026-09-20-1000-x.md", updated_at="2020-01-01T00:00:00Z")  # written long "ago"
+    def test_session_attribution_is_the_ingesting_session_when_the_handoff_is_that_sessions_own(self):
+        """A9-1 (owner ruling 2026-10-01) GATES the pre-A9 behaviour this
+        test used to pin unconditionally (R1-c03: always the CURRENT
+        SessionEnd's session_id): the current session's id is used only
+        when the document provably belongs to it -- frontmatter updated-at
+        not earlier than the transcript's earliest timestamp minus the
+        minutes-level tolerance. The default fixture's 10:00 updated-at
+        against the transcript's 09:59 start qualifies, so a session that
+        wrote (or rewrote) the handoff it syncs still owns the row, and
+        the aggregator's ``owned_episode`` skip still fires for exactly
+        that session."""
+        self._write("2026-09-20-1000-x.md")  # updated_at 10:00, transcript starts 09:59
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="this-very-session")
         meta = self.requests[1]["json"]["metadata"]
         self.assertEqual(meta["session_id"], "this-very-session")
+        self.assertEqual(self._last_entry()["attribution"], "session")
+
+    def test_an_older_handoff_goes_in_under_the_synthetic_id(self):
+        """A9-1's other leg: a document demonstrably written BEFORE this
+        session started (the default transcript starts 09:59; this
+        document predates it by months) never borrows the ending session's
+        id -- once created, session_id can never be corrected, and a wrong
+        one would permanently suppress that session's own aggregated
+        summary. The synthetic id hangs the row off no real session; the
+        session's own summary is unaffected."""
+        self._write("2026-09-20-1000-x.md", updated_at="2020-01-01T00:00:00Z")  # written long "ago"
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="this-very-session")
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(self._last_entry()["attribution"], "synthetic")
+
+    def test_a_missing_transcript_goes_in_under_the_synthetic_id(self):
+        """A9-1 rule 3: an unreadable or absent transcript is "cannot
+        prove" -- the synthetic id, never a guess."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(event={"transcript_path": None})
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+
+    def test_a_transcript_with_no_timestamped_record_goes_in_under_the_synthetic_id(self):
+        """Same rule, different shape: a readable transcript whose records
+        carry no timestamp at all (the leading no-timestamp records are
+        exactly this) proves nothing about the session start."""
+        bare = os.path.join(self.tmp.name, "bare-transcript.jsonl")
+        with open(bare, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "mode", "mode": "default"}) + "\n")
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(event={"transcript_path": bare})
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+
+    def test_the_attribution_tolerance_boundary_is_inclusive(self):
+        """updated-at EXACTLY session-start minus tolerance still belongs
+        to the session (the corpus rounds to :00, and the boundary case of
+        the ruling's own wording: 不早于「会话起点减容差」)."""
+        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T09:57:00Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="boundary-session")
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "boundary-session")
+        # one second past the boundary flips to the synthetic id
+        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T09:56:59Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
+        self._run(session_id="boundary-session")
+        meta = self.requests[3]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
+
+    def test_a_failed_write_leaves_a_later_session_on_the_synthetic_id(self):
+        """A9-1's S1/S2 fixture: S1 chose the document (real attribution)
+        but its write failed; S2 -- a LATER session, same document still
+        untouched -- retries and must NOT hang the row on ITS session id:
+        the document predates S2's start, so the retry goes in under the
+        synthetic id and S2's own summary stays free to generate."""
+        self._write("2026-09-20-1000-x.md")  # 10:00; S1's transcript starts 09:59
+        self.backend.reply(500, {"detail": "boom"})  # S1: the write fails
+        self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "http_error")
+        # S2: hours later -- a transcript that starts well after 10:00.
+        s2_transcript = os.path.join(self.tmp.name, "s2.jsonl")
+        with open(s2_transcript, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "user", "timestamp": "2026-09-20T14:00:00.000Z"}) + "\n")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-2", event={"transcript_path": s2_transcript})
+        meta = self.requests[2]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "handoff:docs/handoff/2026-09-20-1000-x.md")
 
     def test_owner_container_frontmatter_value_is_recorded_on_identity_unresolved(self):
         """R1-c10's courtesy, carried through the A9-2 rewrite: the ledger

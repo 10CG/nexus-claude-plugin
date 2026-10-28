@@ -63,6 +63,7 @@ import socket
 import stat
 import sys
 import time
+from datetime import timedelta
 
 # Siblings are imported by name, which only works while this file's directory
 # is on sys.path. PYTHONSAFEPATH=1 / `python -P` (3.11+) takes it off, and
@@ -211,6 +212,12 @@ _LEDGER_BUDGET_SECONDS = 2.0
 # refusal path, and, with the ledger budget, stay under the host's
 # timeout.
 _WORK_BUDGET_SECONDS = 20.0
+
+# A9-1 (owner ruling 2026-10-01): minutes-or-more attribution tolerance. The
+# corpus motivation: 52 of 112 handoffs with an updated-at carry a :00 second
+# -- humans rounding when writing frontmatter by hand -- so the window must
+# absorb minute-level rounding, comfortably. 120s.
+_ATTRIBUTION_TOLERANCE_SECONDS = 120
 # IngestClient's own `deadline` sits this far inside the work budget, so the
 # client can refuse a request it would not finish in time rather than the
 # work-budget thread being abandoned mid-call with nothing recorded at all.
@@ -1356,6 +1363,47 @@ def _short(text, cap=200):
     return str(text)[:cap]
 
 
+def _session_start(transcript_path):
+    """The EARLIEST timestamp in this session's transcript, or ``None``.
+
+    A9-1's session-start oracle: the earliest TIMESTAMPED record of the
+    transcript SessionEnd hands us. The first few records (mode /
+    permission-mode / file-history-snapshot) carry no timestamp at all, and
+    the first two user records of one real session were observed OUT OF
+    ORDER -- so this is a minimum over every parsed timestamp, not "the
+    first one seen". One linear pass, no JSON parse of lines that cannot
+    hold the key.
+
+    ``None`` means "cannot prove" -- unreadable path, missing file, no
+    timestamped record at all -- and the caller's A9-1 rule sends that to
+    the synthetic-id attribution, never a guess: once a row is created its
+    session_id can never be corrected (an IDENTITY_KEY, §3.2), and a
+    wrongly-attributed real session_id would additionally suppress that
+    session's own aggregated summary for good (the aggregator's
+    ``owned_episode`` skip).
+    """
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    earliest = None
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"timestamp"' not in line:
+                    continue  # cannot hold the key: skip the json.loads
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                ts = _parse_instant(entry.get("timestamp"))
+                if ts is not None and (earliest is None or ts < earliest):
+                    earliest = ts
+    except OSError:
+        return None
+    return earliest
+
+
 # ── the work ─────────────────────────────────────────────────────────────
 
 def _collect(run):
@@ -1387,7 +1435,7 @@ def _collect(run):
     if not base_url:
         return "not_configured"  # the default for a fresh install; do nothing else
 
-    session_id = event.get("session_id")
+    payload_session_id = event.get("session_id")
 
     # A9-2/A9-3: the identity bundle `_locate` groups candidates by. Read
     # here for now; the env-once round (P1 discipline, same as the other
@@ -1451,6 +1499,35 @@ def _collect(run):
     content = _cap_for_wire(content)  # R2-c08: the cap must hold post-redaction too
 
     # ---- write path: owner + content both passed ----
+    # A9-1 (owner ruling 2026-10-01, 套餐 A 时间窗门控 + 合成 id 兜底): the
+    # row's session_id is THIS session's id only when the document provably
+    # belongs to it -- frontmatter updated-at not earlier than the session's
+    # transcript start minus the minutes-level tolerance. Anything else --
+    # an older document (a write that failed earlier, a first-round backlog,
+    # a document this session never touched), an unreadable or absent
+    # transcript, a missing payload session_id, an unparseable updated-at --
+    # is "cannot prove", and the row goes in under the synthetic id
+    # ``handoff:<external_id>``, hanging off no real session: that session's
+    # own aggregated summary is unaffected (two rows for one session, the
+    # accepted cost of the late sync), and the synthetic row can never steal
+    # a session's summary slot. branch stays the run's branch in BOTH cases
+    # (the document itself carries none, and an absent branch makes the row
+    # near-unfindable in the branch-scoped injection query). Recorded in
+    # extra as ``attribution`` (session|synthetic); no new reason.
+    transcript_start = _session_start(event.get("transcript_path"))
+    updated_at = _parse_instant(frontmatter.get("updated-at"))
+    if (
+        isinstance(payload_session_id, str) and payload_session_id
+        and transcript_start is not None
+        and updated_at is not None
+        and updated_at >= transcript_start - timedelta(seconds=_ATTRIBUTION_TOLERANCE_SECONDS)
+    ):
+        session_id = payload_session_id
+        run["extra"]["attribution"] = "session"
+    else:
+        session_id = f"handoff:{external_id}"
+        run["extra"]["attribution"] = "synthetic"
+
     # X1-policy (TASK-007): project scope for the episode's metadata. The
     # git-source fallback is ledger-reported for the same reason as in
     # session_capture: a silent fallback would look "env-resolved" forever.
