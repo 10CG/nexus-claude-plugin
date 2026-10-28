@@ -627,10 +627,18 @@ class TestProjectKey(unittest.TestCase):
 
     def test_linked_worktree_resolves_to_main_worktree(self):
         """A session started in a linked worktree reports the MAIN worktree's
-        basename, so both worktrees of one checkout answer the same."""
+        basename, so both worktrees of one checkout answer the same. The
+        commit carries INLINE identity (the CI runner's container has no
+        global git identity -- a bare `git commit` exits 128 there; same
+        convention as `_repo_with_a_commit` below and test_handoff_sync's
+        TestCurrentBranchForwarding fixture)."""
         main = self._repo("handoff-project")
         subprocess.run(
-            ["git", "-C", main, "commit", "-q", "--allow-empty", "-m", "init"],
+            [
+                "git", "-C", main,
+                "-c", "user.name=test", "-c", "user.email=test@example.com",
+                "commit", "-q", "--allow-empty", "-m", "init",
+            ],
             check=True, capture_output=True,
         )
         linked = os.path.join(self._tmp.name, "linked")
