@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """SessionEnd handoff-ingestion hook for the nexus-memory plugin (workflow B,
 change 2 TASK-005): ingests the project's own, most recent Aria session
-handoff -- most recent project-wide, NOT most recent among the ones this
-container owns (R1-c07: locate never filters by owner; ownership is checked
-only AFTER the single newest candidate has already been picked, and a miss
-there ends the run in ``not_owner``, not a search for an older document this
-container does own -- Amendment A9) -- as a ``layer=session_summary`` episode
+handoff -- most recent AMONG THE ONES THIS CONTAINER OWNS (Amendment A9-2,
+owner ruling 2026-10-01: candidates are grouped by ``owner-container`` into
+own / others / uncertain before any selection; the pre-A9 R1-c07 behaviour
+picked the newest project-wide first and only then checked ownership, so a
+shared ``latest.md`` pointer at the OTHER container's document silenced this
+container's own ingestion under a quiet ``not_owner`` for weeks) -- as a
+``layer=session_summary`` episode
 (``docs/architecture/memory-layers.md`` §3.2), the same layer the session
 aggregator writes for an auto-summarised session -- a human-authored handoff
 is just another episode with ``aria.source=handoff`` provenance instead of an
 aggregator hash.
 
-One SessionEnd run ingests at most ONE handoff document: the project's own
-``docs/handoff/latest.md`` pointer, or -- when that pointer is absent,
-mismatched or stale -- whichever candidate's frontmatter ``updated-at`` is
-newest (Amendment A4-5, owner ruling 2026-09-21).
+One SessionEnd run ingests at most ONE handoff document: the ``latest.md``
+pointer (text or symlink, A9-23) when it resolves to a document of this
+container's own group, or -- otherwise -- whichever OWN-group candidate's
+frontmatter ``updated-at`` is newest (Amendment A4-5, owner ruling
+2026-09-21; A9-2).
 
 Design contract (proposal ``memory-layer-contract-and-aria-structured-
 ingestion`` workflow B; handoff format ``standards/conventions/session-
@@ -56,9 +59,11 @@ handoff.md`` §2.2 / §2.3):
 import json
 import os
 import re
+import socket
 import stat
 import sys
 import time
+from datetime import timedelta
 
 # Siblings are imported by name, which only works while this file's directory
 # is on sys.path. PYTHONSAFEPATH=1 / `python -P` (3.11+) takes it off, and
@@ -207,6 +212,12 @@ _LEDGER_BUDGET_SECONDS = 2.0
 # refusal path, and, with the ledger budget, stay under the host's
 # timeout.
 _WORK_BUDGET_SECONDS = 20.0
+
+# A9-1 (owner ruling 2026-10-01): minutes-or-more attribution tolerance. The
+# corpus motivation: 52 of 112 handoffs with an updated-at carry a :00 second
+# -- humans rounding when writing frontmatter by hand -- so the window must
+# absorb minute-level rounding, comfortably. 120s.
+_ATTRIBUTION_TOLERANCE_SECONDS = 120
 # IngestClient's own `deadline` sits this far inside the work budget, so the
 # client can refuse a request it would not finish in time rather than the
 # work-budget thread being abandoned mid-call with nothing recorded at all.
@@ -307,7 +318,11 @@ def _candidates(handoff_dir):
     self-referential symlink), a per-entry permission problem -- as opposed
     to one that is simply GONE by the time this loop reaches it (listed a
     moment ago, unlinked since: an ordinary race, R2-c03's own reading,
-    kept for that case alone). The two used to be indistinguishable by
+    kept for that case alone). Since A9-19 (owner ruling 2026-10-01) each
+    entry carries its OWN bound exception -- ``(name, OSError)`` pairs, the
+    error type no longer discarded at the ``except`` site -- because the
+    fallback-scan report writes "which entry, what error" into the detail.
+    The two used to be indistinguishable by
     exception type: ``os.stat`` follows symlinks, so both a vanished entry
     and a dangling one raise the identical ``FileNotFoundError``. Filtering
     with ``os.path.isfile`` directly (rather than ``os.stat`` + `S_ISREG``
@@ -338,19 +353,19 @@ def _candidates(handoff_dir):
     except NotADirectoryError:
         return [], []
     out = []
-    undecidable = []
+    undecidable = []  # (name, exception) pairs -- A9-19 binds the error
     for name in names:
         if name.upper() in _HANDOFF_EXCLUDED_NAMES_UPPER or not name.endswith(".md"):
             continue
         path = os.path.join(handoff_dir, name)
         try:
             is_file = stat.S_ISREG(os.stat(path).st_mode)
-        except OSError:
+        except OSError as stat_exc:
             try:
                 os.lstat(path)
             except FileNotFoundError:
                 continue  # gone even at the symlink-entry level: a real race
-            except OSError:
+            except OSError as lstat_exc:
                 # R4-c01: EACCES / EIO / ESTALE etc. on the lstat call
                 # itself -- as opposed to FileNotFoundError -- is NOT "gone
                 # by the time we looked": something is still there and this
@@ -362,17 +377,23 @@ def _candidates(handoff_dir):
                 # test_handoff_sync.py's TestLocate:
                 # test_an_unstattable_candidate_entry_is_pointer_
                 # unresolved_not_quiet (mocked) and its real_chmod sibling
-                # pin THIS branch alone; test_an_unstattable_candidates_
-                # own_lstat_failure_does_not_sabotage_a_healthy_sibling
-                # (R5-c06) additionally pins that ONE such entry does not
-                # take a healthy sibling candidate down with it). The old
-                # code read ANY OSError here the same as FileNotFoundError,
-                # quietly dropping the candidate and, if it was the only
-                # one, landing on `no_handoff` -- exactly the silent stop
-                # ruling 5 / ruling 13 rule out. Falls through to the same
-                # `undecidable.append` below as a successful lstat does.
-                pass
-            undecidable.append(name)
+                # pin THIS branch alone). The old code read ANY OSError
+                # here the same as FileNotFoundError, quietly dropping the
+                # candidate and, if it was the only one, landing on
+                # `no_handoff` -- exactly the silent stop ruling 5 /
+                # ruling 13 rule out. The lstat exception is the one bound
+                # on this leg: it is the error that proves "still there
+                # but unresolvable".
+                undecidable.append((name, lstat_exc))
+                continue
+            # A dangling / ELOOP symlink (lstat SUCCEEDS, only the
+            # following stat fails): the entry itself is really there. The
+            # stat exception is the binding one on this leg -- the errors
+            # differ per leg (dangling is FileNotFoundError, ELOOP is
+            # OSError), and A9-19's whole-round report writes that type
+            # into the detail so a reader can tell a deleted-neighbour
+            # case from a permission case without reproducing the run.
+            undecidable.append((name, stat_exc))
             continue
         if is_file:
             out.append(name)
@@ -391,26 +412,43 @@ def _pointer_target(handoff_dir):
     perfectly readable ``latest.md``).
 
     ``unresolved``, when not ``None``, is a short description of why
-    ``latest.md`` itself could not be resolved at all -- a dangling or
-    self-referential (``ELOOP``) symlink, a directory, a permission error, a
-    stale handle (R5-c01). This is a DIFFERENT shape from "no pointer": a
-    project that genuinely keeps no ``latest.md`` must stay quiet, but one
-    whose ``latest.md`` exists in SOME form and cannot be resolved must not
-    have that read failure silently reinterpreted as "no pointer" -- the
-    old ``os.path.isfile`` check folded both into the exact same ``False``,
-    so the newest-``updated-at`` fallback below ran anyway and could
-    silently pick a DIFFERENT document than the one the (unreadable)
-    pointer might actually have named -- exactly the silent which-document
-    swap ruling 13 forbids, and the same shape R4-c03 already closes one
-    level down (an EXPLICIT pointer TARGET landing in ``undecidable``) --
-    this is the pointer FILE itself being unresolvable. The caller
-    (``_locate``) decides what an ``unresolved`` result means: with two or
-    more ``*.md`` entries it could have named -- resolvable candidates and
-    undecidable ones counted together (R6-c01) -- it reports
+    ``latest.md`` itself could not be resolved at all -- a directory, a
+    permission error, a stale handle (R5-c01). This is a DIFFERENT shape
+    from "no pointer": a project that genuinely keeps no ``latest.md`` must
+    stay quiet, but one whose ``latest.md`` exists in SOME form and cannot
+    be resolved must not have that read failure silently reinterpreted as
+    "no pointer" -- the old ``os.path.isfile`` check folded both into the
+    exact same ``False``, so the newest-``updated-at`` fallback below ran
+    anyway and could silently pick a DIFFERENT document than the one the
+    (unreadable) pointer might actually have named -- exactly the silent
+    which-document swap ruling 13 forbids, and the same shape R4-c03
+    already closes one level down (an EXPLICIT pointer TARGET landing in
+    ``undecidable``) -- this is the pointer FILE itself being unresolvable.
+    The caller (``_locate``) decides what an ``unresolved`` result means:
+    with two or more ``*.md`` entries it could have named -- resolvable
+    candidates and undecidable ones counted together (R6-c01) -- it reports
     ``pointer_unresolved`` (guessing could ingest the wrong one); only with
     exactly ONE such entry in total is there nothing else ``latest.md``
     could have named, so that leg falls through unchanged and quiet
     (R2-c13's FIFO fixture stays green).
+
+    A9-23 (owner ruling 2026-10-01, option A 当指针) adds the SYMLINK
+    shape, Aether's real layout: a symlink ``latest.md`` is the pointer
+    ITSELF whenever its fully-resolved path (both sides realpath'd) lands
+    in ``docs/handoff``'s top level -- its basename is returned as
+    ``target`` and judged by the caller exactly like a text pointer's. A
+    dangling or looping symlink is decided by its LINK TEXT
+    (``os.readlink``, which never follows): a text resolving into the
+    directory top level and naming an ``undecidable`` entry reports through
+    the caller's R4-c03 branch; anything else -- outside the directory, a
+    subdirectory, an excluded name -- is the quiet "points at a
+    non-candidate" fallback, NOT an ``unresolved`` error (the pre-A9 code
+    reported the ELOOP/dangling ``repr`` here every single session;
+    R6-c09: that report never prevented a wrong pick anyway). A healthy
+    symlink pointing OUTSIDE the top level (at a pointer file elsewhere, or
+    into a subdirectory) is NOT the pointer: the target's CONTENT is read
+    and the ``**Latest**:`` line searched there, exactly the pre-A9
+    behaviour for those shapes.
 
     ``os.lstat`` -- not ``os.path.isfile``, which this replaces -- is
     checked FIRST specifically so a genuinely ABSENT ``latest.md``
@@ -428,8 +466,9 @@ def _pointer_target(handoff_dir):
     (R1-c13: ``stat()`` reads metadata only, it does not wait for a writer
     the way opening a FIFO does -- confirmed empirically against R2-c13's
     own FIFO fixture). Anything other than a regular file at that point (a
-    directory, FIFO, device, or a dangling/looping symlink ``stat`` itself
-    cannot resolve) is ``unresolved`` and is never opened.
+    directory, FIFO, or device node; dangling/looping symlinks no longer
+    reach this leg -- A9-23 decides them by link text above) is
+    ``unresolved`` and is never opened.
 
     The read itself is capped (``_MAX_DOCUMENT_CHARS``) for the same reason
     a regular file that is merely huge must not be read in full just to
@@ -437,7 +476,7 @@ def _pointer_target(handoff_dir):
     """
     path = os.path.join(handoff_dir, _LATEST_MD)
     try:
-        os.lstat(path)
+        link_stat = os.lstat(path)
     except FileNotFoundError:
         return None, None  # the ordinary case: no latest.md at all
     except OSError as exc:
@@ -445,9 +484,71 @@ def _pointer_target(handoff_dir):
         # existence check itself fail -- same "cannot tell" shape as the
         # two legs below, just caught one step earlier.
         return None, f"{exc!r}"
+    if stat.S_ISLNK(link_stat.st_mode):
+        # A9-23 (owner ruling 2026-10-01, option A 当指针): a SYMLINK
+        # latest.md is Aether's real layout (a git-tracked mode-120000
+        # link, repointed by hand each session close) and is treated as
+        # the pointer itself whenever it resolves into docs/handoff's TOP
+        # LEVEL -- both sides realpath'd, so the judgement is by FULL
+        # PATH, never bare basename (a basename-only check would mis-match
+        # a top-level document sharing the name of a subdirectory target,
+        # and would break the healthy-symlink-to-a-pointer-FILE case the
+        # content read below still handles). The returned basename is then
+        # judged by _locate exactly like a text pointer's: a candidate ->
+        # use it; an undecidable entry -> pointer_unresolved (R4-c03); in
+        # no list -> the same quiet fallback as an ordinary pointer naming
+        # a nonexistent file.
+        try:
+            os.stat(path)  # does the whole chain resolve? (result unused: only failure matters)
+        except OSError:
+            # Dangling or looping chain -- including the case where the
+            # link names an entry that exists but is itself unresolvable
+            # (its own stat failure propagates up the chain). A9-23:
+            # decide by the LINK TEXT (os.readlink never follows), NOT by
+            # the error -- the pre-A9 code returned the ELOOP/FileNotFoundError
+            # repr as `unresolved` here and this fired EVERY session
+            # (R6-c09: the report never prevented a wrong pick anyway).
+            try:
+                text = os.readlink(path)
+            except OSError as exc:
+                return None, f"{exc!r}"
+            lexically = os.path.normpath(
+                text if os.path.isabs(text) else os.path.join(handoff_dir, text)
+            )
+            # R1 review (post_implementation): the DIRECTORY half of the
+            # joined path is resolved (realpath), the BASENAME half stays
+            # lexical -- never realpath the whole thing: realpath resolves
+            # THROUGH a final dangling symlink and hands back the TARGET's
+            # path, which would quietly re-route a link naming a top-level
+            # undecidable entry away from the R4-c03 report; and never
+            # compare a lexical dirname against a realpath'd directory (a
+            # handoff_dir behind a symlink component never compares equal).
+            try:
+                resolved_parent = os.path.realpath(os.path.dirname(lexically))
+                real_dir = os.path.realpath(handoff_dir)
+            except OSError:
+                resolved_parent, real_dir = os.path.dirname(lexically), handoff_dir
+            if resolved_parent == real_dir:
+                return os.path.basename(lexically), None
+            # Names something outside the directory / in a subdirectory /
+            # an excluded name: in NO list, the quiet "points at a
+            # non-candidate" fallback.
+            return None, None
+        # Healthy chain: resolve fully and compare directories.
+        try:
+            resolved_path = os.path.realpath(path)
+            real_dir = os.path.realpath(handoff_dir)
+        except OSError as exc:
+            return None, f"{exc!r}"
+        if os.path.dirname(resolved_path) == real_dir:
+            return os.path.basename(resolved_path), None
+        # A healthy symlink pointing OUTSIDE the directory (at a pointer
+        # file elsewhere) or INTO a subdirectory (a document there): not
+        # the pointer -- fall through and read the link's TARGET CONTENT,
+        # exactly the pre-A9 behaviour for these shapes.
     try:
         resolved = os.stat(path)
-    except OSError as exc:  # a dangling or self-referential (ELOOP) symlink
+    except OSError as exc:  # unreachable for a symlink chain that resolved above
         return None, f"{exc!r}"
     if not stat.S_ISREG(resolved.st_mode):
         # A directory, FIFO, device node, socket: something IS configured
@@ -488,10 +589,76 @@ def _probe_frontmatter(path):
     return frontmatter
 
 
-def _locate(handoff_dir, extra=None):
+_GROUP_OWN = "own"
+_GROUP_OTHERS = "others"
+_GROUP_UNCERTAIN = "uncertain"
+
+
+def _owner_group(frontmatter, identity):
+    """``"own"`` / ``"others"`` / ``"uncertain"`` -- A9-2's three-way
+    grouping of one candidate by its ``owner-container``, judged against
+    ``identity`` (``{"uuid", "hostname", "label"}``, captured by the
+    caller and handed in as data -- this function never touches the
+    environment).
+
+    ``own``: the second segment is uuid-shaped and equals the local aria
+    uuid -- this container wrote it. ``others``: a uuid that differs, or a
+    non-uuid second segment that equals NEITHER the hostname NOR the
+    non-empty label (A9-3: clearly somebody else's machine -- a quiet
+    ``not_owner``, not the every-session ``identity_unresolved`` the
+    pre-A9 code recorded). ``uncertain``: everything that might still be
+    THIS machine in a historical state -- a missing ``owner-container`` (or
+    no parseable frontmatter at all), or a non-uuid second segment equal to
+    the hostname or the non-empty label (Aria's ``get_container_id`` used
+    to write exactly that before uuid pinning). The distinction is the
+    whole point: "uncertain" candidates must never be silently passed over
+    as if they were somebody else's (TASK-001 C1), so the selection rules
+    in ``_locate`` treat a newer uncertain candidate, or an empty own group
+    with uncertain candidates present, as ``identity_unresolved``.
+    """
+    raw = frontmatter.get("owner-container")
+    if not isinstance(raw, str) or not raw.strip():
+        return _GROUP_UNCERTAIN
+    doc_uuid = _identity.owner_container_uuid(raw)
+    if doc_uuid is not None:
+        return _GROUP_OWN if doc_uuid == identity["uuid"] else _GROUP_OTHERS
+    # A9-3: non-uuid second segment -- one cheap local comparison splits
+    # "clearly someone else's machine" (others, quiet) from "possibly this
+    # machine before uuid pinning" (uncertain, reportable). Case folded on
+    # both sides (aria_label lowercases its half for the same reason).
+    second = raw.rsplit("/", 1)[-1].strip().lower()
+    if not second:
+        return _GROUP_UNCERTAIN  # an owner half with no uuid half at all: "missing"
+    hostname = (identity["hostname"] or "").lower()
+    label = (identity["label"] or "").lower()
+    if second == hostname or (label and second == label):
+        return _GROUP_UNCERTAIN
+    return _GROUP_OTHERS
+
+
+def _locate(handoff_dir, extra=None, *, identity):
     """``(name, reason)``: the candidate filename (inside ``handoff_dir``) to
     ingest, or a reason when none could be located. Exactly one of the two
     is non-``None``.
+
+    ``identity`` (A9-2, required keyword) is ``{"uuid": str-or-None,
+    "hostname": str, "label": str-or-None}`` -- the local container's aria
+    uuid, hostname and aria label, captured by the CALLER and handed in as
+    data (never read here: this function runs on the round worker thread,
+    and environment/filesystem identity reads belong to the calling thread
+    -- the same env-once discipline the other SessionEnd hooks follow).
+    It drives the A9-2 owner grouping: candidates are grouped into
+    own/others/uncertain BEFORE any selection, a pointer is only followed
+    to an own-group document (a pointer at somebody else's document
+    selects this container's own newest instead -- the fix for shared
+    latest.md pointers, which used to silence this container's ingestion
+    under a quiet ``not_owner``), an uncertain-group document blocks with
+    ``identity_unresolved`` rather than being quietly passed over
+    (TASK-001 C1), and the no-pointer fallback compares the OWN group's
+    newest ``updated-at`` while a NEWER uncertain candidate blocks the
+    pick. The caller additionally returns ``not_owner`` (quiet) when every
+    candidate is provably somebody else's and ``identity_unresolved`` when
+    none are provably ours but some might be.
 
     Amendment A4-5 (owner ruling 2026-09-21): a project with no handoff
     directory, or one with nothing but a pointer and/or a README in it, is
@@ -509,15 +676,18 @@ def _locate(handoff_dir, extra=None):
     ``_candidates``'s ``undecidable`` list (a dangling symlink, ``ELOOP``)
     is "something was configured here, none of it could be resolved" --
     the same ``pointer_unresolved`` leg, not the quiet one, even though
-    ``listdir`` itself succeeded. When there is no pointer naming one of
-    them specifically, a directory with SOME resolvable candidates
-    alongside an undecidable one is not held back by the latter for the
-    FALLBACK scan below: it is simply left out of the newest-``updated-at``
-    comparison, the same as any other document this run cannot see (owner
-    question A9 row c18 -- R4 post_implementation audit -- covers whether
-    that silent exclusion is the right call; unchanged here). A pointer
-    that names one of them EXPLICITLY is a different case, handled before
-    the fallback scan even starts (R4-c03): silently substituting an
+    ``listdir`` itself succeeded. A9-19 (owner ruling 2026-10-01, closing
+    the old A9 row c18) adds the third shape: a directory with SOME
+    resolvable candidates alongside an undecidable one DOES hold back the
+    FALLBACK scan below -- the unstattable entry may be exactly the newest
+    document, so the whole round reports ``pointer_unresolved`` naming the
+    entry and its error type (the pre-A9 code silently left it out of the
+    newest-``updated-at`` comparison). A WORKING pointer that resolves to
+    a resolvable candidate bypasses that scan entirely, so an undecidable
+    SIBLING does not sink a round whose choice was never in doubt. A
+    pointer that names an undecidable entry EXPLICITLY is a different
+    case, handled before the fallback scan even starts (R4-c03): silently
+    substituting an
     older, merely-readable sibling for the specific document latest.md
     points at is exactly the silent which-document swap ruling 13 forbids,
     so that path reports ``pointer_unresolved`` instead.
@@ -585,15 +755,18 @@ def _locate(handoff_dir, extra=None):
         # Every listed *.md entry was undecidable (R3-c05): something WAS
         # kept here, so this is the loud "cannot tell" leg, not "nothing
         # here" -- the same distinction ruling 5 draws for an unlistable
-        # directory, one level down.
+        # directory, one level down. A9-19: the per-entry error types ride
+        # along (a dangling neighbour and a permission loss read the same
+        # without them).
         detail = (
             f"{len(undecidable)} candidate(s) in docs/handoff could not be resolved: "
-            f"{', '.join(undecidable)}"
+            + ", ".join(f"{name} ({exc!r})" for name, exc in undecidable)
         )
         if extra is not None:
             extra["detail"] = _short(detail)
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
+    undecidable_by_name = dict(undecidable)
     target, pointer_unresolved = _pointer_target(handoff_dir)
     if pointer_unresolved is not None and len(candidates) + len(undecidable) > 1:
         # R5-c01 / ruling 13: latest.md exists in SOME form but could not
@@ -631,25 +804,105 @@ def _locate(handoff_dir, extra=None):
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
     if target in candidates:  # None never matches a real filename
-        return target, None
-    if target is not None and target in undecidable:
+        # A9-2 (owner ruling 2026-10-01): a pointer is only ever followed
+        # to a document THIS container wrote -- the pre-A9 code followed it
+        # unconditionally and then failed the owner check, which is exactly
+        # how a shared pointer (nexus's latest.md pointing at the OTHER
+        # container's handoff) silenced this container's own ingestion for
+        # weeks: not_owner, a skip, zero requests, never reported beyond
+        # the ledger.
+        if identity["uuid"] is None:
+            # Same "cannot tell" as the old owner check: the LOCAL side is
+            # unreadable, so even a pointer-resolved candidate cannot be
+            # judged. Reportable, never a silent skip.
+            detail = "local aria uuid could not be determined"
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "identity_unresolved"
+        try:
+            target_frontmatter = _probe_frontmatter(os.path.join(handoff_dir, target))
+        except OSError as exc:
+            # R3-c06 for the pointed document specifically.
+            detail = f"{target}: pointer target could not be read: {exc!r}"
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "pointer_unresolved"
+        target_group = _owner_group(target_frontmatter, identity)
+        if target_group == _GROUP_OWN:
+            return target, None
+        if target_group == _GROUP_UNCERTAIN:
+            # A9-2: the pointer names a document whose ownership cannot be
+            # decided -- silently passing over it for this container's
+            # (older) own document would be exactly the C1 quiet-stop, so
+            # this reports instead.
+            detail = (
+                f"{target}: owner-container unresolved "
+                f"({target_frontmatter.get('owner-container')!r})"
+            )
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "identity_unresolved"
+        # _GROUP_OTHERS: fall through to the own-group newest scan below.
+    if target is not None and target in undecidable_by_name:
         # R4-c03 / ruling 13: latest.md explicitly names this entry, and it
         # IS listed -- just unresolved (a dangling symlink, ELOOP, a
         # per-entry permission problem). Falling through to the
         # newest-updated-at scan below would silently ingest a DIFFERENT,
         # older document instead of the one the pointer actually names,
         # with a clean-looking ledger row: exactly the silent
-        # which-document swap ruling 13 forbids. This is deliberately
-        # narrower than the fallback scan a few lines down (owner question
-        # A9 row c18): only an EXPLICIT pointer resolving to an
-        # undecidable entry fails loud here; the no-pointer fallback still
-        # simply leaves an undecidable sibling out of the comparison.
-        detail = f"{target}: pointer target could not be resolved"
+        # which-document swap ruling 13 forbids. A9-23 reaches this same
+        # branch with a symlink latest.md whose LINK TEXT names the
+        # undecidable entry (the dangling chain propagates the target's
+        # own stat failure, so the readlink leg returns its basename).
+        # A9-19: the bound error type rides along in the detail.
+        detail = (
+            f"{target}: pointer target could not be resolved "
+            f"({undecidable_by_name[target]!r})"
+        )
         if extra is not None:
             extra["detail"] = _short(detail)
         _warn(f"[{HOOK}] {detail}")
         return None, "pointer_unresolved"
-    newest_name, newest_ts = None, None
+    if undecidable:
+        # A9-19 (owner ruling 2026-10-01, option A 全报): this point is
+        # only reached when NO usable pointer resolved (none at all, or
+        # one naming a non-candidate or another container's document), so
+        # the choice below is about to be made by the newest-`updated-at`
+        # fallback scan -- and an entry that cannot even be stat-ed may be
+        # exactly the NEWEST document (own or not -- its owner cannot be
+        # read either), silently excluded from that comparison. The other
+        # three "cannot tell" shapes (unlistable directory,
+        # all-undecidable, latest.md itself unresolved) already report;
+        # this used to be the one quiet hold-out, and "bad entry count 1
+        # vs 2" decided whether the same damage reported or not. The whole
+        # round reports, the detail naming each entry and its error type.
+        # A WORKING pointer to an OWN document (the branch above) bypasses
+        # this scan entirely, which is the one shape A9-19 spares: a bad
+        # sibling must not sink a round whose choice was never in doubt.
+        detail = (
+            f"{len(undecidable)} candidate(s) in docs/handoff could not be resolved: "
+            + ", ".join(f"{name} ({exc!r})" for name, exc in undecidable)
+        )
+        if extra is not None:
+            extra["detail"] = _short(detail)
+        _warn(f"[{HOOK}] {detail}")
+        return None, "pointer_unresolved"
+    if identity["uuid"] is None:
+        # Same check as the pointer branch, for the scan path: nothing can
+        # be grouped without the local uuid.
+        detail = "local aria uuid could not be determined"
+        if extra is not None:
+            extra["detail"] = _short(detail)
+        _warn(f"[{HOOK}] {detail}")
+        return None, "identity_unresolved"
+    # A9-2's grouped scan: the fallback comparison runs over the OWN group
+    # only -- every candidate is still probed (a newer UNCERTAIN candidate
+    # blocks the pick below), while OTHERS are simply not in the running,
+    # which is what fixes the shared-pointer shape end to end.
+    own, uncertain = [], []  # own: (name, ts); uncertain: (name, ts, raw owner)
     for name in candidates:
         try:
             frontmatter = _probe_frontmatter(os.path.join(handoff_dir, name))
@@ -666,10 +919,67 @@ def _locate(handoff_dir, extra=None):
                 extra["detail"] = _short(detail)
             _warn(f"[{HOOK}] {detail}")
             return None, "pointer_unresolved"
+        group = _owner_group(frontmatter, identity)
         ts = _parse_instant(frontmatter.get("updated-at"))
+        if group == _GROUP_OWN:
+            own.append((name, ts))
+        elif group == _GROUP_UNCERTAIN:
+            # The RAW owner value rides along (R1-c10): "which document,
+            # which value was the problem", without reproducing the run.
+            uncertain.append((name, ts, frontmatter.get("owner-container")))
+    if not own:
+        if uncertain:
+            # A9-2: nothing here is provably this container's, and
+            # something MIGHT be (uncertain) -- that is TASK-001 C1's
+            # reportable case, not a quiet not_owner. R6-c02's courtesy
+            # survives the A9-2 rewrite: when latest.md was ALSO broken
+            # (single-entry exemption let this scan run anyway), naming
+            # both files sends whoever reads the detail to fix the right
+            # one(s), not just the frontmatter.
+            parts = []
+            if pointer_unresolved is not None:
+                parts.append(f"latest.md: {pointer_unresolved}")
+            # R1 review: the [:5] slice is bounded, but the BOUND must be
+            # visible -- 40 uncertain candidates reporting 5 silently is
+            # exactly the ledger-quietly-lying shape this file keeps closing.
+            # R2 review: the count rides in its OWN extra key, never inside
+            # the detail string -- detail passes through _short's 200-char
+            # cap, and an inline marker appended before the cap was measured
+            # to arrive HALF-CUT ("(+35 ") with real-length names, which is
+            # worse than no marker. A separate key is never truncated.
+            if extra is not None:
+                extra["uncertain_candidates"] = len(uncertain)
+            parts.append(
+                "no own-container candidate; unresolved owner-container: "
+                + ", ".join(f"{name}({raw!r})" for name, _ts, raw in uncertain[:5])
+            )
+            detail = "; ".join(parts)
+            if extra is not None:
+                extra["detail"] = _short(detail)
+            _warn(f"[{HOOK}] {detail}")
+            return None, "identity_unresolved"
+        return None, "not_owner"  # every candidate is provably somebody else's: quiet
+    newest_name, newest_ts = None, None
+    for name, ts in own:
         if ts is not None and (newest_ts is None or ts > newest_ts):
             newest_name, newest_ts = name, ts
     if newest_name:
+        for _name, ts, _raw in uncertain:
+            # A9-2: an uncertain candidate that is NEWER than the own-group
+            # pick blocks it -- it may be this container's own newest
+            # document with an unparseable/legacy owner field. Uncertain
+            # candidates with no comparable timestamp do NOT block (the
+            # corpus: nexus's 20 uncertain candidates are all old documents
+            # that must not hold the round hostage).
+            if ts is not None and ts > newest_ts:
+                detail = (
+                    f"newer unresolved owner-container candidate than the own-group pick: "
+                    f"{_name}"
+                )
+                if extra is not None:
+                    extra["detail"] = _short(detail)
+                _warn(f"[{HOOK}] {detail}")
+                return None, "identity_unresolved"
         return newest_name, None
     # R6-c02: `pointer_unresolved`, when set, was computed by `_pointer_
     # target` above and then DELIBERATELY not acted on yet -- the
@@ -687,8 +997,8 @@ def _locate(handoff_dir, extra=None):
         detail = f"latest.md: {pointer_unresolved}"
     else:
         detail = (
-            f"{len(candidates)} candidate(s) in docs/handoff, none with a parseable "
-            f"updated-at and no pointer resolved to one"
+            f"{len(own)} own-container candidate(s) in docs/handoff, none with a "
+            f"parseable updated-at and no pointer resolved to one"
         )
     if extra is not None:
         extra["detail"] = _short(detail)
@@ -753,10 +1063,22 @@ _parse_instant = _ingest_client._parse_instant
 
 
 def _opted_out(frontmatter):
-    """True when ``nexus-ingest`` selects the opt-out (R1-c05, TASK-005 R1
-    fix round; quoted values R2-c02). Strips a trailing inline ``# reason``
-    comment, then -- same as ``_split_frontmatter`` -- one level of matching
-    quotes, before normalising case and comparing -- this frontmatter
+    """``"skip"`` / ``"allow"`` / ``"unparsable"`` -- the A9-5 three-state
+    reading of ``nexus-ingest`` (owner ruling 2026-10-01, 发版前修改).
+
+    ``skip`` / ``false`` / ``no`` / ``off`` / ``0`` are the opt-out (the
+    author's clear intent in every spelling -- the pre-A9 code ingested the
+    last four of these and the ledger row looked clean); ``true`` / ``yes``
+    / ``on`` / ``1`` upload; EVERY OTHER value -- including the empty
+    string once normalised -- is ``"unparsable"``: this key exists only to
+    let the author control the upload, so an unrecognised value must not
+    read as permission. The caller records the existing failure reason
+    ``file_unparsable`` (no new reason) with the ORIGINAL value in the
+    detail, reported every session until the value is fixed.
+
+    Normalisation is unchanged from R1-c05 / R2-c02: strip a trailing
+    inline ``# reason`` comment, then -- same as ``_split_frontmatter`` --
+    one level of matching quotes, before normalising case. This frontmatter
     dialect is flat ``key: string`` only (session-handoff.md §2.3.8.3;
     Aria's own simple parser keeps an inline comment verbatim on the value
     exactly like ``_split_frontmatter`` above does), so ``Skip`` / ``SKIP``
@@ -772,18 +1094,19 @@ def _opted_out(frontmatter):
     a human editing frontmatter by hand is likely to use) reaches here
     still wearing its quotes, comment removed but quotes intact, and used
     to compare unequal to the bare word ``skip``.
-
-    Only the literal ``skip`` is recognised once normalised: ``false`` /
-    ``no`` / ``off`` are left ingesting, an open question for Amendment A9,
-    not a guess made here.
     """
     value = frontmatter.get("nexus-ingest")
     if not isinstance(value, str):
-        return False
+        return "allow"  # key absent: nothing was opted, upload is the default
     value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         value = value[1:-1]
-    return value.strip().lower() == "skip"
+    value = value.strip().lower()
+    if value in ("skip", "false", "no", "off", "0"):
+        return "skip"
+    if value in ("true", "yes", "on", "1"):
+        return "allow"
+    return "unparsable"  # the caller puts the ORIGINAL frontmatter value in the detail
 
 
 # ── content: H1 -> §6 -> §2, capped ─────────────────────────────────────
@@ -1015,7 +1338,7 @@ def _external_id(root, doc_path):
     return rel.replace(os.sep, "/")
 
 
-def _build_metadata(session_id, branch, frontmatter, owner_container_uuid):
+def _build_metadata(session_id, branch, frontmatter, owner_container_uuid, project=None):
     """§3.2 + Amendment A8-1's ``aria.*`` set for this row. ``branch`` and
     each ``aria.*`` key are omitted when the source value is absent (a PATCH
     is a shallow merge; sending nothing for a key leaves the stored value
@@ -1030,6 +1353,14 @@ def _build_metadata(session_id, branch, frontmatter, owner_container_uuid):
     metadata = {"session_id": session_id, "aria.source": "handoff"}
     if branch:
         metadata["branch"] = branch
+    # X1-policy (TASK-007): the project scope key. Without it a handoff
+    # episode fails the read side's row-by-row `metadata.project` check (the
+    # D filters by project) and would be dropped as filter_suspect even in
+    # its own project. Same derivation as session_capture/memory_sync:
+    # _identity.project_key, CLAUDE_PROJECT_DIR first, git-toplevel fallback
+    # reported by the caller.
+    if project:
+        metadata["project"] = project
     if frontmatter.get("track-id"):
         metadata["aria.track_id"] = frontmatter["track-id"]
     if owner_container_uuid:
@@ -1050,6 +1381,47 @@ def _short(text, cap=200):
     if not text:
         return None
     return str(text)[:cap]
+
+
+def _session_start(transcript_path):
+    """The EARLIEST timestamp in this session's transcript, or ``None``.
+
+    A9-1's session-start oracle: the earliest TIMESTAMPED record of the
+    transcript SessionEnd hands us. The first few records (mode /
+    permission-mode / file-history-snapshot) carry no timestamp at all, and
+    the first two user records of one real session were observed OUT OF
+    ORDER -- so this is a minimum over every parsed timestamp, not "the
+    first one seen". One linear pass, no JSON parse of lines that cannot
+    hold the key.
+
+    ``None`` means "cannot prove" -- unreadable path, missing file, no
+    timestamped record at all -- and the caller's A9-1 rule sends that to
+    the synthetic-id attribution, never a guess: once a row is created its
+    session_id can never be corrected (an IDENTITY_KEY, §3.2), and a
+    wrongly-attributed real session_id would additionally suppress that
+    session's own aggregated summary for good (the aggregator's
+    ``owned_episode`` skip).
+    """
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    earliest = None
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"timestamp"' not in line:
+                    continue  # cannot hold the key: skip the json.loads
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                ts = _parse_instant(entry.get("timestamp"))
+                if ts is not None and (earliest is None or ts < earliest):
+                    earliest = ts
+    except OSError:
+        return None
+    return earliest
 
 
 # ── the work ─────────────────────────────────────────────────────────────
@@ -1079,17 +1451,29 @@ def _collect(run):
         run["cwd"] = event["cwd"]
     cwd = run["cwd"] or os.getcwd()
 
-    base_url = os.environ.get("NEXUS_API_URL", "").rstrip("/")
+    base_url = run["base_url"]
     if not base_url:
         return "not_configured"  # the default for a fresh install; do nothing else
 
-    session_id = event.get("session_id")
+    payload_session_id = event.get("session_id")
+
+    # A9-2/A9-3: the identity bundle `_locate` groups candidates by. P1
+    # (TASK-013, the same env-once discipline the other two SessionEnd
+    # hooks follow): every input here was read ONCE by main(), on the
+    # calling thread, before this worker started -- aria_uuid/aria_label
+    # expanduser HOME, gethostname can raise, and this thread is one
+    # run_with_deadline can only ABANDON, never kill.
+    identity = {
+        "uuid": run["aria_uuid"],
+        "hostname": run["hostname"],
+        "label": run["aria_label"],
+    }
 
     toplevel, degraded = _identity.project_root(cwd)
     root = toplevel or cwd
     handoff_dir = os.path.join(root, "docs", "handoff")
 
-    name, locate_reason = _locate(handoff_dir, run["extra"])
+    name, locate_reason = _locate(handoff_dir, run["extra"], identity=identity)
     if locate_reason:
         return locate_reason
     doc_path = os.path.join(handoff_dir, name)
@@ -1097,7 +1481,16 @@ def _collect(run):
     # (R1-c10, ruling 9): every reason from here on, write path or not, now
     # says WHICH handoff it was about, instead of only the ones that reached
     # a successful upsert.
-    external_id = _external_id(root, doc_path)
+    # X1 (owner 2026-10-01; A10-12 (2): reuse _identity.memory_dir_key):
+    # every external_id this hook writes carries the Claude Code project
+    # directory key as a prefix -- with user_id now pinning the PERSON
+    # (X1-policy, 2026-10-14), all of one user's projects share a pool, and
+    # two projects' same-named handoffs would otherwise PATCH each other's
+    # rows. The prefix derivation is the SAME single definition memory_sync
+    # keys its external_ids, memory directory and state file by; a degraded
+    # key never reaches the wire (identity_degraded refuses the write).
+    key, _key_degraded = _identity.memory_dir_key(cwd)
+    external_id = f"{key}/{_external_id(root, doc_path)}"
     run["extra"]["external_id"] = external_id
     try:
         with open(doc_path, encoding="utf-8", errors="replace") as fh:
@@ -1110,23 +1503,26 @@ def _collect(run):
 
     frontmatter, body = _split_frontmatter(text)
 
-    if _opted_out(frontmatter):
-        return "opted_out"  # checked before the owner check (§3.2 recovery path)
+    opt_out = _opted_out(frontmatter)
+    if opt_out == "skip":
+        return "opted_out"  # §3.2 recovery path: the owner check already passed in _locate
+    if opt_out == "unparsable":
+        # A9-5 (owner 2026-10-01): an unrecognised value is a refusal, not
+        # permission. file_unparsable is already in the failure table, so
+        # no new reason and no new table entry -- and the ORIGINAL value
+        # goes in the detail, so whoever reads the ledger can fix the
+        # document without reproducing the run.
+        raw_value = frontmatter.get("nexus-ingest")
+        run["extra"]["detail"] = _short(f"nexus-ingest={raw_value!r} is not a recognised value")
+        _warn(f"[{HOOK}] {run['extra']['detail']}")
+        return "file_unparsable"
 
-    local_uuid = _identity.aria_uuid()
+    # A9-2: the owner check has ALREADY passed -- `_locate` only ever
+    # hands back a document of this container's OWN group (a local uuid
+    # that could not be determined, or a not-provably-somebody-else's
+    # document, exits there with identity_unresolved / not_owner). The
+    # document's own uuid half is still needed for aria.owner_container.
     doc_uuid = _identity.owner_container_uuid(frontmatter.get("owner-container"))
-    if local_uuid is None or doc_uuid is None:
-        # Never silently `not_owner`: uuid could not be determined on either
-        # side, which is a different (and reportable) condition from "this
-        # is someone else's handoff". A pointer-resolved candidate whose
-        # frontmatter simply lacks `owner-container` falls through to here
-        # too -- it does not get a free pass on the owner check. The raw
-        # frontmatter value (R1-c10) says which of the two sides was the
-        # problem without having to reproduce the run to find out.
-        run["extra"]["detail"] = _short(f"owner-container={frontmatter.get('owner-container')!r}")
-        return "identity_unresolved"
-    if local_uuid != doc_uuid:
-        return "not_owner"
 
     content, content_reason = _build_content(body)
     if content_reason:
@@ -1134,13 +1530,53 @@ def _collect(run):
     content = _cap_for_wire(content)  # R2-c08: the cap must hold post-redaction too
 
     # ---- write path: owner + content both passed ----
-    metadata = _build_metadata(session_id, _current_branch(cwd), frontmatter, doc_uuid)
+    # A9-1 (owner ruling 2026-10-01, 套餐 A 时间窗门控 + 合成 id 兜底): the
+    # row's session_id is THIS session's id only when the document provably
+    # belongs to it -- frontmatter updated-at not earlier than the session's
+    # transcript start minus the minutes-level tolerance. Anything else --
+    # an older document (a write that failed earlier, a first-round backlog,
+    # a document this session never touched), an unreadable or absent
+    # transcript, a missing payload session_id, an unparseable updated-at --
+    # is "cannot prove", and the row goes in under the synthetic id
+    # ``handoff:<external_id>``, hanging off no real session: that session's
+    # own aggregated summary is unaffected (two rows for one session, the
+    # accepted cost of the late sync), and the synthetic row can never steal
+    # a session's summary slot. branch stays the run's branch in BOTH cases
+    # (the document itself carries none, and an absent branch makes the row
+    # near-unfindable in the branch-scoped injection query). Recorded in
+    # extra as ``attribution`` (session|synthetic); no new reason.
+    transcript_start = _session_start(event.get("transcript_path"))
+    updated_at = _parse_instant(frontmatter.get("updated-at"))
+    if (
+        isinstance(payload_session_id, str) and payload_session_id
+        and transcript_start is not None
+        and updated_at is not None
+        and updated_at >= transcript_start - timedelta(seconds=_ATTRIBUTION_TOLERANCE_SECONDS)
+    ):
+        session_id = payload_session_id
+        run["extra"]["attribution"] = "session"
+    else:
+        session_id = f"handoff:{external_id}"
+        run["extra"]["attribution"] = "synthetic"
 
-    state, _state_reasons = _hook_state.read_state(HOOK, cwd)
+    # X1-policy (TASK-007): project scope for the episode's metadata. The
+    # git-source fallback is ledger-reported for the same reason as in
+    # session_capture: a silent fallback would look "env-resolved" forever.
+    project, project_source = _identity.project_key(cwd, run["project_env"])
+    if project_source == _identity.PROJECT_SOURCE_GIT:
+        run["extra"]["project_source"] = "git_fallback"
+    metadata = _build_metadata(session_id, _current_branch(cwd), frontmatter, doc_uuid, project)
+
+    # P1: the state path resolved from the run's OWN state_root (read once
+    # by main()), never via read_state(HOOK, cwd) -- that form re-resolves
+    # state_root(), an environment read, on this worker thread. The joined
+    # path is byte-identical to _hook_state.state_path(HOOK, cwd).
+    state_path = os.path.join(run["state_root"], _identity.project_slug(cwd), f"{HOOK}.state.json")
+    state, _state_reasons = _hook_state.read_state_at(state_path)
     drift_reasons = _hook_state.identity_drift(
         previous=state.get("container_id"),
-        current=_identity.container_id(),
-        state_existed=_hook_state.state_exists(HOOK, cwd),
+        current=run["container_id"],
+        state_existed=os.path.exists(state_path),
     )
     if "identity_changed" in drift_reasons:
         # Recorded independently of the scalar `reason` this run ends on
@@ -1160,11 +1596,16 @@ def _collect(run):
         # `unknown` as the scalar `reason` either way.
         run["extra"]["identity_changed"] = True
 
+    # P1: token / container_id pre-read by main(); user_id INLINES
+    # _identity.user_id's own two-line body with the pre-captured override
+    # (calling the real one would read the environment on this thread when
+    # the override is None -- the same reason memory_sync inlines it).
+    user_id = run["default_user_id"] or _identity.project_slug(cwd)
     client = _ingest_client.IngestClient(
         base_url,
-        os.environ.get("NEXUS_API_TOKEN", ""),
-        _identity.user_id(cwd),
-        _identity.container_id(),
+        run["token"],
+        user_id,
+        run["container_id"],
         SOURCE_NAME,
         timeout=_HTTP_TIMEOUT_SECONDS,
         deadline=run["deadline"],
@@ -1380,6 +1821,43 @@ def main():
         "deadline": started + _WORK_BUDGET_SECONDS - _DEADLINE_SLACK_SECONDS,
     }
 
+    # P1 (TASK-013; the discipline memory_sync established with its own
+    # env-once round, review finding 6 of b3bb60d): every environment input
+    # the work below needs is read HERE, on THIS (the calling) thread,
+    # strictly before run_with_deadline starts the worker -- never inside
+    # _collect, which runs on a daemon thread run_with_deadline can only
+    # ABANDON, never kill. The worker reads every one of these back out of
+    # `run`; the static guard in test_handoff_sync walks the same call
+    # graph test_memory_sync's guard walks and fails on any environment
+    # read reachable from _collect. The list, in read order: the backend
+    # two, the state root (NEXUS_HOOK_STATE_DIR / expanduser), the user
+    # override, the container identity (NEXUS_CONTAINER_ID or the
+    # hostname), the A9-2/A9-3 bundle (aria uuid + label -- both
+    # expanduser HOME -- and the hostname again for the comparison), and
+    # CLAUDE_PROJECT_DIR for the X1-policy project key.
+    try:
+        run.update(
+            base_url=os.environ.get("NEXUS_API_URL", "").rstrip("/"),
+            token=os.environ.get("NEXUS_API_TOKEN", ""),
+            state_root=_hook_state.state_root(),
+            default_user_id=os.environ.get(_identity.DEFAULT_USER_ID_ENV),
+            container_id=_identity.container_id(),
+            aria_uuid=_identity.aria_uuid(),
+            aria_label=_identity.aria_label(),
+            hostname=socket.gethostname(),
+            project_env=os.environ.get(_identity.PROJECT_DIR_ENV),
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded below, exactly like a worker exception
+        # F3 (memory_sync's env-once review): a failure in these reads must
+        # not become an unrecorded, silent exit through __main__'s blanket
+        # handler -- it takes the SAME path a worker exception takes: an
+        # `unknown` row plus a stderr line.
+        outcome, left_behind = {"error": exc}, False
+    else:
+        outcome, left_behind = _hook_runner.run_with_deadline(
+            lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
+        )
+
     # _collect itself never calls print() DIRECTLY: the WORK stays off
     # stdio so an abandoned thread cannot interleave with anything main()
     # writes after giving up on it. Not quite absolute in practice, though
@@ -1393,9 +1871,8 @@ def main():
     # directly, and _ingest_client write to stderr from SEVERAL places
     # each -- the same "spooky abandoned thread" risk _hook_runner's own
     # docstring already names, not something this hook adds beyond it.
-    outcome, left_behind = _hook_runner.run_with_deadline(
-        lambda: _collect(run), _WORK_BUDGET_SECONDS, f"{HOOK}-work"
-    )
+    # (The run_with_deadline call itself now lives in the `else:` of the
+    # P1 pre-read above, mirroring memory_sync's F3 shape.)
 
     reason = "unknown"
     diagnostic = None

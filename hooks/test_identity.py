@@ -590,6 +590,154 @@ class TestPluginVersion(unittest.TestCase):
                 self.assertEqual(_identity.plugin_version(), good)
 
 
+class TestProjectKey(unittest.TestCase):
+    """X1-policy (owner 2026-10-14/17): the provenance `project` scope key.
+
+    CLAUDE_PROJECT_DIR wins (session startup dir, does not follow `cd`), a
+    linked worktree resolves to its MAIN worktree, and without the env var
+    the answer comes from the cwd git toplevel with source="git" so callers
+    can ledger-report the fallback.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        # _SLUG_CACHE is keyed by cwd; unique tmp dirs keep tests isolated,
+        # but clear our keys anyway so nothing leaks into later tests.
+        self._cache = _identity._SLUG_CACHE
+        self.addCleanup(self._cache.clear)
+
+    def _repo(self, name):
+        repo = os.path.join(self._tmp.name, name)
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        return repo
+
+    def test_env_dir_wins_over_cwd_repo(self):
+        """The env value is the session startup dir; a cwd that `cd`-ed into
+        a different repo must not change the answer."""
+        main = self._repo("nexus")
+        other = self._repo("somewhere-else")
+        env_dir = os.path.join(main, "sub")
+        os.makedirs(env_dir)
+        self.assertEqual(
+            _identity.project_key(other, env_dir),
+            ("nexus", _identity.PROJECT_SOURCE_ENV),
+        )
+
+    def test_linked_worktree_resolves_to_main_worktree(self):
+        """A session started in a linked worktree reports the MAIN worktree's
+        basename, so both worktrees of one checkout answer the same. The
+        commit carries INLINE identity (the CI runner's container has no
+        global git identity -- a bare `git commit` exits 128 there; same
+        convention as `_repo_with_a_commit` below and test_handoff_sync's
+        TestCurrentBranchForwarding fixture)."""
+        main = self._repo("handoff-project")
+        subprocess.run(
+            [
+                "git", "-C", main,
+                "-c", "user.name=test", "-c", "user.email=test@example.com",
+                "commit", "-q", "--allow-empty", "-m", "init",
+            ],
+            check=True, capture_output=True,
+        )
+        linked = os.path.join(self._tmp.name, "linked")
+        subprocess.run(
+            ["git", "-C", main, "worktree", "add", "-q", linked],
+            check=True, capture_output=True,
+        )
+        self.assertEqual(
+            _identity.project_key(linked, linked),
+            ("handoff-project", _identity.PROJECT_SOURCE_ENV),
+        )
+
+    def test_env_dir_outside_any_repo_uses_its_basename(self):
+        plain = os.path.join(self._tmp.name, "plain-project")
+        os.makedirs(plain)
+        cwd = self._repo("unrelated")
+        self.assertEqual(
+            _identity.project_key(cwd, plain),
+            ("plain-project", _identity.PROJECT_SOURCE_ENV),
+        )
+
+    def test_git_fallback_when_env_missing(self):
+        repo = self._repo("fallback-repo")
+        sub = os.path.join(repo, "deep")
+        os.makedirs(sub)
+        self.assertEqual(
+            _identity.project_key(sub, None),
+            ("fallback-repo", _identity.PROJECT_SOURCE_GIT),
+        )
+
+    def test_no_env_and_no_repo_is_none(self):
+        """Neither resolves: writers omit the key, the D omits the scoped
+        query entirely -- never an unscoped query that only looks scoped."""
+        nowhere = os.path.join(self._tmp.name, "no-repo-here")
+        os.makedirs(nowhere)
+        with mock.patch("subprocess.run", side_effect=OSError("no git")):
+            self.assertEqual(_identity.project_key(nowhere, None), (None, "git"))
+
+    def test_git_unreachable_with_env_set_still_answers_env(self):
+        with mock.patch("subprocess.run", side_effect=OSError("no git")):
+            self.assertEqual(
+                _identity.project_key("/any/cwd", "/sessions/some-project"),
+                ("some-project", _identity.PROJECT_SOURCE_ENV),
+            )
+
+
+class TestAriaLabel(unittest.TestCase):
+    """A9-3 (owner ruling 2026-10-01, package A): the ``label`` line of the
+    same container-id file aria_uuid reads -- a COMPARISON-ONLY read. A
+    handoff whose owner-container second segment is not uuid-shaped but
+    equals the hostname or the non-empty label is "possibly this machine in
+    a historical state" (uncertain), not "someone else's machine". The
+    label is never an identity itself (contrast aria_uuid's own docstring):
+    a non-empty label must not change what aria_uuid returns, and this
+    function must not be used anywhere except that one comparison."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, text):
+        path = os.path.join(self.tmp.name, "container-id")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_reads_the_label_line(self):
+        labelled = ARIA_FILE_SAMPLE.replace("label:", "label: devbox-A")
+        self.assertEqual(_identity.aria_label(self._write(labelled)), "devbox-a")
+
+    def test_empty_label_is_none_not_empty_string(self):
+        """The on-this-machine convention is an empty label; None (not "")
+        means "not participating in the comparison", so an empty label can
+        never equal a document's second segment (which is never empty when
+        it is compared at all)."""
+        self.assertIsNone(_identity.aria_label(self._write(ARIA_FILE_SAMPLE)))
+
+    def test_label_is_stripped(self):
+        self.assertEqual(_identity.aria_label(self._write("uuid: bfe8285d\nlabel:  devbox-A  \n")), "devbox-a")
+
+    def test_label_is_lowercased(self):
+        """The comparison in handoff_sync lowercases both sides, matching
+        owner_container_uuid/aria_uuid; the raw value must not arrive there
+        with different casing than the uuid half does."""
+        self.assertEqual(_identity.aria_label(self._write("label: DevBox-A\n")), "devbox-a")
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(_identity.aria_label(os.path.join(self.tmp.name, "nope")))
+
+    def test_no_label_line_is_none(self):
+        self.assertIsNone(_identity.aria_label(self._write("uuid: bfe8285d\n")))
+
+    def test_empty_label_value_is_none(self):
+        self.assertIsNone(_identity.aria_label(self._write("label:\nuuid: bfe8285d\n")))
+
+    def test_comment_mentioning_label_is_not_parsed(self):
+        self.assertIsNone(_identity.aria_label(self._write("# label: devbox-A is old\nuuid: bfe8285d\n")))
+
+
 class TestSourceHeader(unittest.TestCase):
     def test_shape_is_name_slash_version(self):
         with mock.patch.object(_identity, "plugin_version", return_value="9.9.9"):

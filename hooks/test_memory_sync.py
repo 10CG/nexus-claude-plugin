@@ -1263,6 +1263,61 @@ class TestR12RacilyCleanEntries(unittest.TestCase):
             time.tzset()
 
 
+
+class TestProjectKeyOnTheWire(unittest.TestCase):
+    """R1 review (post_implementation, qa lens): X1-policy's acceptance is
+    a CONSUMER-side claim -- the POSTed metadata["project"] equals what
+    _identity.project_key derives from the SAME cwd, and the git-source
+    fallback (no CLAUDE_PROJECT_DIR in the run env) is ledger-reported.
+    Unlike _WriteCase (a plain directory, where the key is legitimately
+    underivable and omitted), this harness is a REAL git repository, so
+    the derivation has something to derive."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.path.join(self.tmp.name, "proj")
+        os.makedirs(self.cwd)
+        # No commit needed: rev-parse --show-toplevel answers on a fresh
+        # init. Inline identity is likewise unneeded (nothing commits).
+        subprocess.run(["git", "init", "-q", self.cwd], check=True, capture_output=True)
+        self.state_dir = os.path.join(self.tmp.name, "state")
+        self.config_dir = os.path.join(self.tmp.name, "claude-config")
+        self.key, _degraded = _identity.memory_dir_key(self.cwd)
+        self.memory_dir = os.path.join(self.config_dir, "projects", self.key, "memory")
+        os.makedirs(self.memory_dir)
+        self.backend = _Backend()
+        self.addCleanup(self.backend.close)
+        self._patch(mock.patch.dict(os.environ, {"NEXUS_HOOK_STATE_DIR": self.state_dir}))
+
+    def _patch(self, patcher):
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @property
+    def requests(self):
+        return self.backend.requests
+
+    def test_the_wire_project_key_equals_the_derivation_and_the_git_fallback_is_ledgered(self):
+        _write_memory_file(self.memory_dir, "f1")
+        self.backend.reply(*_empty_lookup())
+        self.backend.reply(*_empty_lookup()).reply(*_created())
+        _run_main(self, _MOD, {"cwd": self.cwd}, {
+            "NEXUS_API_URL": self.backend.url,
+            "NEXUS_HOOK_STATE_DIR": self.state_dir,
+            "NEXUS_DEFAULT_USER_ID": USER,
+            "CLAUDE_CONFIG_DIR": self.config_dir,
+        })
+        posts = [r for r in self.requests if r["method"] == "POST"]
+        self.assertEqual(len(posts), 1, self.requests)
+        expected, source = _identity.project_key(self.cwd, None)
+        self.assertEqual(posts[0]["json"]["metadata"]["project"], expected)
+        self.assertEqual(source, _identity.PROJECT_SOURCE_GIT)
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
+        self.assertTrue(entries)
+        self.assertEqual(entries[-1]["project_source"], "git_fallback")
+
+
 class TestMetadataBuilding(unittest.TestCase):
     def test_includes_x1_keys_and_slug_and_modified_always(self):
         meta = _MOD._build_memory_metadata("-home-dev-nexus", "nexus", "my-slug", {}, "2026-01-01T00:00:00Z")
@@ -1280,6 +1335,20 @@ class TestMetadataBuilding(unittest.TestCase):
         self.assertEqual(meta["aria.memory_type"], "feedback")
         self.assertEqual(meta["aria.description"], "d")
         self.assertEqual(meta["aria.origin_session"], "s1")
+
+    def test_provenance_project_is_written_when_derived(self):
+        """X1-policy (TASK-007): these are fact-layer rows; the D's fact
+        delta queries them with project=<slug> and verifies metadata.project
+        row by row -- absent, they all read as filter_suspect."""
+        meta = _MOD._build_memory_metadata("k", "nexus", "slug", {}, "2026-01-01T00:00:00Z", project="nexus")
+        self.assertEqual(meta["project"], "nexus")
+        self.assertEqual(meta["aria.project"], "nexus")
+
+    def test_provenance_project_is_omitted_when_underivable(self):
+        meta = _MOD._build_memory_metadata("k", "nexus", "slug", {}, "2026-01-01T00:00:00Z", project=None)
+        self.assertNotIn("project", meta)
+        # aria.project keeps its historical always-a-string value either way
+        self.assertEqual(meta["aria.project"], "nexus")
 
 
 # ════════════════════════════════════════════════════════════════════════

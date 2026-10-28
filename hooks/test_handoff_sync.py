@@ -47,6 +47,15 @@ import _identity
 import _ingest_client
 import _redact
 
+# P1's static guard shares the AST machinery test_memory_sync built for its
+# own env-once round -- one implementation, two modules pinned by it. The
+# import is side-effect-free (constants and class definitions only).
+from test_memory_sync import (  # noqa: E402
+    _environment_reads_reachable_from,
+    _parse_hook_module,
+    _worker_entry_points,
+)
+
 _HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 _HOOK_SCRIPT = os.path.join(_HOOKS_DIR, "handoff_sync.py")
 
@@ -410,6 +419,12 @@ class _HandoffDirCase(unittest.TestCase):
         self.cwd = os.path.join(self.tmp.name, "proj")
         os.makedirs(self.cwd)
         self.handoff_dir = os.path.join(self.cwd, "docs", "handoff")
+        # A9-2/A9-3: the identity bundle _locate groups candidates by. A
+        # FIXED hostname, never the real one -- this suite's hostname-shaped
+        # fixtures (simonfish/dev-claude2) happen to be the dev machine's
+        # actual hostname, so a live read would make them pass here and fail
+        # on CI (A9-3's own pitfall note).
+        self.identity = {"uuid": LOCAL_UUID, "hostname": "ci-box", "label": None}
 
     def _mkdir(self):
         os.makedirs(self.handoff_dir, exist_ok=True)
@@ -423,13 +438,13 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")  # newer, not pointed to
         _write_latest_pointer(self.handoff_dir, "a.md")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_pointer_missing_falls_back_to_newest_updated_at(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_a_tie_in_updated_at_is_broken_by_filename(self):
         """R3-c11: `_locate`'s fallback keeps the FIRST candidate that beats
@@ -452,39 +467,39 @@ class TestLocate(_HandoffDirCase):
         with mock.patch.object(
             _MOD.os, "listdir", return_value=["z-owned-by-other.md", "a-owned-by-me.md"]
         ):
-            self.assertEqual(_MOD._locate(self.handoff_dir), ("a-owned-by-me.md", None))
+            self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a-owned-by-me.md", None))
 
     def test_multi_track_banner_without_a_pointer_falls_back(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         _write_latest_pointer(self.handoff_dir, "a.md", style="banner")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_arrow_style_pointer_falls_back(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         _write_latest_pointer(self.handoff_dir, "a.md", style="arrow")  # points at a, the OLDER one
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))  # arrow ignored -> newest wins
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))  # arrow ignored -> newest wins
 
     def test_pointer_to_a_non_candidate_falls_back(self):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         _write_latest_pointer(self.handoff_dir, "deleted-file.md")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_no_dir_is_no_handoff(self):
         self.assertFalse(os.path.isdir(self.handoff_dir))
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
     def test_only_latest_and_readme_is_no_handoff(self):
         self._mkdir()
         _write_latest_pointer(self.handoff_dir, "irrelevant.md")
         with open(os.path.join(self.handoff_dir, "README.md"), "w", encoding="utf-8") as fh:
             fh.write("# About this directory\n")
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
     def test_a_lowercase_readme_is_excluded_case_insensitively(self):
         """Ruling 6 (TASK-005 R1 fix round, R1-c12): the exclusion of
@@ -505,7 +520,7 @@ class TestLocate(_HandoffDirCase):
             fh.write("# About this directory\n")
         with open(os.path.join(self.handoff_dir, "LATEST.md"), "w", encoding="utf-8") as fh:
             fh.write("nothing useful\n")
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
     def test_pointer_target_with_a_directory_prefix_resolves_via_basename(self):
         """R1-c28: the Aria collector pattern's target group is normalised
@@ -523,7 +538,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")  # newer, not pointed to
         with open(os.path.join(self.handoff_dir, "latest.md"), "w", encoding="utf-8") as fh:
             fh.write("# Latest\n\n**Latest**: [a.md](docs/handoff/a.md)\n")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_an_unreadable_directory_is_pointer_unresolved_not_quiet(self):
         """Ruling 5 (TASK-005 R1 fix round, R1-c06): a docs/handoff directory
@@ -543,7 +558,7 @@ class TestLocate(_HandoffDirCase):
             self.skipTest("running as a user unaffected by chmod 000 (e.g. root)")
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
@@ -559,7 +574,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         with mock.patch.object(_MOD.os, "listdir", side_effect=PermissionError(13, "denied")), \
                 mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
@@ -600,7 +615,7 @@ class TestLocate(_HandoffDirCase):
                 with mock.patch.object(_MOD.os, "stat", side_effect=exc), \
                         mock.patch.object(_MOD.os, "lstat", side_effect=exc), \
                         mock.patch.object(sys, "stderr", stderr):
-                    result = _MOD._locate(self.handoff_dir)
+                    result = _MOD._locate(self.handoff_dir, identity=self.identity)
                 self.assertEqual(result, (None, "pointer_unresolved"))
                 self.assertIn("docs/handoff", stderr.getvalue())
 
@@ -627,30 +642,27 @@ class TestLocate(_HandoffDirCase):
             self.skipTest("running as a user unaffected by chmod (e.g. root)")
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("docs/handoff", stderr.getvalue())
 
-    def test_an_unstattable_candidates_own_lstat_failure_does_not_sabotage_a_healthy_sibling(self):
-        """R5-c06: mutating the lstat-OSError `pass` two tests above (R4-
-        c01, `_candidates`'s own per-entry `except OSError:` re-raising
-        instead of falling through to `undecidable.append`) passed the
-        WHOLE suite before this test existed (confirmed against a temp
-        copy) -- every existing fixture for that branch uses a SINGLE
-        candidate, so "that one entry becomes undecidable, landing on
-        pointer_unresolved" and "the whole listing re-raises, caught by
-        `_locate`'s OUTER except, ALSO landing on pointer_unresolved" are
-        indistinguishable: both produce the identical `(None,
-        "pointer_unresolved")` with "docs/handoff" in the stderr detail
-        either way. A second, HEALTHY candidate is what tells them apart
-        -- mirroring `test_a_single_eloop_entry_does_not_sabotage_other_
-        candidates` above, which already pins this for the SIBLING branch
-        (a dangling/looping symlink, where `os.lstat` itself SUCCEEDS and
-        only `os.stat` fails) -- this covers the one where `os.lstat`
-        ITSELF also raises a non-`FileNotFoundError` `OSError`."""
+    def test_an_unstattable_sibling_does_not_sabotage_a_pointer_hit(self):
+        """A9-19 (owner ruling 2026-10-01) FLIPPED the pre-A9 shape this
+        test used to pin (R5-c06: a bad entry not sinking the fallback
+        scan). Under the ruling, the FALLBACK scan reports any unstattable
+        entry whole-round -- so the old fixture (no pointer, EIO on a.md,
+        healthy b.md) is now `pointer_unresolved` by design, and the
+        correct thing left to pin is the shape the ruling spares: a
+        WORKING pointer names a healthy document, and one unstattable
+        sibling must not sink that round -- the directory is fine, the
+        choice was never in doubt (per R6 code-reviewer's suggested
+        fixture). lstat itself raising a non-FileNotFoundError OSError is
+        still the branch under test (R4-c01), just no longer on the
+        fallback-scan path."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "b.md")
         broken = os.path.abspath(os.path.join(self.handoff_dir, "a.md"))
         real_stat, real_lstat = os.stat, os.lstat
 
@@ -666,9 +678,9 @@ class TestLocate(_HandoffDirCase):
 
         with mock.patch.object(_MOD.os, "stat", side_effect=failing_stat), \
                 mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat):
-            result = _MOD._locate(self.handoff_dir)
-        # b.md must still resolve normally -- a.md's own unresolvable
-        # lstat must not take the whole directory listing down with it.
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
+        # latest.md names b.md: the unstattable a.md sibling never enters
+        # the comparison, so the round resolves b.md cleanly.
         self.assertEqual(result, ("b.md", None))
 
     def test_a_candidate_that_vanishes_at_both_stat_and_lstat_is_dropped_quietly(self):
@@ -697,7 +709,7 @@ class TestLocate(_HandoffDirCase):
         os.symlink(os.path.join(self.tmp.name, "does-not-exist"), self.handoff_dir)
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
 
     def test_a_dangling_md_symlink_candidate_is_pointer_unresolved_not_quiet(self):
@@ -717,7 +729,7 @@ class TestLocate(_HandoffDirCase):
         )
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("dangling.md", stderr.getvalue())
 
@@ -730,7 +742,7 @@ class TestLocate(_HandoffDirCase):
         never catches it, because the dangling link sits one level up."""
         docs = os.path.dirname(self.handoff_dir)
         os.symlink(os.path.join(self.tmp.name, "nonexistent-docs-target"), docs)
-        result = _MOD._locate(self.handoff_dir)
+        result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
 
     def test_a_valid_docs_symlink_without_a_handoff_dir_stays_quiet(self):
@@ -751,21 +763,59 @@ class TestLocate(_HandoffDirCase):
         real_target = os.path.join(self.tmp.name, "real-docs-target")
         os.makedirs(real_target)
         os.symlink(real_target, docs)
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
-    def test_a_single_eloop_entry_does_not_sabotage_other_candidates(self):
-        """R3-c05, third leg: a self-referential symlink (`ELOOP` on
-        `os.stat`) is neither `FileNotFoundError` (so the old per-entry
-        `except FileNotFoundError` never caught it at all) nor a
-        directory-level failure -- it used to escape `_candidates`
-        entirely, and `_locate`'s outer `except OSError` then read the
-        WHOLE directory as unresolved even though a perfectly good sibling
-        candidate sat right next to it."""
+    def test_a_single_eloop_entry_in_the_fallback_scan_is_pointer_unresolved_whole_round(self):
+        """A9-19 (owner ruling 2026-10-01, option A 全报): the no-pointer
+        fallback scan compares candidates by `updated-at` -- and an entry
+        that cannot even be stat-ed (here a self-referential symlink,
+        `ELOOP` on `os.stat`; EACCES / EIO / ESTALE are the same shape)
+        may be exactly the NEWEST document, silently excluded from the
+        comparison. The other three "cannot tell" shapes already report;
+        this used to be the one quiet hold-out (R3-c05 pinned that
+        silence, this flips it): the whole round is `pointer_unresolved`
+        and the detail names the entry and its error type."""
         self._mkdir()
         loop_path = os.path.join(self.handoff_dir, "loop.md")
         os.symlink(loop_path, loop_path)  # self-referential -> ELOOP on stat()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-20T10:00:00Z")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        extra = {}
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("loop.md", extra["detail"])
+        self.assertIn("OSError(", extra["detail"])  # the error TYPE travels with the name
+        self.assertIn("loop.md", stderr.getvalue())
+
+    def test_a_mocked_eio_entry_in_the_fallback_scan_is_pointer_unresolved_whole_round(self):
+        """A9-19, mocked-EIO twin (root-safe, the chmod-class convention):
+        the same whole-round report when the unstattable entry is an
+        injected `OSError(5)` on stat itself, not a constructible symlink
+        shape."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        broken = os.path.abspath(os.path.join(self.handoff_dir, "b.md"))
+        real_stat, real_lstat = os.stat, os.lstat
+
+        def failing_stat(path, *a, **kw):
+            if os.path.abspath(path) == broken:
+                raise OSError(5, "Input/output error")
+            return real_stat(path, *a, **kw)
+
+        def failing_lstat(path, *a, **kw):
+            if os.path.abspath(path) == broken:
+                raise OSError(5, "Input/output error")
+            return real_lstat(path, *a, **kw)
+
+        extra = {}
+        with mock.patch.object(_MOD.os, "stat", side_effect=failing_stat), \
+                mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat):
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("b.md", extra["detail"])
+        self.assertIn("OSError(", extra["detail"])
 
     def test_an_unreadable_newer_candidate_is_pointer_unresolved_not_a_silent_older_pick(self):
         """R3-c06: with no pointer, the fallback scan compares every
@@ -790,7 +840,7 @@ class TestLocate(_HandoffDirCase):
             self.skipTest("running as a user unaffected by chmod 000 (e.g. root)")
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("2026-09-20-new.md", stderr.getvalue())
         self.assertNotEqual(result, (os.path.basename(older), None))  # never silently the older one
@@ -818,7 +868,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open), \
                 mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir)
+            result = _MOD._locate(self.handoff_dir, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("2026-09-20-new.md", stderr.getvalue())
         self.assertNotEqual(result, (os.path.basename(older), None))  # never silently the older one
@@ -848,7 +898,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         extra = {}
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("2026-09-29-new.md", extra["detail"])
         self.assertIn("2026-09-29-new.md", stderr.getvalue())
@@ -882,7 +932,7 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         extra = {}
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", extra["detail"])
         self.assertIn("latest.md", stderr.getvalue())
@@ -912,16 +962,23 @@ class TestLocate(_HandoffDirCase):
         stderr = io.StringIO()
         with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open), \
                 mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", stderr.getvalue())
         self.assertIn("latest.md", extra["detail"])
         self.assertIn("OSError(", extra["detail"])
 
-    def test_a_dangling_latest_md_symlink_with_multiple_candidates_is_pointer_unresolved(self):
-        """R5-c01: latest.md ITSELF (not its target line's basename, R4-c03's
-        shape) is a dangling symlink -- `os.path.isfile` used to read that
-        as plain `False`, indistinguishable from no pointer file at all."""
+    def test_a_dangling_latest_md_symlink_with_multiple_candidates_falls_back_quietly(self):
+        """A9-23 (owner ruling 2026-10-01, option A 当指针) FLIPPED this
+        pre-A9 error (R5-c01). A dangling latest.md symlink is no longer
+        "latest.md itself unresolved" -- the LINK TEXT is read instead
+        (`os.readlink`), resolved against the directory, and when the
+        resolved path names no entry in any list (this link points
+        OUTSIDE the directory), that is the SAME shape as an ordinary
+        pointer naming a nonexistent file: quiet fallback to the newest
+        `updated-at`, not a failure every session. The dangling target may
+        simply be a deleted handoff nobody repointed at -- R6-c09's own
+        finding was that the error never prevented a wrong pick anyway."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
@@ -929,26 +986,117 @@ class TestLocate(_HandoffDirCase):
             os.path.join(self.tmp.name, "does-not-exist-target.md"),
             os.path.join(self.handoff_dir, "latest.md"),
         )
-        result = _MOD._locate(self.handoff_dir)
-        self.assertEqual(result, (None, "pointer_unresolved"))
+        result = _MOD._locate(self.handoff_dir, identity=self.identity)
+        self.assertEqual(result, ("b.md", None))
 
-    def test_a_self_referential_latest_md_symlink_with_multiple_candidates_is_pointer_unresolved(self):
-        """R5-c01: latest.md -> latest.md (ELOOP). `os.lstat` alone cannot
-        catch this (it does not follow the final component, so it succeeds
-        on the symlink entry itself) -- resolving what is really there
-        needs a FOLLOWING stat, which is where ELOOP actually surfaces.
-        R6-c07: also pins the diagnostic TEXT -- the `repr()` of the
-        `OSError` `os.stat` raises for ELOOP, not just that SOME failure
-        was reported."""
+    def test_a_self_referential_latest_md_symlink_with_multiple_candidates_falls_back_quietly(self):
+        """A9-23, the loop form of the same flip: latest.md -> latest.md.
+        The link text resolves to `latest.md` itself -- an excluded name,
+        in no candidate list -- so this too is "points at a non-candidate"
+        and falls back quietly (was `pointer_unresolved` with the ELOOP
+        repr before the ruling)."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         loop_path = os.path.join(self.handoff_dir, "latest.md")
         os.symlink(loop_path, loop_path)
+        result = _MOD._locate(self.handoff_dir, identity=self.identity)
+        self.assertEqual(result, ("b.md", None))
+
+    def test_a_healthy_latest_md_symlink_into_the_directory_is_a_pointer(self):
+        """A9-23's main shape -- Aether's real layout (docs/handoff/
+        latest.md is a git-tracked symlink, mode 120000, repointed by
+        hand every session close). The symlink IS the pointer when its
+        resolved full path (both sides realpath'd) lands in docs/handoff's
+        TOP LEVEL and names a candidate -- equal in authority to a text
+        pointer, so it may select an OLDER document than the newest-
+        updated-at fallback would have (latest.md is the human-maintained
+        semantic authority, mtime is only the fallback -- session-handoff
+        standard). The pre-A9 code read the TARGET's content here, found
+        no `**Latest**:` line in it, and fell back to mtime, which only
+        worked on Aether because the target happened to also be the
+        newest."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        os.symlink("a.md", os.path.join(self.handoff_dir, "latest.md"))  # names the OLDER one
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
+
+    def test_an_absolute_latest_md_symlink_into_the_directory_is_a_pointer(self):
+        """A9-23: the same judgement must not depend on the link text being
+        relative -- an absolute symlink resolving into the directory's top
+        level is the same pointer."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        b = _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        os.symlink(b, os.path.join(self.handoff_dir, "latest.md"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
+
+    def test_a_latest_md_symlink_pointing_into_a_subdirectory_does_not_mis_match_a_top_level_same_name(self):
+        """A9-23: the symlink-pointer judgement is by FULL PATH (both sides
+        realpath'd, directories compared), never by bare basename -- the
+        spec's original wording (`只取基名`) would have matched a top-level
+        document the link does not name and would also have broken R6-c06
+        (a symlink at a pointer FILE). A link into a subdirectory is NOT a
+        pointer; the link's target content is read instead (it holds no
+        `**Latest**:` line here), so the round falls back to the newest
+        top-level candidate -- which must not be x.md merely because the
+        subdirectory document shares its name."""
+        self._mkdir()
+        sub = os.path.join(self.handoff_dir, "sub")
+        os.makedirs(sub)
+        _write_handoff(self.handoff_dir, "x.md", updated_at="2026-09-05T00:00:00Z")
+        _write_handoff(self.handoff_dir, "z.md", updated_at="2026-09-20T00:00:00Z")
+        _write_handoff(sub, "x.md", updated_at="2026-09-25T00:00:00Z")
+        os.symlink("sub/x.md", os.path.join(self.handoff_dir, "latest.md"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("z.md", None))
+
+    def test_a_symlinked_handoff_dir_still_routes_the_link_text_to_the_undecidable_report(self):
+        """R1 review (post_implementation): the dangling-symlink judgement
+        must resolve BOTH sides -- a handoff_dir reached through a symlink
+        component (the lexical dirname would never equal the realpath'd
+        directory) used to send a link text naming a top-level undecidable
+        entry down the QUIET "points at a non-candidate" fallback instead
+        of the R4-c03 report. The A9-19 backstop still reported the entry
+        whole-round, but with a detail that named the entry instead of the
+        POINTER -- this pins the direct route ("pointer target could not
+        be resolved")."""
+        real = self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-target.md"),
+            os.path.join(self.handoff_dir, "gone.md"),
+        )
+        os.symlink("gone.md", os.path.join(self.handoff_dir, "latest.md"))
+        alias = os.path.join(self.tmp.name, "alias-handoff")
+        os.symlink(real, alias)
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        result = _MOD._locate(alias, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
-        self.assertIn("OSError(", extra["detail"])
+        self.assertIn("pointer target could not be resolved", extra["detail"])
+        self.assertIn("gone.md", extra["detail"])
+
+    def test_a_dangling_latest_md_symlink_whose_link_text_names_an_undecidable_entry_is_pointer_unresolved(self):
+        """A9-23's one loud leg for a dangling symlink: the link TEXT
+        resolves into the directory's top level and names an entry that is
+        listed but unresolvable (itself a dangling `*.md` symlink) -- the
+        same shape R4-c03 already closes for text pointers, caught via the
+        link text now: never silently ingest something else."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
+        os.symlink(
+            os.path.join(self.tmp.name, "does-not-exist-target.md"),
+            os.path.join(self.handoff_dir, "gone.md"),
+        )
+        os.symlink("gone.md", os.path.join(self.handoff_dir, "latest.md"))
+        extra = {}
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "pointer_unresolved"))
+        self.assertIn("gone.md", extra["detail"])
+        self.assertIn("gone.md", stderr.getvalue())
 
     def test_a_directory_named_latest_md_with_multiple_candidates_is_pointer_unresolved(self):
         """R5-c01: a directory named latest.md is confirmed by `os.lstat`
@@ -963,7 +1111,7 @@ class TestLocate(_HandoffDirCase):
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("not a regular file", extra["detail"])
 
@@ -981,7 +1129,7 @@ class TestLocate(_HandoffDirCase):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_an_unresolved_latest_md_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
         """R6-c01: the exemption above counts ONLY `candidates`, the
@@ -1007,14 +1155,18 @@ class TestLocate(_HandoffDirCase):
         )
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", extra["detail"])
 
     def test_a_dangling_latest_md_symlink_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
-        """R6-c01, second form: `latest.md` ITSELF a dangling symlink (as
-        opposed to the undecidable `*.md` SIBLING entry) -- a different
-        path through the same exemption as the directory form above."""
+        """R6-c01's shape, A9-19's outcome: the dangling latest.md symlink
+        itself now falls back QUIETLY (A9-23 -- its link text names an
+        outside path, in no list), but the fallback scan then meets the
+        undecidable `b.md` sibling -- and A9-19's whole-round report fires
+        with the NEW口径 detail: the ENTRY name and its error type, no
+        longer `latest.md`. Still `pointer_unresolved`, by a different
+        route and with a detail that names the thing to fix."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         os.symlink(
@@ -1026,9 +1178,10 @@ class TestLocate(_HandoffDirCase):
             os.path.join(self.handoff_dir, "latest.md"),
         )
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
-        self.assertIn("latest.md", extra["detail"])
+        self.assertIn("b.md", extra["detail"])
+        self.assertIn("FileNotFoundError", extra["detail"])
 
     def test_a_mocked_read_failure_on_latest_md_with_a_single_candidate_and_an_undecidable_sibling_is_pointer_unresolved(self):
         """R6-c01, third form: injected via a mocked `open` (root-safe,
@@ -1050,32 +1203,32 @@ class TestLocate(_HandoffDirCase):
 
         extra = {}
         with mock.patch.object(_MOD, "open", create=True, side_effect=failing_open):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("latest.md", extra["detail"])
 
     def test_an_unresolved_latest_mds_single_candidate_with_no_parseable_updated_at_still_names_latest_md_in_detail(self):
-        """R6-c02: the single-entry exemption falls through with
-        `target=None` (never a real filename) to the newest-`updated-at`
-        scan -- so when the lone candidate ALSO has no parseable
-        `updated-at`, this run reaches `_locate`'s OWN final "none with a
-        parseable updated-at" exit. That exit used to build its `detail`
-        from scratch, discarding the `pointer_unresolved` reason
-        `_pointer_target` already computed -- so a session where BOTH
+        """R6-c02, under A9-2: the single-entry exemption falls through
+        with `target=None` (never a real filename) to the grouped scan --
+        and the lone candidate (no owner-container, no parseable
+        `updated-at`) lands in the UNCERTAIN group, so the run exits
+        identity_unresolved with an empty own group. The R6-c02 courtesy
+        itself is what must survive the A9-2 rewrite: a session where BOTH
         `latest.md` (here, a directory) AND the single candidate's
-        frontmatter are broken reported a ledger `detail` that only
-        mentions frontmatter, sending whoever reads it to fix the wrong
-        file, and no stderr line naming `latest.md` at all."""
+        frontmatter are broken reports a `detail` naming BOTH files, not
+        one that only mentions the frontmatter and sends whoever reads it
+        to fix the wrong file."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "track-id: x", "---"])
         os.mkdir(os.path.join(self.handoff_dir, "latest.md"))
         extra = {}
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
-            result = _MOD._locate(self.handoff_dir, extra)
-        self.assertEqual(result, (None, "pointer_unresolved"))
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
         self.assertIn("latest.md", extra["detail"])
         self.assertIn("not a regular file", extra["detail"])
+        self.assertIn("a.md", extra["detail"])
         self.assertIn("latest.md", stderr.getvalue())
 
     def test_an_unstattable_latest_md_is_pointer_unresolved_not_a_silent_older_pick(self):
@@ -1111,7 +1264,7 @@ class TestLocate(_HandoffDirCase):
                 stderr = io.StringIO()
                 with mock.patch.object(_MOD.os, "lstat", side_effect=failing_lstat), \
                         mock.patch.object(sys, "stderr", stderr):
-                    result = _MOD._locate(self.handoff_dir, extra)
+                    result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
                 self.assertEqual(result, (None, "pointer_unresolved"))
                 self.assertNotEqual(result, (os.path.basename(older), None))
                 self.assertIn("latest.md", extra["detail"])
@@ -1141,7 +1294,7 @@ class TestLocate(_HandoffDirCase):
         with open(real_pointer, "w", encoding="utf-8") as fh:
             fh.write("# Latest\n\n**Latest**: [a.md](./a.md)\n")
         os.symlink(real_pointer, os.path.join(self.handoff_dir, "latest.md"))
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
 
     def test_a_missing_latest_md_with_multiple_candidates_still_falls_back_quietly(self):
         """Control for the whole group above: latest.md genuinely ABSENT
@@ -1151,7 +1304,7 @@ class TestLocate(_HandoffDirCase):
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", updated_at="2026-09-10T00:00:00Z")
         _write_handoff(self.handoff_dir, "b.md", updated_at="2026-09-20T00:00:00Z")
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("b.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("b.md", None))
 
     def test_a_closed_stderr_does_not_turn_an_unlistable_directory_into_http_error(self):
         """R3-c04: the old code printed `[{HOOK}] {detail}` with a bare
@@ -1168,7 +1321,7 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         with mock.patch.object(_MOD, "_candidates", side_effect=OSError("denied")), \
                 mock.patch.object(sys, "stderr", _BrokenStderr()):
-            result = _MOD._locate(self.handoff_dir, extra)  # must not raise BrokenPipeError
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)  # must not raise BrokenPipeError
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("could not be listed", extra["detail"])
 
@@ -1184,30 +1337,43 @@ class TestLocate(_HandoffDirCase):
         extra = {}
         with mock.patch.object(_MOD, "_candidates", side_effect=OSError("denied")), \
                 mock.patch.object(sys, "stderr", io.StringIO()):
-            result = _MOD._locate(self.handoff_dir, extra)
+            result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
         self.assertEqual(result, (None, "pointer_unresolved"))
         self.assertIn("could not be listed", extra["detail"])
 
-    def test_pointer_unresolved_records_a_detail_when_no_candidate_resolves(self):
+    def test_a_lone_unparseable_frontmatter_candidate_is_identity_unresolved_with_a_detail(self):
+        """A4-5's loud leg, under A9-2: a candidate with no parseable
+        owner-container is UNCERTAIN, and an empty own group with uncertain
+        candidates present reports identity_unresolved (still a failure
+        class, still naming the candidate) -- the pre-A9 run reached the
+        blunter "none with a parseable updated-at" pointer_unresolved
+        instead."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "not: a-known-key", "---"])
         _write_latest_pointer(self.handoff_dir, "does-not-exist.md")
         extra = {}
-        result = _MOD._locate(self.handoff_dir, extra)
-        self.assertEqual(result, (None, "pointer_unresolved"))
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
         self.assertIn("candidate", extra["detail"])
+        self.assertIn("a.md", extra["detail"])
 
     # -- Amendment A4-5 pair: the SAME directory shape, contents-only diff --
 
     def test_a4_5_leg_empty_dir_is_no_handoff(self):
         self._mkdir()
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "no_handoff"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "no_handoff"))
 
-    def test_a4_5_leg_broken_frontmatter_and_unmatched_pointer_is_pointer_unresolved(self):
+    def test_a4_5_leg_broken_frontmatter_and_unmatched_pointer_stays_loud(self):
+        """A4-5's A/B pair: the SAME shape as the empty-dir leg above, one
+        broken candidate added, must stay a REPORTED failure. Under A9-2
+        the reason is identity_unresolved (a lone unparseable-owner
+        candidate is uncertain, and an empty own group with uncertain
+        present is C1's reportable case), not the old blunter
+        pointer_unresolved -- loud either way, which is the pair's point."""
         self._mkdir()
         _write_handoff(self.handoff_dir, "a.md", frontmatter_lines=["---", "not: a-known-key", "---"])
         _write_latest_pointer(self.handoff_dir, "does-not-exist.md")
-        self.assertEqual(_MOD._locate(self.handoff_dir), (None, "pointer_unresolved"))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "identity_unresolved"))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1513,28 +1679,47 @@ class TestContent(unittest.TestCase):
 
 
 class TestOptOut(unittest.TestCase):
-    """R1-c05: `nexus-ingest: skip` recognised past exact-lowercase-match."""
+    """R1-c05 + A9-5 (owner ruling 2026-10-01, 发版前修改): `_opted_out` is
+    three-state. ``skip`` / ``false`` / ``no`` / ``off`` / ``0`` are the
+    opt-out (the author's clear intent in every spelling); ``true`` / ``yes``
+    / ``on`` / ``1`` upload; ANY OTHER value is ``unparsable`` -- this key
+    exists only to let the author control the upload, so an unrecognised
+    value must not read as permission (the pre-A9 behaviour ingested it and
+    recorded a clean row)."""
 
     def test_exact_lowercase_skip_opts_out(self):
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "skip"}), "skip")
 
     def test_mixed_and_upper_case_skip_opts_out(self):
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "Skip"}))
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "SKIP"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "Skip"}), "skip")
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "SKIP"}), "skip")
 
     def test_an_inline_comment_after_skip_still_opts_out(self):
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip  # has a secret in §6"}))
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "skip # reason"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "skip  # has a secret in §6"}), "skip")
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "skip # reason"}), "skip")
 
-    def test_missing_key_does_not_opt_out(self):
-        self.assertFalse(_MOD._opted_out({}))
+    def test_missing_key_is_allow(self):
+        self.assertEqual(_MOD._opted_out({}), "allow")
 
-    def test_unrecognised_values_do_not_opt_out(self):
-        """false/no/off are left ingesting -- an explicitly OPEN question
-        (Amendment A9), not a guess made by this fix."""
-        for value in ("false", "no", "off", "true", "none"):
+    def test_false_no_off_zero_all_opt_out(self):
+        """A9-5: `false / no / off / 0` 视同 skip -- the author meant "do not
+        upload"; the pre-A9 code ingested these and the ledger row looked
+        clean."""
+        for value in ("false", "no", "off", "0", "False", "NO", "OFF"):
             with self.subTest(value=value):
-                self.assertFalse(_MOD._opted_out({"nexus-ingest": value}))
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "skip")
+
+    def test_true_yes_on_one_all_allow(self):
+        for value in ("true", "yes", "on", "1", "TRUE", "Yes"):
+            with self.subTest(value=value):
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "allow")
+
+    def test_every_other_value_is_unparsable(self):
+        """A9-5: anything unrecognised refuses the upload (`file_unparsable`
+        at the caller) instead of reading as permission."""
+        for value in ("none", "maybe", "skip-me-not", ""):
+            with self.subTest(value=value):
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "unparsable")
 
     def test_a_quoted_value_with_an_inline_comment_still_opts_out(self):
         """R2-c02: _split_frontmatter only strips a matching pair of quotes
@@ -1543,16 +1728,16 @@ class TestOptOut(unittest.TestCase):
         last character, so a quoted `"skip"  # reason` / `'skip' # reason`
         value still carries its quotes by the time it reaches here. Both
         quote styles must still be recognised once the comment is gone."""
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": '"skip"  # leaked a token'}))
-        self.assertTrue(_MOD._opted_out({"nexus-ingest": "'skip' # leaked a token"}))
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": '"skip"  # leaked a token'}), "skip")
+        self.assertEqual(_MOD._opted_out({"nexus-ingest": "'skip' # leaked a token"}), "skip")
 
-    def test_a_value_merely_containing_skip_does_not_opt_out(self):
+    def test_a_value_merely_containing_skip_is_unparsable(self):
         """R2-c15: guards the exact-match comparison against a future
         widening to a substring check (e.g. `"skip" in value`), which would
         silently opt out documents whose value merely mentions "skip"."""
         for value in ("skipped", "no-skip-please", "unskippable"):
             with self.subTest(value=value):
-                self.assertFalse(_MOD._opted_out({"nexus-ingest": value}))
+                self.assertEqual(_MOD._opted_out({"nexus-ingest": value}), "unparsable")
 
 
 class TestMetadata(unittest.TestCase):
@@ -1568,6 +1753,17 @@ class TestMetadata(unittest.TestCase):
     def test_branch_is_present_when_known(self):
         meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa")
         self.assertEqual(meta["branch"], "main")
+
+    def test_project_is_present_when_derived(self):
+        """X1-policy (TASK-007): handoff episodes carry the provenance
+        `project` key, or the D's row-by-row check drops them in their own
+        project."""
+        meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa", "nexus")
+        self.assertEqual(meta["project"], "nexus")
+
+    def test_project_is_omitted_when_underivable(self):
+        meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa", None)
+        self.assertNotIn("project", meta)
 
     def test_each_aria_key_is_omitted_when_its_frontmatter_value_is_absent(self):
         meta = _MOD._build_metadata("s1", "main", {}, "aaaaaaaa")
@@ -1657,7 +1853,180 @@ class TestPointerTargetReadSafety(_HandoffDirCase):
         target, unresolved = result.get("pointer", (None, None))
         self.assertIsNone(target)
         self.assertIsNotNone(unresolved)
-        self.assertEqual(_MOD._locate(self.handoff_dir), ("a.md", None))
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), ("a.md", None))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# A9-2 / A9-3: owner grouping -- selection rules and the hostname/label split
+# ════════════════════════════════════════════════════════════════════════
+
+class TestOwnerGrouping(_HandoffDirCase):
+    """A9-2 (owner ruling 2026-10-01, 套餐 A 兜底): candidates are grouped
+    by owner-container into own / others / uncertain BEFORE any selection;
+    the fixtures here are the ruling's own acceptance list."""
+
+    def _other(self, name, **kw):
+        kw.setdefault("owner", f"owner/{OTHER_UUID}")
+        return _write_handoff(self.handoff_dir, name, **kw)
+
+    def _uncertain(self, name, owner="simonfish/ci-box", **kw):
+        """owner = the identity's hostname (or below, its label) with a
+        non-uuid first segment: A9-3's uncertain shape."""
+        return _write_handoff(self.handoff_dir, name, owner=owner, **kw)
+
+    # -- _owner_group unit level --
+
+    def test_uuid_equal_is_own_and_unequal_is_others(self):
+        identity = self.identity
+        self.assertEqual(_MOD._owner_group({"owner-container": f"o/{LOCAL_UUID}"}, identity), "own")
+        self.assertEqual(_MOD._owner_group({"owner-container": f"o/{OTHER_UUID}"}, identity), "others")
+
+    def test_missing_owner_container_is_uncertain(self):
+        self.assertEqual(_MOD._owner_group({}, self.identity), "uncertain")
+        self.assertEqual(_MOD._owner_group({"owner-container": "  "}, self.identity), "uncertain")
+
+    def test_hostname_shaped_second_segment_matches_the_hostname(self):
+        """A9-3: equals THIS machine's hostname -> uncertain (possibly this
+        machine before uuid pinning), never a quiet others."""
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/ci-box"}, self.identity), "uncertain"
+        )
+
+    def test_hostname_shaped_second_segment_matching_the_label_is_uncertain(self):
+        identity = {**self.identity, "label": "devbox-a"}
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/DevBox-A"}, identity), "uncertain"
+        )
+
+    def test_an_empty_label_never_matches_anything(self):
+        """A9-3: label None/empty is not participating -- an owner second
+        segment that is ALSO empty never reaches the comparison, and a
+        non-empty second segment never equals the empty label."""
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/"}, self.identity), "uncertain"
+        )
+        self.assertIsNone(self.identity["label"])
+
+    def test_hostname_shaped_matching_neither_hostname_nor_label_is_others(self):
+        """A9-3's quiet leg: a hostname that is clearly somebody else's
+        machine reads not_owner at the selection level, not the
+        every-session identity_unresolved the pre-A9 code reported
+        (10cg.local / truffle-hound-v2 were reporting exactly this noise)."""
+        self.assertEqual(
+            _MOD._owner_group({"owner-container": "simonfish/dev-claude2"}, self.identity),
+            "others",
+        )
+
+    # -- selection rules --
+
+    def test_pointer_to_an_own_document_is_followed(self):
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine.md", updated_at="2026-09-10T00:00:00Z")
+        self._other("b-newer-theirs.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "a-mine.md")
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity), ("a-mine.md", None)
+        )
+
+    def test_pointer_to_someone_elses_document_takes_the_own_newest(self):
+        """The A9-2 positive fixture: nexus's own shape -- latest.md points
+        at the OTHER container's handoff; this container's own newest (not
+        the pointer's document, and not an old not_owner skip) is selected."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "2026-09-19-old-mine.md", updated_at="2026-09-19T00:00:00Z")
+        self._other("2026-09-20-new-theirs.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "2026-09-20-new-theirs.md")
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity),
+            ("2026-09-19-old-mine.md", None),
+        )
+
+    def test_pointer_to_an_uncertain_document_is_identity_unresolved(self):
+        """A9-2: never quietly pass over an uncertain-group document for
+        this container's older one -- that is TASK-001 C1's silent stop."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine-old.md", updated_at="2026-09-10T00:00:00Z")
+        self._uncertain("b-uncertain.md", updated_at="2026-09-20T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "b-uncertain.md")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertIn("b-uncertain.md", extra["detail"])
+
+    def test_no_pointer_takes_the_own_newest(self):
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine-old.md", updated_at="2026-09-10T00:00:00Z")
+        _write_handoff(self.handoff_dir, "b-mine-new.md", updated_at="2026-09-20T00:00:00Z")
+        self._other("z-newest-theirs.md", updated_at="2026-09-30T00:00:00Z")
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity), ("b-mine-new.md", None)
+        )
+
+    def test_no_pointer_with_a_newer_uncertain_candidate_is_identity_unresolved(self):
+        """A9-2's own-group guard: an uncertain candidate NEWER than the
+        own-group pick may be this container's own newest document with a
+        legacy owner field -- it blocks the pick."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine.md", updated_at="2026-09-10T00:00:00Z")
+        self._uncertain("b-uncertain-newer.md", updated_at="2026-09-20T00:00:00Z")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertIn("b-uncertain-newer.md", extra["detail"])
+
+    def test_no_pointer_with_only_older_uncertain_candidates_takes_the_own_newest(self):
+        """The corpus case (nexus: 20 uncertain candidates, all old): an
+        uncertain candidate with no comparable or an OLDER timestamp does
+        not hold the round hostage."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine-new.md", updated_at="2026-09-20T00:00:00Z")
+        self._uncertain("old-uncertain.md", updated_at="2026-08-01T00:00:00Z")
+        self._uncertain("no-ts-uncertain.md", updated_at=None)
+        self.assertEqual(
+            _MOD._locate(self.handoff_dir, identity=self.identity), ("a-mine-new.md", None)
+        )
+
+    def test_empty_own_group_with_uncertain_candidates_is_identity_unresolved(self):
+        self._mkdir()
+        self._uncertain("u1.md", updated_at="2026-09-10T00:00:00Z")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertIn("u1.md", extra["detail"])
+
+    def test_many_uncertain_candidates_report_the_count_in_its_own_extra_key(self):
+        """R2 review: the count of uncertain candidates rides in a SEPARATE
+        extra key rather than an inline detail marker -- detail passes
+        through _short's 200-char cap, and an inline "(+N more)" appended
+        before the cap was measured to arrive half-cut with real-length
+        names ("(+35 "), which is worse than no marker at all. The own
+        key is never truncated, whatever the detail shows."""
+        self._mkdir()
+        for i in range(7):  # > 5: the detail slice is bounded, the key is not
+            self._uncertain(f"2026-09-1{i}-1000-u.md", updated_at=f"2026-09-1{i}T00:00:00Z")
+        extra = {}
+        result = _MOD._locate(self.handoff_dir, extra, identity=self.identity)
+        self.assertEqual(result, (None, "identity_unresolved"))
+        self.assertEqual(extra["uncertain_candidates"], 7)
+        self.assertLessEqual(len(extra["detail"]), 200)  # bounded, never the count's carrier
+
+    def test_empty_own_group_with_only_others_is_quiet_not_owner(self):
+        self._mkdir()
+        self._other("t1.md", updated_at="2026-09-10T00:00:00Z")
+        self._other("t2.md", updated_at="2026-09-20T00:00:00Z")
+        self.assertEqual(_MOD._locate(self.handoff_dir, identity=self.identity), (None, "not_owner"))
+
+    def test_a_missing_local_uuid_is_identity_unresolved_even_with_a_pointer_hit(self):
+        """The local side of the old owner check, preserved: aria_uuid()
+        returning None is reportable, whatever the directory holds."""
+        self._mkdir()
+        _write_handoff(self.handoff_dir, "a-mine.md", updated_at="2026-09-10T00:00:00Z")
+        _write_latest_pointer(self.handoff_dir, "a-mine.md")
+        result = _MOD._locate(
+            self.handoff_dir, identity={**self.identity, "uuid": None}
+        )
+        self.assertEqual(result, (None, "identity_unresolved"))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1693,6 +2062,23 @@ class _WriteCase(unittest.TestCase):
         with open(aria_file, "w", encoding="utf-8") as fh:
             fh.write(f"uuid: {LOCAL_UUID}\nlabel:\n")
         self._patch(mock.patch.object(_identity, "ARIA_CONTAINER_ID_FILE", aria_file))
+        # A9-1: a transcript whose earliest timestamped record (09:59:00)
+        # sits within the attribution tolerance of the default fixture's
+        # updated-at (10:00:00) -- so the default round attributes its row
+        # to the payload session and every pre-A9-1 expectation about
+        # metadata.session_id keeps its meaning. Includes the two real
+        # shapes A9-1's oracle handles: leading records with no timestamp,
+        # and out-of-order early timestamps.
+        # X1: the external_id prefix -- computed the same way the hook does
+        # (the harness cwd is outside any git repository, so memory_dir_key
+        # falls back to the cwd path itself; deterministic within a run).
+        self.key = _identity.memory_dir_key(self.cwd)[0]
+        self.transcript = os.path.join(self.tmp.name, "transcript.jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "mode", "mode": "default"}) + "\n")
+            fh.write(json.dumps({"type": "user", "timestamp": "2026-09-20T09:59:30.000Z"}) + "\n")
+            fh.write(json.dumps({"type": "user", "timestamp": "2026-09-20T09:59:00.000Z"}) + "\n")
+            fh.write(json.dumps({"type": "assistant", "timestamp": "2026-09-20T10:01:00.000Z"}) + "\n")
 
     def _patch(self, patcher):
         patcher.start()
@@ -1711,11 +2097,18 @@ class _WriteCase(unittest.TestCase):
             frontmatter, _body = _MOD._split_frontmatter(fh.read())
         return _MOD._build_metadata(session_id, BRANCH, frontmatter, LOCAL_UUID)
 
-    def _run(self, session_id="sess-1", **extra_env):
+    def _run(self, session_id="sess-1", event=None, **extra_env):
         env = {"NEXUS_API_URL": self.backend.url, "NEXUS_HOOK_STATE_DIR": self.state_dir,
                "NEXUS_DEFAULT_USER_ID": USER}
         env.update(extra_env)
-        return _run_main(_MOD, {"cwd": self.cwd, "session_id": session_id}, env)
+        payload = {"cwd": self.cwd, "session_id": session_id,
+                   "transcript_path": self.transcript}
+        payload.update(event or {})
+        return _run_main(_MOD, payload, env)
+
+    def _ext(self, name):
+        """The prefixed external_id the hook writes for a handoff document."""
+        return f"{self.key}/docs/handoff/{name}"
 
     @property
     def requests(self):
@@ -1749,11 +2142,31 @@ class TestOwnerAndOptOut(_WriteCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "identity_unresolved")
 
-    def test_a_hostname_shaped_owner_container_is_identity_unresolved(self):
+    def test_a_hostname_shaped_owner_of_another_machine_is_quiet_not_owner(self):
+        """A9-3 (owner 2026-10-01): a hostname-shaped owner-container that
+        matches NEITHER this machine's hostname NOR its label is clearly
+        somebody else's -- a quiet not_owner, not the every-session
+        identity_unresolved the pre-A9 code recorded (10cg.local and
+        truffle-hound-v2 reported exactly that noise). gethostname is
+        STUBBED: the fixture value happens to be the dev machine's real
+        hostname, so a live read would pass here and fail on CI."""
         self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")
-        self._run()
+        with mock.patch("socket.gethostname", return_value="ci-box"):
+            self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "not_owner")
+
+    def test_a_hostname_shaped_owner_equal_to_this_hostname_is_identity_unresolved(self):
+        """A9-3's other half: the same shape, but the hostname IS this
+        machine's -- "possibly me before uuid pinning" (uncertain), and an
+        empty own group with uncertain candidates present is C1's
+        reportable case."""
+        self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")
+        with mock.patch("socket.gethostname", return_value="dev-claude2"):
+            self._run()
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "identity_unresolved")
+        self.assertIn("dev-claude2", self._last_entry()["detail"])
 
     def test_nexus_ingest_skip_is_opted_out_with_zero_requests(self):
         self._write("2026-09-20-1000-x.md", nexus_ingest="skip")
@@ -1761,13 +2174,18 @@ class TestOwnerAndOptOut(_WriteCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "opted_out")
 
-    def test_nexus_ingest_skip_is_checked_before_the_owner_check(self):
-        """A document that is BOTH someone else's AND opted out reports the
-        opt-out, not not_owner -- the digest's explicit ordering."""
+    def test_owner_selection_precedes_the_opt_out_check(self):
+        """A9-2 FLIPPED the old ordering (the digest's "opt-out checked
+        before the owner check"): owner grouping now happens inside
+        `_locate`, BEFORE the chosen document is even opened -- so a
+        document that is somebody else's AND opted out reports not_owner
+        and is never opened at all. The §3.2 recovery path is unaffected:
+        a document of THIS container's own group that opts out still
+        reports opted_out (pinned by the tests above)."""
         self._write("2026-09-20-1000-x.md", owner=f"owner/{OTHER_UUID}", nexus_ingest="skip")
         self._run()
         self.assertEqual(self.requests, [])
-        self.assertEqual(self._last_entry()["reason"], "opted_out")
+        self.assertEqual(self._last_entry()["reason"], "not_owner")
 
     def test_nexus_ingest_quoted_skip_with_inline_comment_is_opted_out(self):
         """R2-c02, end to end: the recovery path in memory-layers.md §3.2
@@ -1775,6 +2193,28 @@ class TestOwnerAndOptOut(_WriteCase):
         a server-side row was soft-deleted; the opt-out must still be
         honoured, or the row gets recreated on the very next SessionEnd."""
         self._write("2026-09-20-1000-x.md", nexus_ingest='"skip"  # leaked a token in §6')
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self._last_entry()["reason"], "opted_out")
+
+    def test_an_unrecognised_nexus_ingest_value_refuses_the_upload(self):
+        """A9-5 (owner 2026-10-01): the key exists only to control the
+        upload, so a value this hook does not recognise must not read as
+        permission. `file_unparsable` (already in the failure table -- no
+        new reason), the ORIGINAL value in the detail, zero requests, and
+        a reported failure every session until the value is fixed."""
+        self._write("2026-09-20-1000-x.md", nexus_ingest="maybe")
+        self._run()
+        self.assertEqual(self.requests, [])
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "file_unparsable")
+        self.assertIn("maybe", entry["detail"])
+        self.assertFalse(entry["ok"])
+
+    def test_nexus_ingest_false_is_the_opted_out_skip(self):
+        """A9-5 end to end: `false` is the opt-out, a quiet skip with zero
+        requests -- the same row shape `skip` itself produces."""
+        self._write("2026-09-20-1000-x.md", nexus_ingest="false")
         self._run()
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "opted_out")
@@ -1857,7 +2297,10 @@ class TestPointerUnresolvedIsReported(_WriteCase):
 
     def test_pointer_unresolved_is_reported_next_session_start(self):
         with open(os.path.join(self.handoff_dir, "a.md"), "w", encoding="utf-8") as fh:
-            fh.write("---\nnot: a-known-key\n---\nbody\n")  # no parseable updated-at
+            # own-group but NO parseable updated-at (A9-2 keeps this the
+            # pointer_unresolved leg; a no-owner frontmatter would exit
+            # identity_unresolved instead, which the grouping tests cover)
+            fh.write("---\nowner-container: owner/aaaaaaaa\ntrack-id: x\n---\nbody\n")
         _write_latest_pointer(self.handoff_dir, "does-not-exist.md")
         self._run()
         self.assertEqual(self._last_entry()["reason"], "pointer_unresolved")
@@ -2056,7 +2499,7 @@ class TestWritePath(_WriteCase):
         self.assertEqual(
             get["query"],
             {"user_id": USER, "layer": "session_summary", "container_id": CONTAINER,
-             "external_id": "docs/handoff/2026-09-20-1000-x.md", "limit": "5"},
+             "external_id": self._ext("2026-09-20-1000-x.md"), "limit": "5"},
         )
         post = self.requests[1]["json"]
         self.assertEqual(post["user_id"], USER)
@@ -2072,7 +2515,7 @@ class TestWritePath(_WriteCase):
         self.assertEqual(meta["aria.updated_at"], "2026-09-20T10:00:00Z")
         self.assertNotIn("aggregation_hash", meta)
         self.assertEqual(meta["layer"], "session_summary")
-        self.assertEqual(meta["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(meta["external_id"], self._ext("2026-09-20-1000-x.md"))
         self.assertEqual(meta["container_id"], CONTAINER)
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "none")
@@ -2099,7 +2542,7 @@ class TestWritePath(_WriteCase):
 
         self._write("2026-09-20-1000-x.md", section6=f"## §6 Next session 入口\n\nCHANGED {marker}")
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash="something-else",
+            self._ext("2026-09-20-1000-x.md"), content_hash="something-else",
         ))).reply(200, {"memory_id": "t1::proj::11111111-1111-4111-8111-111111111111"})
         self._run(session_id="sess-1")
         patch_entry = self._last_entry()
@@ -2114,7 +2557,7 @@ class TestWritePath(_WriteCase):
         digest = _ingest_client.content_hash(content)
         stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+            self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
         )))
         self._run(session_id="sess-1")
         self.assertEqual([r["method"] for r in self.requests], ["GET"])
@@ -2131,7 +2574,7 @@ class TestWritePath(_WriteCase):
             updated_at="2026-09-20T11:00:00Z",
         )
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=created_meta["content_hash"],
+            self._ext("2026-09-20-1000-x.md"), content_hash=created_meta["content_hash"],
             row_id="11111111-1111-4111-8111-111111111111",
             extra={k: v for k, v in created_meta.items() if k.startswith("aria.")},
         ))).reply(200, {"memory_id": "t1::proj::11111111-1111-4111-8111-111111111111"})
@@ -2153,7 +2596,7 @@ class TestWritePath(_WriteCase):
 
         self._write("2026-09-20-1000-x.md", status="done", updated_at="2026-09-20T11:00:00Z")
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=created_meta["content_hash"],
+            self._ext("2026-09-20-1000-x.md"), content_hash=created_meta["content_hash"],
             row_id="22222222-1111-4111-8111-111111111111",
             extra={k: v for k, v in created_meta.items() if k.startswith("aria.")},
         ))).reply(200, {"memory_id": "m1"})
@@ -2167,7 +2610,7 @@ class TestWritePath(_WriteCase):
     def test_an_older_local_updated_at_is_stale_local(self):
         self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T10:00:00Z")
         self.backend.reply(200, _page(_row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash="something-else",
+            self._ext("2026-09-20-1000-x.md"), content_hash="something-else",
             extra={"aria.updated_at": "2026-09-21T00:00:00Z"},
         )))
         self._run(session_id="sess-1")
@@ -2189,11 +2632,11 @@ class TestWritePath(_WriteCase):
         digest = _ingest_client.content_hash(content)
         stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
         older = _row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+            self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
             created_at="2026-09-19T00:00:00.000001Z", row_id="aaaaaaaa-1111-4111-8111-111111111111",
         )
         newer = _row(
-            "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+            self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
             created_at="2026-09-19T01:00:00.000001Z", row_id="bbbbbbbb-1111-4111-8111-111111111111",
         )
         self.backend.reply(200, _page(newer, older)).reply(204, None)
@@ -2226,7 +2669,7 @@ class TestWritePath(_WriteCase):
         stored = {k: v for k, v in self._expected_metadata(path, "sess-1").items() if k.startswith("aria.")}
         rows = [
             _row(
-                "docs/handoff/2026-09-20-1000-x.md", content_hash=digest, extra=stored,
+                self._ext("2026-09-20-1000-x.md"), content_hash=digest, extra=stored,
                 created_at=f"2026-09-19T0{i}:00:00.000001Z",
                 row_id=f"{i:08x}-1111-4111-8111-111111111111",
             )
@@ -2327,12 +2770,18 @@ class TestWritePath(_WriteCase):
         if "abcd@db-host" not in result:
             self.assertNotIn("nexus:abcd", result)
 
-    def test_session_id_missing_is_loud_and_writes_nothing(self):
+    def test_session_id_missing_goes_in_under_the_synthetic_id(self):
+        """A9-1 supersedes the pre-A9 loud guard for a payload without a
+        session_id (the client's `session_summary without session_id`
+        check in _ingest_client.upsert still exists as the belt): the
+        ruling's else-branch is exactly "cannot attribute" -- the row goes
+        in under the synthetic id instead of writing nothing."""
         self._write("2026-09-20-1000-x.md")
-        with mock.patch("sys.stderr"):
-            self._run(session_id=None)
-        self.assertEqual(self.requests, [])
-        self.assertEqual(self._last_entry()["reason"], "unknown")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id=None)
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+        self.assertEqual(self._last_entry()["reason"], "none")
 
     def test_identity_drift_reports_once(self):
         self._write("2026-09-20-1000-x.md")
@@ -2378,11 +2827,16 @@ class TestWritePath(_WriteCase):
         state, _ = _hook_state.read_state(_MOD.HOOK, self.cwd)
         self.assertEqual(state.get("container_id"), "dev-box-a")
 
-        # A second, NEWER document owned by someone else -- `_locate`'s
-        # no-pointer fallback picks it over the first (ruling 1: newest
-        # updated-at wins across ALL candidates, ownership is checked only
-        # after). This container's own id has drifted to dev-box-b in the
-        # meantime, but `not_owner` is decided well before the write path.
+        # A second round whose directory holds NOTHING of this
+        # container's: the own document is gone, a newer foreign one sits
+        # in its place (A9-2: the own-group scan finds nothing, every
+        # candidate is provably somebody else's -> not_owner). This
+        # container's own id has drifted to dev-box-b in the meantime, but
+        # `not_owner` is decided well before the write path -- the old
+        # fixture kept the own document in place and relied on the pre-A9
+        # "newest wins across ALL candidates" rule, which A9-2 replaced
+        # with the own-group scan (that shape now re-ingests the own doc).
+        os.remove(os.path.join(self.handoff_dir, "2026-09-20-1000-x.md"))
         self._write(
             "2026-09-20-1100-y.md", owner=f"owner/{OTHER_UUID}", updated_at="2026-09-20T11:00:00Z",
         )
@@ -2704,11 +3158,12 @@ class TestWritePath(_WriteCase):
 
         with mock.patch.object(
             _identity, "container_id",
-            # The two real calls _collect makes (identity_drift's
-            # `current=`, then the IngestClient constructor) return the
-            # new id normally; the THIRD is the protected precompute in
-            # `write()` itself, which is what this raises on.
-            side_effect=["dev-box-b", "dev-box-b", RuntimeError("transient container_id failure")],
+            # P1 (TASK-013) collapsed _collect's two calls (identity_
+            # drift's `current=`, then the IngestClient constructor) into
+            # ONE pre-read in main(); the SECOND and last call is the
+            # protected precompute in `write()` itself, which is what
+            # this raises on.
+            side_effect=["dev-box-b", RuntimeError("transient container_id failure")],
         ) as mock_container_id, mock.patch.object(
             _hook_state, "update_state", side_effect=failing_update_state
         ) as mock_update_state:
@@ -2726,7 +3181,7 @@ class TestWritePath(_WriteCase):
         # `update_state` should be visible here, not just coincidentally
         # still pass because both paths happen to set the same reason.
         mock_update_state.assert_not_called()
-        self.assertEqual(mock_container_id.call_count, 3)
+        self.assertEqual(mock_container_id.call_count, 2)  # main()'s pre-read + write()'s precompute
 
         entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
         reasons = [e["reason"] for e in entries]
@@ -3032,7 +3487,7 @@ class TestWritePath(_WriteCase):
         self._write("2026-09-20-1000-x.md")
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="sess-1")
-        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertEqual(self._last_entry()["external_id"], self._ext("2026-09-20-1000-x.md"))
 
     def test_a_document_that_vanishes_between_locate_and_open_is_unknown_not_quiet(self):
         """R4-c10: after `_locate` has already picked a document, the
@@ -3060,8 +3515,12 @@ class TestWritePath(_WriteCase):
             self._run(session_id="sess-1")
         self.assertEqual(self.requests, [])
         entry = self._last_entry()
-        self.assertEqual(entry["reason"], "unknown")
-        self.assertIn("cannot read", entry["detail"])
+        # A9-2 moved the first read of a POINTED document into _locate (the
+        # owner grouping): the vanish race now surfaces there -- probe
+        # returns {} for the race, the document reads uncertain, and the
+        # empty own group reports identity_unresolved (still a failure
+        # class, still named) instead of the old post-locate "unknown".
+        self.assertEqual(entry["reason"], "identity_unresolved")
         findings, _marks = _INJECT_MOD._failure_report(self.cwd)
         self.assertTrue(any("handoff-sync" in f for f in findings), findings)
 
@@ -3088,8 +3547,33 @@ class TestWritePath(_WriteCase):
         self._run(session_id="sess-1")
         self.assertEqual(self.requests, [])
         entry = self._last_entry()
-        self.assertEqual(entry["reason"], "unknown")
-        self.assertIn("cannot read", entry["detail"])
+        # A9-2: the pointed document is probed for its owner BEFORE it is
+        # opened; the chmod read failure surfaces from that probe as
+        # pointer_unresolved (R3-c06's "cannot read to compare" for the
+        # pointer target), a failure class either way -- the pre-A9 run
+        # reported "unknown"/"cannot read" only after _locate had already
+        # returned the document.
+        self.assertEqual(entry["reason"], "pointer_unresolved")
+        self.assertIn("2026-09-20-1000-x.md", entry["detail"])
+
+    def test_external_ids_carry_the_x1_project_prefix(self):
+        """X1 (A10-12 (2)): the external_id prefix is _identity.
+        memory_dir_key -- the SAME single definition memory_sync keys its
+        rows by. With user_id pinning the person (X1-policy), two projects
+        of one user share a pool, and same-named handoffs in two different
+        project directories must not land on (and PATCH) each other's
+        external_id."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run()
+        meta = self.requests[1]["json"]["metadata"]
+        key = _identity.memory_dir_key(self.cwd)[0]
+        self.assertEqual(meta["external_id"], f"{key}/docs/handoff/2026-09-20-1000-x.md")
+        # a second project directory with a different path derives a
+        # different key, hence a different external_id for the same name
+        other_cwd = os.path.join(self.tmp.name, "other-proj")
+        os.makedirs(os.path.join(other_cwd, "docs", "handoff"))
+        self.assertNotEqual(_identity.memory_dir_key(other_cwd)[0], key)
 
     def test_the_ledger_detail_is_truncated_to_200_chars(self):
         """R1-c30: `_short`'s cap, pinned end to end through the ledger."""
@@ -3100,58 +3584,168 @@ class TestWritePath(_WriteCase):
         self.assertEqual(entry["reason"], "rejected_422")
         self.assertLessEqual(len(entry["detail"]), 200)
 
-    def test_locate_does_not_filter_candidates_by_owner(self):
-        """Ruling 1 (TASK-005 R1 fix round, R1-c07): `_locate` picks the
-        newest `updated-at` across ALL candidates in the directory, never
-        checking frontmatter `owner-container` -- the owner check only runs
-        AFTER a single document has already been chosen. A newer handoff
-        written by a DIFFERENT container therefore wins over an older one
-        THIS container actually owns, and the older one is never even
-        considered: this run ends in `not_owner`, not a successful
-        ingestion of the older document. Deliberate (see Amendment A9): a
-        change here must be a deliberate decision, not an incidental
-        refactor -- this test exists so that decision shows up as a test
-        change, not a silent behaviour change.
+    def test_locate_filters_candidates_by_owner(self):
+        """A9-2 (owner 2026-10-01) FLIPPED the pre-A9 behaviour this test
+        used to pin (R1-c07: no owner filtering; a newer OTHER container's
+        document won, the older own document was never considered, and the
+        run ended not_owner with zero requests -- weeks of silent no-ingest
+        on the shared-pointer nexus checkout). The own-group newest is
+        selected and INGESTED even when a newer foreign document sits in
+        the same directory.
         """
         self._write("2026-09-19-old-mine.md", owner=f"owner/{LOCAL_UUID}", updated_at="2026-09-19T00:00:00Z")
         self._write("2026-09-20-new-theirs.md", owner=f"owner/{OTHER_UUID}", updated_at="2026-09-20T00:00:00Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run()
-        self.assertEqual(self.requests, [])
-        self.assertEqual(self._last_entry()["reason"], "not_owner")
+        self.assertEqual([r["method"] for r in self.requests], ["GET", "POST"])
+        self.assertEqual(self.requests[1]["json"]["metadata"]["aria.track_id"], "carry-x")
+        self.assertEqual(self._last_entry()["reason"], "none")
 
-    def test_session_attribution_is_the_ingesting_session_not_the_documents_own(self):
-        """Ruling 1 (TASK-005 R1 fix round, R1-c03): metadata.session_id is
-        always the CURRENT SessionEnd's session_id, never anything derived
-        from the handoff document itself -- there is nothing in a handoff
-        document that could tell us which session originally wrote it. This
-        is deliberate, not an oversight (see Amendment A9); a change here
-        must be deliberate, not incidental.
-        """
-        self._write("2026-09-20-1000-x.md", updated_at="2020-01-01T00:00:00Z")  # written long "ago"
+    def test_session_attribution_is_the_ingesting_session_when_the_handoff_is_that_sessions_own(self):
+        """A9-1 (owner ruling 2026-10-01) GATES the pre-A9 behaviour this
+        test used to pin unconditionally (R1-c03: always the CURRENT
+        SessionEnd's session_id): the current session's id is used only
+        when the document provably belongs to it -- frontmatter updated-at
+        not earlier than the transcript's earliest timestamp minus the
+        minutes-level tolerance. The default fixture's 10:00 updated-at
+        against the transcript's 09:59 start qualifies, so a session that
+        wrote (or rewrote) the handoff it syncs still owns the row, and
+        the aggregator's ``owned_episode`` skip still fires for exactly
+        that session."""
+        self._write("2026-09-20-1000-x.md")  # updated_at 10:00, transcript starts 09:59
         self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
         self._run(session_id="this-very-session")
         meta = self.requests[1]["json"]["metadata"]
         self.assertEqual(meta["session_id"], "this-very-session")
+        self.assertEqual(self._last_entry()["attribution"], "session")
+
+    def test_an_older_handoff_goes_in_under_the_synthetic_id(self):
+        """A9-1's other leg: a document demonstrably written BEFORE this
+        session started (the default transcript starts 09:59; this
+        document predates it by months) never borrows the ending session's
+        id -- once created, session_id can never be corrected, and a wrong
+        one would permanently suppress that session's own aggregated
+        summary. The synthetic id hangs the row off no real session; the
+        session's own summary is unaffected."""
+        self._write("2026-09-20-1000-x.md", updated_at="2020-01-01T00:00:00Z")  # written long "ago"
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="this-very-session")
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+        self.assertEqual(self._last_entry()["attribution"], "synthetic")
+
+    def test_a_missing_transcript_goes_in_under_the_synthetic_id(self):
+        """A9-1 rule 3: an unreadable or absent transcript is "cannot
+        prove" -- the synthetic id, never a guess."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(event={"transcript_path": None})
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+
+    def test_a_transcript_with_no_timestamped_record_goes_in_under_the_synthetic_id(self):
+        """Same rule, different shape: a readable transcript whose records
+        carry no timestamp at all (the leading no-timestamp records are
+        exactly this) proves nothing about the session start."""
+        bare = os.path.join(self.tmp.name, "bare-transcript.jsonl")
+        with open(bare, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "mode", "mode": "default"}) + "\n")
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(event={"transcript_path": bare})
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+
+    def test_the_attribution_tolerance_boundary_is_inclusive(self):
+        """updated-at EXACTLY session-start minus tolerance still belongs
+        to the session (the corpus rounds to :00, and the boundary case of
+        the ruling's own wording: 不早于「会话起点减容差」)."""
+        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T09:57:00Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="boundary-session")
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], "boundary-session")
+        # one second past the boundary flips to the synthetic id
+        self._write("2026-09-20-1000-x.md", updated_at="2026-09-20T09:56:59Z")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m2"})
+        self._run(session_id="boundary-session")
+        meta = self.requests[3]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+
+    def test_an_unparseable_updated_at_goes_in_under_the_synthetic_id(self):
+        """R1 review (qa lens): one of A9-1's own "cannot prove" legs, named
+        in the gate's comment but never pinned -- a frontmatter updated-at
+        that does not parse cannot be compared against the session start,
+        so the synthetic id, never a guess."""
+        # A POINTER-selected own document: the no-pointer scan would refuse
+        # an unparseable updated-at at _locate already (its own exit), so
+        # this leg of A9-1's gate is only reachable through a pointer.
+        self._write("2026-09-20-1000-x.md", updated_at="not-a-timestamp")
+        _write_latest_pointer(self.handoff_dir, "2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="this-very-session")
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+
+    def test_an_unreadable_transcript_path_goes_in_under_the_synthetic_id(self):
+        """R1 review (qa lens): the other unpinned leg -- a transcript_path
+        that is SET but names nothing readable (here: no such file) is the
+        same "cannot prove" as an absent one."""
+        self._write("2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(event={"transcript_path": os.path.join(self.tmp.name, "no-such-transcript.jsonl")})
+        meta = self.requests[1]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
+
+    def test_a_failed_write_leaves_a_later_session_on_the_synthetic_id(self):
+        """A9-1's S1/S2 fixture: S1 chose the document (real attribution)
+        but its write failed; S2 -- a LATER session, same document still
+        untouched -- retries and must NOT hang the row on ITS session id:
+        the document predates S2's start, so the retry goes in under the
+        synthetic id and S2's own summary stays free to generate."""
+        self._write("2026-09-20-1000-x.md")  # 10:00; S1's transcript starts 09:59
+        self.backend.reply(500, {"detail": "boom"})  # S1: the write fails
+        self._run(session_id="sess-1")
+        self.assertEqual(self._last_entry()["reason"], "http_error")
+        # S2: hours later -- a transcript that starts well after 10:00.
+        s2_transcript = os.path.join(self.tmp.name, "s2.jsonl")
+        with open(s2_transcript, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "user", "timestamp": "2026-09-20T14:00:00.000Z"}) + "\n")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(session_id="sess-2", event={"transcript_path": s2_transcript})
+        meta = self.requests[2]["json"]["metadata"]
+        self.assertEqual(meta["session_id"], f"handoff:{self._ext('2026-09-20-1000-x.md')}")
 
     def test_owner_container_frontmatter_value_is_recorded_on_identity_unresolved(self):
-        """R1-c10: the ledger `extra` used to stay `{}` on every reason that
-        returns before the write path -- a SessionStart failure report for
+        """R1-c10's courtesy, carried through the A9-2 rewrite: the ledger
+        `extra` used to stay `{}` on every reason that returns before the
+        write path -- a SessionStart failure report for
         `identity_unresolved` could not even say which frontmatter value
-        was the problem."""
-        self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")  # hostname-shaped
-        self._run()
+        was the problem. The uncertain-candidate exit still names the
+        candidate and its raw owner value (external_id is no longer
+        present -- under A9-2 no document was CHOSEN, so there is no
+        doc-relative id to record; the candidate name carries the same
+        information)."""
+        self._write("2026-09-20-1000-x.md", owner="simonfish/dev-claude2")  # == this hostname: uncertain
+        with mock.patch("socket.gethostname", return_value="dev-claude2"):
+            self._run()
         entry = self._last_entry()
         self.assertEqual(entry["reason"], "identity_unresolved")
-        self.assertIn("simonfish/dev-claude2", entry["detail"])
-        self.assertEqual(entry["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertIn("2026-09-20-1000-x.md", entry["detail"])
 
-    def test_not_owner_and_opted_out_also_record_external_id(self):
-        """R1-c10, the other non-write branches: `not_owner` and `opted_out`
-        likewise say which document the run was about."""
+    def test_not_owner_records_no_document_and_opted_out_records_the_document(self):
+        """R1-c10, A9-2 edition: `not_owner` now exits inside `_locate`
+        with no document chosen (nothing to name -- the whole directory is
+        provably somebody else's), while `opted_out` follows selection of
+        an OWN document and still records its external_id."""
         self._write("2026-09-20-1000-x.md", owner=f"owner/{OTHER_UUID}")
         self._run()
         self.assertEqual(self._last_entry()["reason"], "not_owner")
-        self.assertEqual(self._last_entry()["external_id"], "docs/handoff/2026-09-20-1000-x.md")
+        self.assertNotIn("external_id", self._last_entry())
+        self._write("2026-09-20-1001-mine.md", owner=f"owner/{LOCAL_UUID}", nexus_ingest="skip")
+        self._run()
+        self.assertEqual(self._last_entry()["reason"], "opted_out")
+        self.assertEqual(self._last_entry()["external_id"], self._ext("2026-09-20-1001-mine.md"))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -3198,6 +3792,24 @@ class TestRuns(unittest.TestCase):
         env.update(extra_env)
         return _run_main(_MOD, {"cwd": cwd, "session_id": session_id}, env)
 
+    def test_the_wire_project_key_equals_the_derivation_and_the_git_fallback_is_ledgered(self):
+        """R1 review (post_implementation, qa lens): X1-policy's acceptance
+        is a CONSUMER-side claim -- the POSTed metadata["project"] equals
+        what _identity.project_key derives from the SAME cwd (not merely
+        that the parameter plumbs into _build_metadata), and the git-source
+        fallback (no CLAUDE_PROJECT_DIR in the run env) is ledger-reported
+        as project_source=git_fallback."""
+        _write_handoff(self.handoff_dir, "2026-09-20-1000-x.md")
+        self.backend.reply(200, _page()).reply(201, {"memory_id": "m1"})
+        self._run(self.repo)
+        meta = self.backend.requests[1]["json"]["metadata"]
+        expected, source = _identity.project_key(self.repo, None)
+        self.assertEqual(meta["project"], expected)
+        self.assertEqual(source, _identity.PROJECT_SOURCE_GIT)
+        entries, _ = _hook_state.read_ledger(_MOD.HOOK, self.repo)
+        self.assertTrue(entries)
+        self.assertEqual(entries[-1]["project_source"], "git_fallback")
+
     def test_subdirectory_cwd_gives_the_same_external_id(self):
         _write_handoff(self.handoff_dir, "2026-09-20-1000-x.md", owner=f"owner/{LOCAL_UUID}")
         _write_latest_pointer(self.handoff_dir, "2026-09-20-1000-x.md")
@@ -3214,7 +3826,8 @@ class TestRuns(unittest.TestCase):
         self._run(sub, backend=backend2, session_id="sess-2")
         from_sub = backend2.requests[1]["json"]["metadata"]["external_id"]
 
-        self.assertEqual(from_root, "docs/handoff/2026-09-20-1000-x.md")
+        expected_prefix = _identity.memory_dir_key(self.repo)[0]
+        self.assertEqual(from_root, f"{expected_prefix}/docs/handoff/2026-09-20-1000-x.md")
         self.assertEqual(from_root, from_sub)
 
 
@@ -3598,6 +4211,61 @@ class TestSubprocess(unittest.TestCase):
         )
         stdout, _stderr = _communicate_kill_on_timeout(proc, b"{not json", 20)
         self.assertEqual((stdout, proc.returncode), (b"", 0))
+
+
+class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
+    """The static half of handoff_sync's env-once round (TASK-013, the P1
+    discipline memory_sync's own guard established): main() reads every
+    environment input once, on the calling thread; the worker (_collect,
+    on a thread run_with_deadline can only abandon) uses only what was
+    captured. Walks every function the worker can reach -- in
+    handoff_sync.py and, transitively, every hook module it imports -- and
+    fails on an environment read in any of them, taken or not."""
+
+    def test_no_function_the_worker_can_reach_reads_the_environment(self):
+        roots = _worker_entry_points(_parse_hook_module("handoff_sync"))
+        self.assertTrue(roots, "found no worker target in main() -- the check below would be vacuous")
+        reads, visited = _environment_reads_reachable_from(
+            [("handoff_sync", r) for r in roots]
+        )
+        self.assertEqual(reads, [], "a function the worker thread can reach reads the environment itself")
+        # Not vacuous: the walk really reached the worker's own work and
+        # crossed into the shared hook modules.
+        reached = {name for module, name in visited if module == "handoff_sync"}
+        for expected in ("_locate", "_pointer_target", "_candidates", "_session_start", "_opted_out"):
+            self.assertIn(expected, reached)
+        self.assertIn(("_ingest_client", "IngestClient"), visited)
+        self.assertIn(("_identity", "memory_dir_key"), visited)
+        self.assertIn(("_identity", "project_key"), visited)
+        # identity_drift is reached through the run-captured container_id,
+        # not through a fresh _identity.container_id() on the worker.
+        self.assertIn(("_hook_state", "read_state_at"), visited)
+
+    def test_the_same_walk_does_find_main_s_own_reads(self):
+        """The control: main() -- on the calling thread -- is where the
+        reads moved to, and the same analysis that finds none on the
+        worker path finds them there."""
+        reads, _visited = _environment_reads_reachable_from([("handoff_sync", "main")])
+        in_main = {read for module, function, read, _line in reads if (module, function) == ("handoff_sync", "main")}
+        self.assertIn("os.environ", in_main)
+        reached = {r[:3] for r in reads}
+        self.assertIn(("_hook_state", "state_root", "os.environ"), reached)
+        self.assertIn(("_identity", "container_id", "os.environ"), reached)
+        self.assertIn(("_identity", "aria_uuid", "os.path.expanduser"), reached)
+
+    def test_a_read_reintroduced_on_the_worker_path_is_caught(self):
+        """The mutation control (memory_sync's own test_each_way_back_in_
+        is_caught, one case): a late token read in _collect is found by
+        the same walk that finds none today."""
+        import ast as _ast
+        tree = _parse_hook_module("handoff_sync")
+        defs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+        defs["_collect"].body.insert(1, _ast.parse('os.environ.get("NEXUS_API_TOKEN")').body[0])
+        roots = _worker_entry_points(tree)
+        reads, _visited = _environment_reads_reachable_from(
+            [("handoff_sync", r) for r in roots], {"handoff_sync": tree}
+        )
+        self.assertIn(("handoff_sync", "_collect", "os.environ", mock.ANY), reads)
 
 
 if __name__ == "__main__":

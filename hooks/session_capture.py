@@ -887,7 +887,7 @@ def _capture_dropped_payload(dropped):
     }
 
 
-def _build_activities(extracted, container_id, branch, session_id, dropped):
+def _build_activities(extracted, container_id, branch, session_id, dropped, project=None):
     """Wrap extracted (action, partial) pairs into ActivityItem dicts with
     uniform provenance injected into each activity_data, plus the capture
     budget's telemetry under ``activity_data["internal"]["capture_dropped"]``.
@@ -910,6 +910,12 @@ def _build_activities(extracted, container_id, branch, session_id, dropped):
             ad["branch"] = branch
         if session_id:
             ad["session_id"] = session_id
+        # X1-policy: the project scope key, like container_id/branch/session_id
+        # a per-row provenance key (the backend copies activity_data into
+        # memories.metadata); the aggregator takes the MODE of these values
+        # into session_summary rows. Written only when derivable.
+        if project:
+            ad["project"] = project
         # Injected on EVERY activity, and rebuilt on every iteration rather
         # than built once and shared (owner ruling 2): a row-level query must
         # read the run's drop count off whichever row it lands on -- "which
@@ -1094,6 +1100,21 @@ def _collect(run):
     branch = _current_branch(cwd)
     session_id = event.get("session_id")
     resume = _load_watermark(session_id, cwd)
+    # X1-policy (TASK-007): scope every activity to the session's project so
+    # the backend can carry `project` into observation rows and the aggregator
+    # can take the mode into session_summary. Derived from CLAUDE_PROJECT_DIR
+    # (session startup dir, does not follow `cd`), NOT the hook's own cwd --
+    # a session that `cd`-ed away from where it started must not file its rows
+    # under another project. The `git` source is the documented fallback and
+    # MUST be ledger-reported: the env var's presence in hook processes is
+    # verified on real machines, and a silent fallback would keep looking
+    # "env-resolved" forever. project None (neither resolves) simply omits the
+    # key: the rows stay unscoped, which is honest.
+    project, project_source = _identity.project_key(
+        cwd, os.environ.get(_identity.PROJECT_DIR_ENV)
+    )
+    if project_source == _identity.PROJECT_SOURCE_GIT:
+        run["extra"]["project_source"] = "git_fallback"
 
     try:
         extracted, stats, prefix, resumed = _parse_transcript(transcript_path, resume)
@@ -1114,7 +1135,9 @@ def _collect(run):
         resumed=resumed,
         folded=stats["folded"],
     )
-    activities = _build_activities(extracted, container_id, branch, session_id, stats["dropped"])
+    activities = _build_activities(
+        extracted, container_id, branch, session_id, stats["dropped"], project
+    )
     run["extra"].update(activities=len(activities), lines=stats["lines"], parsed=stats["parsed"])
     if not activities:
         if _unreadable(stats):

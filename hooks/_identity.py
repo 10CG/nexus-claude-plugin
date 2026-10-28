@@ -242,9 +242,97 @@ def project_slug(cwd):
     return project_identity(cwd)[0]
 
 
-def user_id(cwd):
-    """The Nexus user_id rows are keyed by — same source as project_slug."""
-    return os.environ.get("NEXUS_DEFAULT_USER_ID") or project_slug(cwd)
+# X1-policy (owner 2026-10-14; derivation rules owner 2026-10-17): the provenance
+# `project` key that scopes writes to and reads from the Nexus backend. This is
+# a DIFFERENT question from project_slug (which keys rows by the hook's own
+# cwd): a session may `cd` away from where it started, and rows keyed by where
+# the hook happened to run would split one project in two. CLAUDE_PROJECT_DIR
+# is the session's startup directory and does not follow `cd`; a linked
+# worktree must resolve to its main worktree, or the same checkout would answer
+# differently depending on which worktree the session started in.
+PROJECT_SOURCE_ENV = "env"   # CLAUDE_PROJECT_DIR was set (worktree already resolved)
+PROJECT_SOURCE_GIT = "git"   # fallback: the cwd git toplevel basename
+PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"  # public: callers read it once on the main thread
+
+
+def _main_worktree(repo_dir):
+    """The main worktree's directory for a checkout inside ``repo_dir``, or
+    ``None`` when git could not be asked.
+
+    A linked worktree answers ``--git-common-dir`` with the MAIN repository's
+    ``.git``; its parent is the main worktree. The main worktree itself answers
+    with its own ``.git``, whose parent is itself, so one code path covers
+    both.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "rev-parse", "--path-format=absolute",
+             "--git-common-dir"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:  # timeout, no git binary -- caller falls back to the dir itself
+        return None
+    if result.returncode != 0:
+        return None
+    common = result.stdout.decode().strip()
+    if not common:
+        return None
+    parent = os.path.dirname(os.path.abspath(common))
+    return parent or None
+
+
+def project_key(cwd, env_dir):
+    """``(slug_or_None, source)``: the provenance ``project`` scope key.
+
+    ``env_dir`` is ``CLAUDE_PROJECT_DIR``'s value, read ONCE by the CALLING
+    thread -- this function never touches ``os.environ`` itself, because
+    memory_sync's round worker must not read the environment (its guard test
+    walks the call graph for exactly that). Main-thread callers pass the
+    value themselves; it rides the ``run`` dict across the thread boundary
+    like ``default_user_id`` does.
+
+    A set ``env_dir`` (the session startup directory; it does not follow
+    ``cd``) wins, with a linked worktree resolved to its main worktree's
+    basename; when the value is absent, the fallback is the ``cwd`` git
+    toplevel's basename with the git source -- callers MUST ledger-report
+    that fallback (X1-policy: the env var's presence in hook processes is
+    verified on real machines, and a hook that silently fell back would keep
+    looking env-resolved forever). ``slug is None`` only when neither
+    resolves (no env value AND git could not name a toplevel): writers omit
+    the key, and the session_inject D omits the project-scoped query entirely
+    (never an empty-string value, never an unscoped query that only LOOKS
+    scoped).
+
+    Not memoised in ``_SLUG_CACHE``: the env path asks git about the ENV dir,
+    which is not the ``cwd`` that cache is keyed by. Callers (hooks) ask once
+    per run.
+    """
+    if env_dir:
+        root = _main_worktree(env_dir) or env_dir
+        return normalize_slug(os.path.basename(root.rstrip("/"))), PROJECT_SOURCE_ENV
+    toplevel, _degraded = _resolved_root(cwd)  # degraded or plain no-repo: no toplevel either way
+    if toplevel is None:
+        return None, PROJECT_SOURCE_GIT
+    return normalize_slug(os.path.basename(toplevel.rstrip("/"))), PROJECT_SOURCE_GIT
+
+
+DEFAULT_USER_ID_ENV = "NEXUS_DEFAULT_USER_ID"  # public: same P1 pre-read pattern
+
+
+def user_id(cwd, default_user_id=None):
+    """The Nexus user_id rows are keyed by — same source as project_slug.
+
+    ``default_user_id`` serves the P1 discipline (change 2, A10): a caller
+    running its work on an abandonable thread passes the value of
+    ``DEFAULT_USER_ID_ENV`` that its CALLING thread pre-read; ``""`` means
+    "unset" (identical semantics to the or-chain, and no environment read
+    on the worker). Omitted (``None``, the default) reads the environment
+    here, exactly as this function always did.
+    """
+    if default_user_id is None:
+        default_user_id = os.environ.get(DEFAULT_USER_ID_ENV)
+    return default_user_id or project_slug(cwd)
 
 
 def current_branch(cwd):
@@ -334,6 +422,43 @@ def aria_uuid(path=None):
             # would never equal the document's lowercased value, the owner
             # check would be merely false, and ingestion would stop under
             # `not_owner` -- an expected skip that is never reported.
+            return value or None
+    return None
+
+
+def aria_label(path=None):
+    """The ``label:`` line of the same container-id file ``aria_uuid`` reads,
+    or None.
+
+    ⚠️ COMPARISON-ONLY (Amendment A9-3, owner ruling 2026-10-01): this value
+    is never an identity. Its one purpose is handoff_sync's owner grouping,
+    where a handoff whose ``owner-container`` second segment is NOT uuid
+    shaped but equals this machine's hostname or its NON-EMPTY label is
+    "possibly this machine in a historical state" (uncertain, reported),
+    not "someone else's machine" (a quiet ``not_owner`` that would silently
+    stop this container's own ingestion -- the C1 failure mode all over
+    again). Contrast ``aria_uuid``: that one must keep ignoring the label
+    entirely, because the uuid is what frontmatter pins.
+
+    None covers everything that means "not participating": a missing file,
+    no ``label:`` line at all, and an EMPTY label value -- this machine's
+    own convention is to leave the label empty, so an empty string must
+    not equal a document's second segment (which is only ever compared
+    when non-empty). Lowercased and stripped like the uuid half, so the
+    comparison in handoff_sync can compare both sides verbatim.
+    """
+    target = os.path.expanduser(path or ARIA_CONTAINER_ID_FILE)
+    try:
+        with open(target, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        stripped = line.strip()
+        # Same no-comment-skip reasoning as aria_uuid: a commented-out line
+        # still begins with '#', so it cannot match the prefix below.
+        if stripped.startswith("label:"):
+            value = stripped[len("label:"):].strip().lower()
             return value or None
     return None
 
