@@ -413,6 +413,43 @@ def aria_uuid(path=None):
     return None
 
 
+def aria_label(path=None):
+    """The ``label:`` line of the same container-id file ``aria_uuid`` reads,
+    or None.
+
+    ⚠️ COMPARISON-ONLY (Amendment A9-3, owner ruling 2026-10-01): this value
+    is never an identity. Its one purpose is handoff_sync's owner grouping,
+    where a handoff whose ``owner-container`` second segment is NOT uuid
+    shaped but equals this machine's hostname or its NON-EMPTY label is
+    "possibly this machine in a historical state" (uncertain, reported),
+    not "someone else's machine" (a quiet ``not_owner`` that would silently
+    stop this container's own ingestion -- the C1 failure mode all over
+    again). Contrast ``aria_uuid``: that one must keep ignoring the label
+    entirely, because the uuid is what frontmatter pins.
+
+    None covers everything that means "not participating": a missing file,
+    no ``label:`` line at all, and an EMPTY label value -- this machine's
+    own convention is to leave the label empty, so an empty string must
+    not equal a document's second segment (which is only ever compared
+    when non-empty). Lowercased and stripped like the uuid half, so the
+    comparison in handoff_sync can compare both sides verbatim.
+    """
+    target = os.path.expanduser(path or ARIA_CONTAINER_ID_FILE)
+    try:
+        with open(target, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        stripped = line.strip()
+        # Same no-comment-skip reasoning as aria_uuid: a commented-out line
+        # still begins with '#', so it cannot match the prefix below.
+        if stripped.startswith("label:"):
+            value = stripped[len("label:"):].strip().lower()
+            return value or None
+    return None
+
+
 def owner_container_uuid(owner_container):
     """The uuid half of a handoff's ``<owner>/<uuid>`` frontmatter, or None.
 

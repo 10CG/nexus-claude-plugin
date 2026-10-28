@@ -677,6 +677,59 @@ class TestProjectKey(unittest.TestCase):
             )
 
 
+class TestAriaLabel(unittest.TestCase):
+    """A9-3 (owner ruling 2026-10-01, package A): the ``label`` line of the
+    same container-id file aria_uuid reads -- a COMPARISON-ONLY read. A
+    handoff whose owner-container second segment is not uuid-shaped but
+    equals the hostname or the non-empty label is "possibly this machine in
+    a historical state" (uncertain), not "someone else's machine". The
+    label is never an identity itself (contrast aria_uuid's own docstring):
+    a non-empty label must not change what aria_uuid returns, and this
+    function must not be used anywhere except that one comparison."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, text):
+        path = os.path.join(self.tmp.name, "container-id")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_reads_the_label_line(self):
+        labelled = ARIA_FILE_SAMPLE.replace("label:", "label: devbox-A")
+        self.assertEqual(_identity.aria_label(self._write(labelled)), "devbox-a")
+
+    def test_empty_label_is_none_not_empty_string(self):
+        """The on-this-machine convention is an empty label; None (not "")
+        means "not participating in the comparison", so an empty label can
+        never equal a document's second segment (which is never empty when
+        it is compared at all)."""
+        self.assertIsNone(_identity.aria_label(self._write(ARIA_FILE_SAMPLE)))
+
+    def test_label_is_stripped(self):
+        self.assertEqual(_identity.aria_label(self._write("uuid: bfe8285d\nlabel:  devbox-A  \n")), "devbox-a")
+
+    def test_label_is_lowercased(self):
+        """The comparison in handoff_sync lowercases both sides, matching
+        owner_container_uuid/aria_uuid; the raw value must not arrive there
+        with different casing than the uuid half does."""
+        self.assertEqual(_identity.aria_label(self._write("label: DevBox-A\n")), "devbox-a")
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(_identity.aria_label(os.path.join(self.tmp.name, "nope")))
+
+    def test_no_label_line_is_none(self):
+        self.assertIsNone(_identity.aria_label(self._write("uuid: bfe8285d\n")))
+
+    def test_empty_label_value_is_none(self):
+        self.assertIsNone(_identity.aria_label(self._write("label:\nuuid: bfe8285d\n")))
+
+    def test_comment_mentioning_label_is_not_parsed(self):
+        self.assertIsNone(_identity.aria_label(self._write("# label: devbox-A is old\nuuid: bfe8285d\n")))
+
+
 class TestSourceHeader(unittest.TestCase):
     def test_shape_is_name_slash_version(self):
         with mock.patch.object(_identity, "plugin_version", return_value="9.9.9"):
