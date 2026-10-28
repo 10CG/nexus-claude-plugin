@@ -1011,31 +1011,31 @@ class TestListMemoryFiles(unittest.TestCase):
             fh.write(text)
 
     def test_missing_directory_is_empty_not_an_error(self):
-        out, indeterminate, reason = _MOD._list_memory_files(os.path.join(self.tmp.name, "nope"))
-        self.assertEqual((out, indeterminate, reason), ({}, set(), None))
+        out, indeterminate, reason, dir_exists = _MOD._list_memory_files(os.path.join(self.tmp.name, "nope"))
+        self.assertEqual((out, indeterminate, reason, dir_exists), ({}, set(), None, False))
 
     def test_memory_index_is_excluded_case_insensitively(self):
         self._touch("MEMORY.md")
         self._touch("memory.md")  # a project that happens to use lowercase
         self._touch("feedback_x.md")
-        out, _indeterminate, _reason = _MOD._list_memory_files(self.memory_dir)
+        out, _indeterminate, _reason, _dir_exists = _MOD._list_memory_files(self.memory_dir)
         self.assertEqual(out, {"feedback_x": os.path.join(self.memory_dir, "feedback_x.md")})
 
     def test_non_md_files_are_ignored(self):
         self._touch("notes.txt")
         self._touch("a.md")
-        out, _indeterminate, _reason = _MOD._list_memory_files(self.memory_dir)
+        out, _indeterminate, _reason, _dir_exists = _MOD._list_memory_files(self.memory_dir)
         self.assertEqual(list(out), ["a"])
 
     def test_slug_is_the_filename_without_the_extension(self):
         self._touch("project_nexus_prod_deployed.md")
-        out, _indeterminate, _reason = _MOD._list_memory_files(self.memory_dir)
+        out, _indeterminate, _reason, _dir_exists = _MOD._list_memory_files(self.memory_dir)
         self.assertEqual(list(out), ["project_nexus_prod_deployed"])
 
     def test_a_subdirectory_is_not_a_candidate(self):
         os.makedirs(os.path.join(self.memory_dir, "sub.md"))
         self._touch("real.md")
-        out, _indeterminate, _reason = _MOD._list_memory_files(self.memory_dir)
+        out, _indeterminate, _reason, _dir_exists = _MOD._list_memory_files(self.memory_dir)
         self.assertEqual(list(out), ["real"])
 
 
@@ -2693,11 +2693,15 @@ class TestK01DirectoryListingFailure(_WriteCase):
 
 class TestK01ZeroLocalFilesPendingDelete(_WriteCase):
     def test_zero_local_files_with_synced_entries_refuses_to_delete(self):
-        """K01 point 3: a GENUINELY successful listing that comes back
-        empty while state remembers synced entries is the same
+        """K01 point 3, narrowed by A10-5 option 2 (owner 2026-10-28): a
+        listing that fails with ENOENT -- the directory does not resolve
+        at all -- while state remembers synced entries is the same
         "directory resolution might be wrong" signal _reconcile_orphans
-        already guards -- the pending-delete phase must refuse too, not
-        only orphan reconciliation."""
+        already guards; the pending-delete phase must refuse too, not
+        only orphan reconciliation. (K01's original extension guarded the
+        present-but-empty shape identically; the ruling releases that one
+        -- see test_an_empty_but_present_directory_releases_the_pending_
+        deletes.)"""
         path = self._write("only")
         st = os.stat(path)
         _hook_state.write_state_at(
@@ -2711,6 +2715,7 @@ class TestK01ZeroLocalFilesPendingDelete(_WriteCase):
             }}},
         )
         os.remove(path)
+        os.rmdir(os.path.dirname(path))  # ENOENT: the directory itself is gone
         self._run()
         self.assertEqual(self.requests, [])
         self.assertIn("only", self._state().get("files", {}))
@@ -2918,7 +2923,13 @@ class TestR2C10ReconcileAttributionAndForwardProgress(_WriteCase):
         self.assertEqual(entry["reason"], "http_error")
         self.assertEqual(entry.get("reconcile", {}).get("reason"), "http_error")
 
-    def test_the_pending_delete_zero_files_guard_records_how_many_were_blocked(self):
+    def test_the_pending_delete_guard_trips_only_when_the_directory_is_missing(self):
+        """A10-5 option 2 (owner 2026-10-28): the zero-files guard is for
+        the WRONG-DIRECTORY shape -- the memory directory does not resolve
+        at all (``ENOENT``, typically a misconfigured ``CLAUDE_CONFIG_DIR``),
+        which makes every synced slug look vanished at once. K01's original
+        extension guarded the present-but-empty shape identically; the
+        ruling splits the two."""
         path = self._write("only")
         st = os.stat(path)
         _hook_state.write_state_at(
@@ -2931,8 +2942,40 @@ class TestR2C10ReconcileAttributionAndForwardProgress(_WriteCase):
             }}},
         )
         os.remove(path)
+        os.rmdir(os.path.dirname(path))  # the directory itself is gone: ENOENT
         self._run()
-        self.assertEqual(self._last_entry().get("pending_delete_guard"), 1)
+        entry = self._last_entry()
+        self.assertEqual(entry.get("pending_delete_guard"), 1, entry)
+        self.assertEqual(entry["reason"], "orphan_guard", entry)
+        self.assertEqual([r["method"] for r in self.requests if r["method"] == "DELETE"], [])
+
+    def test_an_empty_but_present_directory_releases_the_pending_deletes(self):
+        """A10-5 option 2 (owner 2026-10-28): the user deleted every memory
+        file -- the directory is still there, just empty of ``.md``. The
+        pending deletes are released (still bounded by the per-round
+        budget), so the server rows can follow the deletions instead of
+        reporting ``orphan_guard`` on every session forever (R2-C16)."""
+        path = self._write("only")
+        st = os.stat(path)
+        _hook_state.write_state_at(
+            _MOD._memory_state_path(self.key),
+            {"cursor": 0, "reconciled": True, "files": {"only": {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }}},
+        )
+        os.remove(path)  # directory still exists, now empty
+        self.backend.reply(200, _page(_row(self._ext("only"), content_hash="x"))).reply(204, None)
+        self._run()
+        entry = self._last_entry()
+        self.assertNotEqual(entry["reason"], "orphan_guard", entry)
+        self.assertNotIn("pending_delete_guard", entry)
+        self.assertEqual(
+            [r["method"] for r in self.requests if r["method"] == "DELETE"], ["DELETE"]
+        )
+        self.assertEqual(entry.get("deleted"), 1, entry)
 
     def test_a_server_that_ignores_the_cursor_and_repeats_the_same_page_is_caught(self):
         """Contract §6.2: a before_created_at/before_id pair the backend

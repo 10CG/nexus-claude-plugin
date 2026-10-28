@@ -513,7 +513,7 @@ def _memory_dir(config_dir, key):
 
 
 def _list_memory_files(memory_dir):
-    """``(files, indeterminate, reason)``.
+    """``(files, indeterminate, reason, dir_exists)``.
 
     ``files`` is ``{slug: path}`` for every resolvable ``*.md`` file
     directly in ``memory_dir`` (non-recursive), excluding the index
@@ -525,7 +525,13 @@ def _list_memory_files(memory_dir):
     decision is made, never as deleted. ``reason`` is ``None`` unless the
     directory itself could not be listed for anything other than "it does
     not exist" (``ENOENT`` -- the common, unremarkable case for a project
-    with no Claude Code memory yet).
+    with no Claude Code memory yet). ``dir_exists`` is only meaningful
+    when ``reason`` is ``None``: ``False`` means the listing failed with
+    ``ENOENT`` (the directory does not resolve at all), ``True`` means it
+    was listed -- even when it turned out to hold no ``.md`` file. The
+    pending-delete guard in ``_collect`` consults exactly this bit (A10-5
+    option 2): a present-but-empty directory is the user genuinely
+    deleting every memory file, an absent one is a wrong-directory signal.
 
     K01 (post_implementation R1): the previous version of this function
     collapsed EVERY ``OSError`` from ``os.listdir`` -- ``EACCES``, ``EIO``,
@@ -555,8 +561,13 @@ def _list_memory_files(memory_dir):
         names = os.listdir(memory_dir)
     except OSError as exc:
         if exc.errno == errno.ENOENT:
-            return {}, set(), None
-        return {}, set(), "unknown"
+            # A10-5 option 2 (owner 2026-10-28): ENOENT keeps its own,
+            # distinguishable shape -- the caller's pending-delete guard
+            # needs "the directory does not resolve AT ALL" (typically a
+            # misconfigured CLAUDE_CONFIG_DIR) apart from "it is right
+            # there and simply has no .md files left".
+            return {}, set(), None, False
+        return {}, set(), "unknown", False
     out = {}
     indeterminate = set()
     for name in names:
@@ -583,7 +594,7 @@ def _list_memory_files(memory_dir):
                 continue
         if stat.S_ISREG(entry_stat.st_mode):
             out[slug] = path
-    return out, indeterminate, None
+    return out, indeterminate, None, True
 
 
 # ── frontmatter (flat or nested `metadata:`, two structures) ────────────
@@ -2032,7 +2043,7 @@ def _collect(run):
     else:
         aria_project = project
 
-    local_files, indeterminate, list_reason = _list_memory_files(_memory_dir(run["config_dir"], key))
+    local_files, indeterminate, list_reason, dir_exists = _list_memory_files(_memory_dir(run["config_dir"], key))
     run["extra"]["local_files"] = len(local_files)
     if indeterminate:
         # R3-T04 (post_implementation R3): written the INSTANT this fact
@@ -2180,7 +2191,22 @@ def _collect(run):
         # reconciliation, which is independent and may not even run this
         # round (already reconciled). --
         vanished = sorted(slug for slug in files_state if slug not in local_files and slug not in indeterminate)
-        if not local_files and vanished:
+        if not local_files and vanished and (not dir_exists or indeterminate):
+            # A10-5 option 2 (owner 2026-10-28): the guard is for the
+            # WRONG-DIRECTORY shape -- the memory directory does not
+            # resolve at all (ENOENT, typically a misconfigured
+            # CLAUDE_CONFIG_DIR), which makes every synced slug look
+            # vanished at once. A directory that IS present and holds no
+            # .md-named entry at all (not even an indeterminate one) is
+            # the user genuinely deleting everything: the pending deletes
+            # are released below (still bounded by the per-round budget),
+            # so server rows can follow the deletions instead of
+            # reporting orphan_guard on every session forever (R2-C16's
+            # harm). An indeterminate entry keeps the refusal (R3-T01):
+            # the listing is unresolved IN this directory, and sweeping
+            # it destructively is exactly what K01 exists to prevent --
+            # reconciliation's own zero-REGULAR-files guard reaches the
+            # same refusal in the same round.
             reasons.append("orphan_guard")
             run["extra"]["pending_delete_guard"] = len(vanished)  # R2-C10
             vanished = []
