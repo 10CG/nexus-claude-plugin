@@ -240,7 +240,7 @@ class TestProjectSlugAndUserId(unittest.TestCase):
         """Amendment A6-4: a SessionStart was measured at 11 `rev-parse
         --show-toplevel` calls, each with a 5 s timeout. The second call for
         the same cwd must come from the cache; a different cwd must not."""
-        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo/.git\n/x/therepo\n")
         with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
                 mock.patch("subprocess.run", return_value=done) as run:
             self.assertEqual(_identity.project_slug("/x/therepo/a"), "therepo")
@@ -365,7 +365,7 @@ class TestProjectRoot(unittest.TestCase):
     def test_shares_the_one_git_call_with_project_identity(self):
         """Amendment A6-4: asking both for the same cwd must cost one
         subprocess, not two -- the whole reason this shares a cache."""
-        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo/.git\n/x/therepo\n")
         with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
                 mock.patch("subprocess.run", return_value=done) as run:
             self.assertEqual(_identity.project_identity("/x/therepo/a"), ("therepo", False))
@@ -461,7 +461,7 @@ class TestMemoryDirKey(unittest.TestCase):
         """Calling this for a cwd already asked about by project_root (or
         project_identity) must cost zero extra subprocesses -- same cache,
         same Amendment A6-4 guarantee."""
-        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo\n")
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"/x/therepo/.git\n/x/therepo\n")
         with mock.patch.dict(_identity._SLUG_CACHE, clear=True), \
                 mock.patch("subprocess.run", return_value=done) as run:
             _identity.project_root("/x/therepo/a")
@@ -589,6 +589,69 @@ class TestPluginVersion(unittest.TestCase):
             with self.subTest(version=good), self._with_manifest(json.dumps({"version": good})):
                 self.assertEqual(_identity.plugin_version(), good)
 
+
+class TestA10CommonDirAndCompositeKey(unittest.TestCase):
+    """A10-12 (owner 2026-10-17; K31 machine-verified 2026-10-28) and
+    A10-6(4) (owner 2026-10-29): the git root now derives from
+    --git-common-dir (a linked worktree answers its MAIN worktree root),
+    and memory_dir_key folds the config dir into the key."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._cache = _identity._SLUG_CACHE
+        self.addCleanup(self._cache.clear)
+
+    def _repo(self, name):
+        repo = os.path.join(self._tmp.name, name)
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        return repo
+
+    def test_a_linked_worktree_root_is_the_main_worktree(self):
+        main = self._repo("main-repo")
+        subprocess.run(
+            ["git", "-C", main,
+             "-c", "user.name=test", "-c", "user.email=test@example.com",
+             "commit", "-q", "--allow-empty", "-m", "init"],
+            check=True, capture_output=True,
+        )
+        wt = os.path.join(self._tmp.name, "the-worktree")
+        subprocess.run(
+            ["git", "-C", main, "worktree", "add", "-q", "-b", "wt", wt],
+            check=True, capture_output=True,
+        )
+        self.assertEqual(_identity.project_root(wt), (main, False))
+        # The plain toplevel differs -- this is exactly the K31 shape the
+        # change closes (Claude Code writes memory under the MAIN key).
+        self.assertNotEqual(
+            subprocess.run(["git", "-C", wt, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True).stdout.strip(), main)
+        key_wt, _ = _identity.memory_dir_key(wt)
+        key_main, _ = _identity.memory_dir_key(main)
+        self.assertEqual(key_wt, key_main)
+
+    def test_the_default_config_dir_yields_the_plain_key(self):
+        repo = self._repo("plain")
+        key_none, _ = _identity.memory_dir_key(repo)
+        key_default, _ = _identity.memory_dir_key(repo, _identity._DEFAULT_CONFIG_DIR)
+        self.assertEqual(key_none, key_default)
+        self.assertNotIn("@", key_default)
+
+    def test_a_custom_config_dir_gets_a_stable_distinct_suffix(self):
+        repo = self._repo("suffixed")
+        custom = os.path.join(self._tmp.name, "other-config")
+        other = os.path.join(self._tmp.name, "third-config")
+        k1, _ = _identity.memory_dir_key(repo, custom)
+        k2, _ = _identity.memory_dir_key(repo, custom)
+        k3, _ = _identity.memory_dir_key(repo, other)
+        plain, _ = _identity.memory_dir_key(repo)
+        self.assertEqual(k1, k2)          # same dir -> same key, always
+        self.assertNotEqual(k1, k3)       # different dir -> different key
+        self.assertNotEqual(k1, plain)    # and never the unsuffixed form
+        self.assertTrue(k1.startswith(plain + "@"))
+        self.assertEqual(len(k1.rsplit("@", 1)[1]), 10)  # 10-hex digest
 
 class TestProjectKey(unittest.TestCase):
     """X1-policy (owner 2026-10-14/17): the provenance `project` scope key.

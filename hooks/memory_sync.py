@@ -475,16 +475,24 @@ _RECONCILE_MAX_BODY_BYTES = 2 * 1024 * 1024
 # session_inject's ledger scan can read this hook's own per-memory-dir-key
 # state files as that project's unreadable ledgers (reproduced; see the R1
 # report). The cluster's own fix -- a leading "." no project slug can ever
-# produce -- is NOT applied here: the owner ruling's own corollary (X1,
-# item 2) and the unchanged-items list (item 7) both give this exact path
-# literally, `${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.json`,
-# and "do not change behaviour a binding ruling covers, except as the
-# ruling says" leaves no room to rename it unilaterally. Left as `HOOK`
-# (below) on purpose, matching the ruling's literal text; the collision
-# risk is real but reported to the owner (see owner_questions), not solved
-# here. K09's new run-lock file lives in the SAME directory for the same
-# reason -- no new namespace to litigate.
-_STATE_SUBDIR = HOOK
+# A10-9 (owner 2026-10-29, superseding the note this comment replaces): the
+# state subdirectory is `.memory-sync/`, a name `normalize_slug` can never
+# produce (no slug starts with a dot) -- the K25 collision, where a project
+# whose own slug is "memory-sync" would have had the state directory read
+# as its ledger directory, is closed structurally. K09's run-lock file
+# lives in the SAME directory for the same reason -- no new namespace to
+# litigate.
+_STATE_SUBDIR = ".memory-sync"
+
+
+def _identity_digest(user_id, container_id):
+    """A10-7 option A: a stable 10-hex digest of the round's identity
+    (``user_id`` + ``container_id``), embedded in the state file NAME so a
+    changed identity starts from a fresh state instead of silently reusing
+    another identity's synced/cursor bookkeeping (K16). The separator is a
+    NUL byte so no (user_id, container_id) pair can concatenate into
+    another pair's digest."""
+    return hashlib.sha256(f"{user_id}\x00{container_id}".encode("utf-8")).hexdigest()[:10]
 
 # K24: bumped whenever _split_memory_frontmatter / _cap_body / _cap_for_wire
 # / _build_memory_metadata's own content/metadata ASSEMBLY rules change in a
@@ -851,8 +859,8 @@ def _build_memory_metadata(key, project_name, slug, frontmatter, modified, proje
 
 # ── memory-sync's own state file (X1 corollary: keyed by memory dir key) ─
 
-def _memory_state_path_under(state_root, key):
-    """``<state_root>/memory-sync/<memory dir key>.json`` -- the ROUND-SAFE
+def _memory_state_path_under(state_root, key, id_digest):
+    """``<state_root>/.memory-sync/<memory dir key>.<id digest>.json`` -- the ROUND-SAFE
     form (P1): ``state_root`` is the caller's OWN, already-resolved value
     (``_hook_state.state_root()``, called ONCE in ``main()`` before the
     worker thread starts), never re-resolved here. ``_collect`` calls
@@ -867,28 +875,26 @@ def _memory_state_path_under(state_root, key):
     that happen to share a basename cannot read and write the same state
     file -- see ``_identity.memory_dir_key``'s own docstring for the
     mass-deletion shape that keying-by-basename would otherwise
-    reproduce. The directory is ``_STATE_SUBDIR`` (``== HOOK``, i.e. the
-    literal ``"memory-sync"`` the owner ruling's own corollary gives this
-    path as) -- see that constant's own docstring (K25) for a real,
-    REPORTED-not-fixed collision this literal name has with the ledger
-    directory namespace for a project whose own slug happens to be
-    "memory-sync"."""
-    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.json")
+    reproduce. The directory is ``_STATE_SUBDIR`` (``".memory-sync"``,
+    A10-9) and the file name carries the round's identity digest (A10-7
+    option A) -- see those amendments' own notes for what each part of
+    the name prevents."""
+    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.{id_digest}.json")
 
 
-def _memory_state_path(key):
-    """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.json`` --
-    the CONVENIENCE form: resolves ``_hook_state.state_root()`` itself,
+def _memory_state_path(key, id_digest):
+    """``${NEXUS_HOOK_STATE_DIR}/.memory-sync/<memory dir key>.<id digest>.json``
+    -- the CONVENIENCE form: resolves ``_hook_state.state_root()`` itself,
     fresh, on every call. For this module's own tests and any other
     caller OUTSIDE the worker path ONLY (P1) -- ``_collect`` must never
     call this; see ``_memory_state_path_under`` above, which it calls
     instead, fed from the state root ``main()`` captured once before
     starting the worker."""
-    return _memory_state_path_under(_hook_state.state_root(), key)
+    return _memory_state_path_under(_hook_state.state_root(), key, id_digest)
 
 
-def _memory_run_lock_path_under(state_root, key):
-    """``<state_root>/memory-sync/<memory dir key>.run.lock`` -- the
+def _memory_run_lock_path_under(state_root, key, id_digest):
+    """``<state_root>/.memory-sync/<memory dir key>.<id digest>.run.lock`` -- the
     ROUND-SAFE form (P1), mirroring ``_memory_state_path_under`` above:
     ``state_root`` is the caller's own, already-resolved value, never
     re-resolved here. ``_collect`` calls THIS form.
@@ -906,16 +912,16 @@ def _memory_run_lock_path_under(state_root, key):
     each individual read-modify-write): this one is held for the WHOLE
     network-making portion of one round, which ``_locked`` is not shaped
     for and must not be repurposed to do."""
-    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.run.lock")
+    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.{id_digest}.run.lock")
 
 
-def _memory_run_lock_path(key):
+def _memory_run_lock_path(key, id_digest):
     """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.run.lock`` --
     the CONVENIENCE form (see ``_memory_state_path``'s own docstring):
     resolves ``_hook_state.state_root()`` itself, fresh, on every call.
     For this module's own tests and any other caller OUTSIDE the worker
     path ONLY -- ``_collect`` calls ``_memory_run_lock_path_under`` instead."""
-    return _memory_run_lock_path_under(_hook_state.state_root(), key)
+    return _memory_run_lock_path_under(_hook_state.state_root(), key, id_digest)
 
 
 _NO_RUN_LOCK = -1  # sentinel: the lock could not even be ATTEMPTED; proceed unlocked
@@ -2019,7 +2025,7 @@ def _collect(run):
     if not base_url:
         return "not_configured"  # the default for a fresh install; do nothing else
 
-    key, degraded = _identity.memory_dir_key(cwd)
+    key, degraded = _identity.memory_dir_key(cwd, run["config_dir"])
     run["key"] = key
     run["extra"]["memory_dir"] = key
     # X1-policy (TASK-007): these are fact-layer rows, and the D's fact delta
@@ -2057,7 +2063,17 @@ def _collect(run):
         # `_collect` got, but nothing wrote this key into it yet.
         run["extra"]["unresolved_files"] = sorted(indeterminate)[:5]
 
-    state_path = _memory_state_path_under(run["state_root"], key)
+    # A10-7 option A (owner 2026-10-29): the state FILENAME carries a short
+    # digest of (user_id, container_id). A changed identity therefore starts
+    # from a fresh state (full re-sync under the new identity, bulk bucket),
+    # and rows written under the old one simply read as a peer container's
+    # -- no drift detection, no container_id stored in the state, exactly
+    # the A9-11 doctrine. The user_id fold happens HERE (it only needs the
+    # already-read run["default_user_id"] and the cwd from this round's own
+    # stdin payload -- not an environment input).
+    round_user_id = run["default_user_id"] or _identity.project_slug(cwd)
+    id_digest = _identity_digest(round_user_id, run["container_id"])
+    state_path = _memory_state_path_under(run["state_root"], key, id_digest)
     state, reasons = _hook_state.read_state_at(state_path)
     run["reasons"] = reasons  # K02: the SAME list, mutated as this round goes
     # R4-C3: captured BEFORE `reasons` can grow any further below -- this is
@@ -2115,7 +2131,7 @@ def _collect(run):
         run["calls"] = 0
         return _hook_state.worst_reason(reasons)
 
-    lock_fd = _acquire_run_lock(_memory_run_lock_path_under(run["state_root"], key))
+    lock_fd = _acquire_run_lock(_memory_run_lock_path_under(run["state_root"], key, id_digest))
     if lock_fd is None:
         # K09: a concurrent SessionEnd run for this SAME memory directory
         # already holds the round lock -- both runs would otherwise start
@@ -2170,7 +2186,7 @@ def _collect(run):
         # comes from this round's own stdin payload, read above, which is
         # not an environment input P1 is about).
         token = run["token"]
-        user_id = run["default_user_id"] or _identity.project_slug(cwd)
+        user_id = round_user_id  # folded once above, next to the state path (A10-7)
         client = _ingest_client.IngestClient(
             base_url, token, user_id, run["container_id"], SOURCE_NAME,
             timeout=_HTTP_TIMEOUT_SECONDS, bulk=True, deadline=run["deadline"],
@@ -2528,7 +2544,7 @@ def main():
             base_url=os.environ.get("NEXUS_API_URL", "").rstrip("/"),
             token=os.environ.get("NEXUS_API_TOKEN", ""),
             state_root=_hook_state.state_root(),
-            config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+            config_dir=_identity.claude_config_dir(),  # A10-6(4): the one definition
             # Raw env value (None if unset, possibly ""), not yet folded
             # with the cwd-derived fallback: `_identity.user_id`'s own `or
             # project_slug(cwd)` half needs `cwd`, which is not known until

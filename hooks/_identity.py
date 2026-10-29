@@ -48,6 +48,7 @@ Two different identities are in play and they are NOT interchangeable:
     project.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -107,6 +108,12 @@ def normalize_slug(text):
 # "already asked" from "never asked" apart.
 _SLUG_CACHE = {}  # cwd -> (toplevel_or_None, degraded)
 
+# A10-6(4): the FIXED default config dir, resolved once at import (main
+# thread). memory_dir_key compares against THIS, not a live
+# expanduser/environ read, so the comparison itself never reads the
+# environment on a worker thread (P1 static guard).
+_DEFAULT_CONFIG_DIR = os.path.expanduser("~/.claude")
+
 
 def _resolved_root(cwd):
     """The one ``git rev-parse --show-toplevel`` call this process makes for
@@ -120,12 +127,30 @@ def _resolved_root(cwd):
     degraded = False
     try:
         result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            # A10-12 (owner 2026-10-17; K31 machine-verified 2026-10-28,
+            # Claude Code 2.1.312): print BOTH the common dir and the plain
+            # toplevel in one subprocess. In a linked worktree Claude Code
+            # keys auto-memory (and every project-scoped path) by the MAIN
+            # worktree's canonical root -- --show-toplevel answers the
+            # worktree's OWN path there, so every key derived from it alone
+            # pointed at a directory Claude Code never writes. The common
+            # dir is <main>/.git for both checkouts; its parent IS the main
+            # worktree root. Odd shapes where the common dir does not end
+            # in ".git" keep the plain toplevel answer.
+            ["git", "-C", cwd, "rev-parse", "--path-format=absolute",
+             "--git-common-dir", "--show-toplevel"],
             capture_output=True,
             timeout=5,
         )
         if result.returncode == 0:
-            toplevel = result.stdout.decode().strip() or None
+            lines = [ln for ln in result.stdout.decode().strip().splitlines() if ln.strip()]
+            common = lines[0] if lines else None
+            plain = lines[1] if len(lines) > 1 else None
+            if common and os.path.basename(common) == ".git":
+                toplevel = os.path.dirname(common) or plain
+            else:
+                toplevel = plain
+            toplevel = toplevel or None
         elif b"not a git repository" not in result.stderr.lower():
             # git is there and refused to answer -- `dubious ownership`
             # (a checkout mounted into a container under another uid, this
@@ -138,6 +163,15 @@ def _resolved_root(cwd):
     resolved = (toplevel, degraded)
     _SLUG_CACHE[cwd] = resolved
     return resolved
+
+
+def claude_config_dir():
+    """The Claude Code config dir for this process: ``CLAUDE_CONFIG_DIR``
+    when set, else ``~/.claude``. THE single definition (A10-6(4),
+    owner 2026-10-29): memory_sync's ``main()`` pre-reads its round's value
+    from here, and ``memory_dir_key`` compares against the same ``~/.claude``
+    default when deciding whether a config dir is the canonical store."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 
 
 def project_identity(cwd):
@@ -187,7 +221,7 @@ def project_root(cwd):
 _NON_ALNUM_ASCII_RE = re.compile(r"[^A-Za-z0-9]")
 
 
-def memory_dir_key(cwd):
+def memory_dir_key(cwd, config_dir=None):
     """``(key, degraded)``: the Claude Code project-directory key for ``cwd``'s
     git toplevel, and whether it is a guess.
 
@@ -224,10 +258,34 @@ def memory_dir_key(cwd):
     produces (``/home/dev/nexus`` has one). Reusing ``normalize_slug`` would
     compute a key that does not match the directory Claude Code actually
     created on disk, and the whole point of this function is to match it.
+
+    A10-6(4) (owner 2026-10-29): ``config_dir`` folds the Claude Code
+    CONFIG directory into the key. The memory directory is
+    ``<config_dir>/projects/<key>/memory`` -- two different config dirs
+    (two accounts alternating ``CLAUDE_CONFIG_DIR`` over one checkout) are
+    two DIFFERENT stores, and an unsuffixed key made them share one state
+    file and one external_id namespace: each round treated the other
+    store's rows as vanished and deleted five of them, next round rebuilt
+    them under fresh ids -- feedback and quality scores lost every cycle.
+    The suffix rule keeps the overwhelmingly common case readable: the
+    fixed default ``~/.claude`` (and ``config_dir=None``, the
+    config-UNSCOPED form handoff_sync's repo-scoped prefix uses per
+    A10-12(2)) yields the plain key; any other directory yields
+    ``<key>@<10 hex of sha256>`` -- different dirs can never collide, the
+    same dir is always the same key. The comparison is against the FIXED
+    default, not ``claude_config_dir()``'s live resolution: an env override
+    is exactly the second store the suffix exists to separate.
     """
     toplevel, degraded = _resolved_root(cwd)
     path = toplevel if toplevel else cwd
     key = _NON_ALNUM_ASCII_RE.sub("-", os.path.abspath(path))
+    if config_dir is not None and os.path.abspath(config_dir) != _DEFAULT_CONFIG_DIR:
+        # The fixed default is captured at IMPORT time (main thread), never
+        # re-read on a worker thread -- the P1 static guard flags any
+        # environment-reading call inside a worker-reachable function, and
+        # os.path.expanduser reads HOME.
+        digest = hashlib.sha256(os.path.abspath(config_dir).encode("utf-8")).hexdigest()[:10]
+        key = f"{key}@{digest}"
     return key, degraded
 
 
