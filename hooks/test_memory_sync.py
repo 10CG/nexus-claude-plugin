@@ -123,7 +123,7 @@ _REAL_STATE_SUBDIRS_EXISTED_BEFORE = {}
 _MODULE_ENV_PATCHER = None
 
 
-def _recording_memory_dir_key(cwd):
+def _recording_memory_dir_key(cwd, config_dir=None):
     """Wraps the real ``_identity.memory_dir_key`` for the lifetime of
     this module's run (installed/restored by ``setUpModule`` below),
     recording every key it ever returns -- from a direct test-file call
@@ -143,7 +143,7 @@ def _recording_memory_dir_key(cwd):
     narrower, and therefore immune to a concurrent session's own
     unrelated hook writes (H2-5), than comparing the whole real
     ``~/.nexus`` the way this module's predecessor guard did."""
-    key, degraded = _REAL_MEMORY_DIR_KEY(cwd)
+    key, degraded = _REAL_MEMORY_DIR_KEY(cwd, config_dir)  # A10-6(4): forward the config dir
     with _SEEN_MEMORY_DIR_KEYS_LOCK:
         _SEEN_MEMORY_DIR_KEYS.add(key)
     return key, degraded
@@ -1283,7 +1283,7 @@ class TestProjectKeyOnTheWire(unittest.TestCase):
         subprocess.run(["git", "init", "-q", self.cwd], check=True, capture_output=True)
         self.state_dir = os.path.join(self.tmp.name, "state")
         self.config_dir = os.path.join(self.tmp.name, "claude-config")
-        self.key, _degraded = _identity.memory_dir_key(self.cwd)
+        self.key, _degraded = _identity.memory_dir_key(self.cwd, self.config_dir)  # A10-6(4): suffixed, like the round
         self.memory_dir = os.path.join(self.config_dir, "projects", self.key, "memory")
         os.makedirs(self.memory_dir)
         self.backend = _Backend()
@@ -1412,7 +1412,10 @@ class _WriteCase(unittest.TestCase):
         self.state_dir = os.path.join(self.tmp.name, "state")
         self.config_dir = os.path.join(self.tmp.name, "claude-config")
         self._patch(mock.patch.object(_identity, "_resolved_root", return_value=(self.cwd, False)))
-        self.key, _ = _identity.memory_dir_key(self.cwd)
+        # A10-6(4): the key is computed exactly as the hook's own round will
+        # compute it -- config dir included (the fixture's CLAUDE_CONFIG_DIR
+        # is a non-default dir, so this is the SUFFIXED form).
+        self.key, _ = _identity.memory_dir_key(self.cwd, self.config_dir)
         self.memory_dir = os.path.join(self.config_dir, "projects", self.key, "memory")
         os.makedirs(self.memory_dir)
         self.backend = _Backend()
@@ -1454,8 +1457,17 @@ class _WriteCase(unittest.TestCase):
         self.assertTrue(entries, "no ledger entry was written")
         return entries[-1]
 
+    def _id_digest(self):
+        """The digest the round will compute for (USER, CONTAINER) -- the
+        same pair the fixtures pin via env NEXUS_DEFAULT_USER_ID and the
+        container_id mock."""
+        return _MOD._identity_digest(USER, CONTAINER)
+
+    def _state_path(self, key=None):
+        return _MOD._memory_state_path(key or self.key, self._id_digest())
+
     def _state(self):
-        return _hook_state.read_state_at(_MOD._memory_state_path(self.key))[0]
+        return _hook_state.read_state_at(self._state_path())[0]
 
     def _ext(self, slug):
         return f"{self.key}/{slug}"
@@ -1473,7 +1485,7 @@ class _WriteCase(unittest.TestCase):
             "redaction_fingerprint": _MOD._current_fingerprint(),
         }
         _hook_state.update_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             lambda s, slug=slug, entry=entry: {
                 **s, "cursor": s.get("cursor", 0), "reconciled": True,
                 "files": {**(s.get("files") or {}), slug: entry},
@@ -1617,7 +1629,15 @@ class TestSingleFileSync(_WriteCase):
         self.assertEqual(methods.count("POST"), 3, methods)
         self.assertEqual(self._last_entry()["reason"], "rejected_422")
         state = self._state()
-        self.assertNotIn("bad", state.get("files", {}))
+        # A10-8(3): the 422 file now leaves a FAILED entry (its own stat +
+        # failed_hash, nothing synced) instead of no entry at all -- that
+        # marker is what keeps the re-report and the per-round re-attempt
+        # quiet until the file changes.
+        bad_entry = state.get("files", {}).get("bad")
+        self.assertIsNotNone(bad_entry, state)
+        self.assertEqual(
+            set(bad_entry), {"mtime", "size", "ctime", "failed_hash"}, bad_entry
+        )
         self.assertIn("zzz-good", state.get("files", {}))
         self.assertIn("zzz-last", state.get("files", {}))
 
@@ -1849,7 +1869,7 @@ class TestBatchingAndCursor(_WriteCase):
                               "synced_at": "2026-01-01T00:00:00Z",
                               "redaction_fingerprint": fingerprint}},
         }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         self._run()
         self.assertEqual(self.requests, [])
         self.assertEqual(self._last_entry()["reason"], "none")
@@ -1870,7 +1890,7 @@ class TestBatchingAndCursor(_WriteCase):
                                     "synced_at": "2026-01-01T00:00:00Z",
                                     "redaction_fingerprint": fingerprint}},
         }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         self._write("aa-new")
         # `reconciled: True` is already in the seeded state, so no
         # reconciliation GET happens this round -- the first real request is
@@ -2099,7 +2119,7 @@ class TestR2C01IndeterminateFilesNeverOrphaned(_WriteCase):
         kept_path = self._write("kept")
         st = os.stat(kept_path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"kept": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -2128,7 +2148,7 @@ class TestR2C01IndeterminateFilesNeverOrphaned(_WriteCase):
         path = self._write("was-synced")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"was-synced": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -2189,14 +2209,23 @@ class TestX1PrefixIsolation(_WriteCase):
         longer key's rows counted as the shorter key's orphans."""
         inner_cwd = os.path.join(self.cwd, "packages", "nexus-claude-plugin")
         os.makedirs(inner_cwd)
-        with mock.patch.object(_identity, "_resolved_root", return_value=(inner_cwd, False)):
-            inner_key, _ = _identity.memory_dir_key(inner_cwd)
-        self.assertTrue(inner_key.startswith(self.key))
-        self.assertNotEqual(inner_key, self.key)
-        inner_row = _row(f"{inner_key}/some-slug")
-        self.backend.reply(200, _page(inner_row))
-        self.backend.reply(200, _page())
-        self._run()
+        # A10-6(4): pin the fixed default to this fixture's config dir for
+        # the WHOLE test -- keys stay in the UNSUFFIXED form, which is where
+        # the string-prefix hazard this test guards lives (with a config-dir
+        # suffix the "@" terminator already separates the two keys, and a
+        # pass via suffix mismatch instead of the "/" separator rule would
+        # be vacuous). The ROUND runs under the same pin, so its own key is
+        # the unsuffixed outer key too.
+        with mock.patch.object(_identity, "_DEFAULT_CONFIG_DIR", self.config_dir):
+            with mock.patch.object(_identity, "_resolved_root", return_value=(inner_cwd, False)):
+                inner_key, _ = _identity.memory_dir_key(inner_cwd, self.config_dir)
+            outer_key, _ = _identity.memory_dir_key(self.cwd, self.config_dir)
+            self.assertTrue(inner_key.startswith(outer_key))
+            self.assertNotEqual(inner_key, outer_key)
+            inner_row = _row(f"{inner_key}/some-slug")
+            self.backend.reply(200, _page(inner_row))
+            self.backend.reply(200, _page())
+            self._run()
         # The inner key's row must NEVER be treated as this (outer) project's
         # row: external_id.startswith(outer_key + "/") is false here (the
         # character right after the shared prefix is "-", not "/"), so
@@ -2232,8 +2261,8 @@ class TestX1StateFileKeying(unittest.TestCase):
         with mock.patch.object(_identity, "_resolved_root", return_value=(cwd_b, False)):
             key_b, _ = _identity.memory_dir_key(cwd_b)
         self.assertNotEqual(key_a, key_b)
-        path_a = _MOD._memory_state_path(key_a)
-        path_b = _MOD._memory_state_path(key_b)
+        path_a = _MOD._memory_state_path(key_a, _MOD._identity_digest(USER, CONTAINER))
+        path_b = _MOD._memory_state_path(key_b, _MOD._identity_digest(USER, CONTAINER))
         self.assertNotEqual(path_a, path_b)
         _hook_state.write_state_at(path_a, {"files": {"f1": "a-owns-this"}})
         self.assertEqual(_hook_state.read_state_at(path_b)[0], {})  # b sees nothing of a's
@@ -2243,7 +2272,7 @@ class TestX1StateFileKeying(unittest.TestCase):
         os.makedirs(cwd)
         with mock.patch.object(_identity, "_resolved_root", return_value=(cwd, False)):
             key, _ = _identity.memory_dir_key(cwd)
-        memory_sync_path = _MOD._memory_state_path(key)
+        memory_sync_path = _MOD._memory_state_path(key, _MOD._identity_digest(USER, CONTAINER))
         basename_keyed_path = _hook_state.state_path(_MOD.HOOK, cwd)
         self.assertNotEqual(memory_sync_path, basename_keyed_path)
 
@@ -2361,7 +2390,7 @@ class TestPerFileStateWriteFailure(_WriteCase):
                          "redaction_fingerprint": _MOD._current_fingerprint()},
             },
         }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         os.remove(path)
         self.backend.reply(200, _page(_row(self._ext("gone")))).reply(204, None)
         with self._fail_update_for_slug("gone"):
@@ -2637,7 +2666,7 @@ class TestK01DirectoryListingFailure(_WriteCase):
         for slug, path in (("kept", kept_path), ("gone", gone_path)):
             st = os.stat(path)
             _hook_state.update_state_at(
-                _MOD._memory_state_path(self.key),
+                self._state_path(),
                 lambda s, slug=slug, path=path, st=st: {
                     **s, "cursor": 0, "reconciled": True,
                     "files": {**(s.get("files") or {}), slug: {
@@ -2669,7 +2698,7 @@ class TestK01DirectoryListingFailure(_WriteCase):
         path = self._write("gone")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"gone": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -2705,7 +2734,7 @@ class TestK01ZeroLocalFilesPendingDelete(_WriteCase):
         path = self._write("only")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"only": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -2779,7 +2808,7 @@ class TestR2C03PerFileCursorPersistence(_WriteCase):
         real_record_run = _hook_state.record_run
 
         def spy(*a, **kw):
-            on_disk = _hook_state.read_state_at(_MOD._memory_state_path(self.key))[0]
+            on_disk = _hook_state.read_state_at(self._state_path())[0]
             seen["cursor"] = on_disk.get("cursor")
             seen["files"] = sorted((on_disk.get("files") or {}).keys())
             return real_record_run(*a, **kw)
@@ -2800,7 +2829,7 @@ class TestR2C03PerFileCursorPersistence(_WriteCase):
         path = self._write("f1")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"f1": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -2933,7 +2962,7 @@ class TestR2C10ReconcileAttributionAndForwardProgress(_WriteCase):
         path = self._write("only")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"only": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -2958,7 +2987,7 @@ class TestR2C10ReconcileAttributionAndForwardProgress(_WriteCase):
         path = self._write("only")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"only": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -3017,7 +3046,7 @@ class TestR2C12AlsoFailedIsComputedForEveryLedgerRow(_WriteCase):
         for slug, path in (("kept", kept_path), ("gone", gone_path)):
             st = os.stat(path)
             _hook_state.update_state_at(
-                _MOD._memory_state_path(self.key),
+                self._state_path(),
                 lambda s, slug=slug, path=path, st=st: {
                     **s, "cursor": 0, "reconciled": True,
                     "files": {**(s.get("files") or {}), slug: {
@@ -3058,7 +3087,7 @@ class TestK03AbortPropagation(_WriteCase):
         for slug, p in (("gone", path),):
             st = os.stat(p)
             _hook_state.write_state_at(
-                _MOD._memory_state_path(self.key),
+                self._state_path(),
                 {"cursor": 0, "reconciled": False, "files": {slug: {
                     "mtime": st.st_mtime, "size": st.st_size,
                     "ctime": getattr(st, "st_ctime_ns", None),
@@ -3086,7 +3115,7 @@ class TestK03AbortPropagation(_WriteCase):
         kept_path = self._write("kept")
         st = os.stat(kept_path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": False, "files": {"kept": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -3162,7 +3191,7 @@ class TestK05UnreadableFileDuringDirtyScan(_WriteCase):
         for slug, path in (("bad", bad_path), ("good", good_path)):
             st = os.stat(path)
             _hook_state.update_state_at(
-                _MOD._memory_state_path(self.key),
+                self._state_path(),
                 lambda s, slug=slug, path=path, st=st: {
                     **s, "cursor": 0, "reconciled": True,
                     "files": {**(s.get("files") or {}), slug: {
@@ -3215,7 +3244,7 @@ class TestK05UnreadableFileMockTwin(_WriteCase):
         for slug, path in (("bad", bad_path), ("good", good_path)):
             st = os.stat(path)
             _hook_state.update_state_at(
-                _MOD._memory_state_path(self.key),
+                self._state_path(),
                 lambda s, slug=slug, path=path, st=st: {
                     **s, "cursor": 0, "reconciled": True,
                     "files": {**(s.get("files") or {}), slug: {
@@ -3249,7 +3278,7 @@ class TestK05UnreadableFileMockTwin(_WriteCase):
 class TestK05CorruptStateShape(_WriteCase):
     def test_files_as_a_list_is_treated_as_absent_and_self_heals(self):
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": ["not-a-dict"]},
+            self._state_path(), {"cursor": 0, "reconciled": True, "files": ["not-a-dict"]},
         )
         self._write("f1")
         self.backend.reply(*_empty_lookup()).reply(*_created("m1"))
@@ -3273,7 +3302,7 @@ class TestK05CorruptStateShape(_WriteCase):
         kept_path = self._write("kept")
         st = os.stat(kept_path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {
                 "ghost": "corrupted-entry",
                 "kept": {
@@ -3344,7 +3373,12 @@ class TestK07UnparsableFrontmatterEndToEnd(_WriteCase):
         posts = [r["json"]["metadata"]["external_id"] for r in self.requests if r["method"] == "POST"]
         self.assertEqual(sorted(posts), sorted(self._ext(s) for s in ("a1", "a2", "a4")))
         self.assertEqual(self._last_entry()["reason"], "file_unparsable")
-        self.assertNotIn("a3", self._state().get("files", {}))
+        # A10-8(3): an unparsable file leaves a FAILED entry (stat +
+        # failed_hash, nothing synced) -- reported once per version, not
+        # re-attempted every round.
+        a3_entry = self._state().get("files", {}).get("a3")
+        self.assertIsNotNone(a3_entry, self._state())
+        self.assertEqual(set(a3_entry), {"mtime", "size", "ctime", "failed_hash"}, a3_entry)
         for slug in ("a1", "a2", "a4"):
             self.assertIn(slug, self._state().get("files", {}))
 
@@ -3397,7 +3431,7 @@ class TestK08LedgerCountsAndFailedFiles(_WriteCase):
 
 class TestK09ConcurrentRunLock(_WriteCase):
     def test_a_concurrent_run_for_the_same_key_does_no_network_work(self):
-        lock_fd = _MOD._acquire_run_lock(_MOD._memory_run_lock_path(self.key))
+        lock_fd = _MOD._acquire_run_lock(self._state_path().replace(".json", ".run.lock"))
         self.assertIsNotNone(lock_fd)
         self.addCleanup(_MOD._release_run_lock, lock_fd)
         self._write("f1")
@@ -3416,7 +3450,7 @@ class TestK09ConcurrentRunLock(_WriteCase):
         report either -- flock releases the instant that process exits."""
         _hook_state.record_run(_MOD.HOOK, ok=False, reason="orphan_guard", cwd=self.cwd)
         before, _ = _hook_state.read_ledger(_MOD.HOOK, self.cwd)
-        lock_fd = _MOD._acquire_run_lock(_MOD._memory_run_lock_path(self.key))
+        lock_fd = _MOD._acquire_run_lock(self._state_path().replace(".json", ".run.lock"))
         self.addCleanup(_MOD._release_run_lock, lock_fd)
         self._write("f1")
         self._run()
@@ -3425,7 +3459,7 @@ class TestK09ConcurrentRunLock(_WriteCase):
         self.assertEqual(after, before, "a peer-running round must not append its own ledger row")
 
     def test_the_lock_is_released_so_the_next_round_proceeds_normally(self):
-        lock_fd = _MOD._acquire_run_lock(_MOD._memory_run_lock_path(self.key))
+        lock_fd = _MOD._acquire_run_lock(self._state_path().replace(".json", ".run.lock"))
         self._write("f1")
         self._run()
         _MOD._release_run_lock(lock_fd)
@@ -3514,7 +3548,7 @@ class TestK10WorkerThreadStderrGuard(unittest.TestCase):
         self.backend = _Backend()
         self.addCleanup(self.backend.close)
         with mock.patch.object(_identity, "_resolved_root", return_value=(self.cwd, False)):
-            self.key, _ = _identity.memory_dir_key(self.cwd)
+            self.key, _ = _identity.memory_dir_key(self.cwd, self.config_dir)  # A10-6(4): suffixed, like the round
         self.memory_dir = os.path.join(self.config_dir, "projects", self.key, "memory")
         os.makedirs(self.memory_dir)
         _write_memory_file(self.memory_dir, "dup")
@@ -3638,7 +3672,7 @@ class TestK12PerFileBudgetChecks(_WriteCase):
                 "file_hash": "sha256:" + "0" * 64, "synced_at": "2026-01-01T00:00:00Z",
                 "redaction_fingerprint": fp,
             }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         self.backend.reply(200, _page(_row(self._ext("a-dirty"), content_hash="sha256:" + "1" * 64)))
         self.backend.reply(200, {"memory_id": "m1"}, delay=1.6)
         with mock.patch.object(_MOD, "_WORK_BUDGET_SECONDS", 2.0), \
@@ -3711,7 +3745,7 @@ class TestK13OrphanGuardBoundary(_WriteCase):
                 "redaction_fingerprint": fp,
             }
         _hook_state.update_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             lambda s, files=files: {
                 **s, "cursor": s.get("cursor", 0), "reconciled": s.get("reconciled", False),
                 "files": {**(s.get("files") or {}), **files},
@@ -3793,7 +3827,7 @@ class TestK14SubdirectoryStart(unittest.TestCase):
         os.makedirs(sub)
         state_dir = os.path.join(tmp.name, "state")
         config_dir = os.path.join(tmp.name, "claude-config")
-        key, degraded = _identity.memory_dir_key(repo)
+        key, degraded = _identity.memory_dir_key(repo, config_dir)  # A10-6(4): like the round
         self.assertFalse(degraded)
         memory_dir = os.path.join(config_dir, "projects", key, "memory")
         os.makedirs(memory_dir)
@@ -3830,7 +3864,7 @@ class TestK18DirtySetRotation(_WriteCase):
                 "redaction_fingerprint": fp_old,
             }
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": files},
+            self._state_path(), {"cursor": 0, "reconciled": True, "files": files},
         )
         self._write(real_slug, body="a genuinely different body now")
         # Only the real edit should get a lookup+PATCH within this round's
@@ -3872,7 +3906,7 @@ class TestK18DirtySetRotation(_WriteCase):
                 "redaction_fingerprint": fp,
             }
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": files},
+            self._state_path(), {"cursor": 0, "reconciled": True, "files": files},
         )
         for slug in old_paths:
             self._write(slug, body="edited for real")
@@ -3934,7 +3968,7 @@ class TestK20PartialDeletePreservesMapping(_WriteCase):
         path = self._write("gone")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"gone": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -3969,7 +4003,7 @@ class TestK21SameSizeContentRewrite(_WriteCase):
         path = self._write("f1", body="version-one-same-length-text")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": True, "files": {"f1": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -4125,19 +4159,80 @@ class TestK24AssemblyChangeDirtiesEndToEnd(_WriteCase):
         self.assertEqual([r["method"] for r in self.requests], ["GET", "PATCH"])
 
 
-class TestK25StateSubdirCollisionIsKnownAndReported(unittest.TestCase):
-    """K25's own fix (renaming the dotless "memory-sync" state subdirectory
-    to one no project slug can ever produce) is deliberately NOT applied --
-    the owner ruling's own corollary (X1, item 2) and its unchanged-items
-    list (item 7) both give this exact path literally, including the
-    dotless directory name, and a binding ruling is not this round's to
-    rewrite. This test documents the collision as a known, CURRENT fact
-    (not a regression guard for a fix that does not exist) -- see
-    not_fixed / owner_questions for the K25 write-up."""
+class TestA10_8DeterministicFailures(_WriteCase):
+    """A10-8 (owner 2026-10-29): a NUL body is file_unparsable (never
+    silently replaced); an empty body is its own empty_body skip class;
+    deterministic failures are reported once per file VERSION (state
+    records failed_hash) -- and A10-6(2): an already-gone row counts its
+    own already_gone counter, not deleted."""
 
-    def test_a_project_named_memory_sync_collides_with_the_state_subdir(self):
-        self.assertEqual(_identity.normalize_slug("memory-sync"), _MOD._STATE_SUBDIR)
-        self.assertEqual(_MOD._STATE_SUBDIR, _MOD.HOOK)
+    def test_a_nul_body_is_file_unparsable_reported_once_per_version(self):
+        self.backend.reply(200, _page())  # reconciliation: nothing ours
+        self._write("nulled", body="before\x00after")
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "file_unparsable", entry)
+        n_after_first = len(self.requests)
+        # Round 2: same bytes, same failed_hash -- quiet, zero network calls.
+        self._run()
+        entry2 = self._last_entry()
+        self.assertEqual(entry2["reason"], "none", entry2)
+        self.assertEqual(len(self.requests), n_after_first, self.requests[n_after_first:])
+        # Round 3: the file genuinely changed -- reported again.
+        _write_memory_file(self.memory_dir, "nulled", body="other\x00content")
+        self._run()
+        entry3 = self._last_entry()
+        self.assertEqual(entry3["reason"], "file_unparsable", entry3)
+
+    def test_an_empty_body_is_the_empty_body_skip_class(self):
+        self.backend.reply(200, _page())  # reconciliation: nothing ours
+        self._write("hollow", body="")
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "empty_body", entry)
+        n_after_first = len(self.requests)
+        self._run()
+        entry2 = self._last_entry()
+        self.assertEqual(entry2["reason"], "none", entry2)
+        self.assertEqual(len(self.requests), n_after_first)
+
+    def test_an_already_gone_row_counts_its_own_counter(self):
+        path = self._write("gone")
+        st = os.stat(path)
+        _hook_state.write_state_at(
+            self._state_path(),
+            {"cursor": 0, "reconciled": True, "files": {"gone": {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }}},
+        )
+        os.remove(path)  # the directory stays present-but-empty (A10-5 releases)
+        self.backend.reply(200, _page())  # pending-delete lookup: nothing there
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry.get("already_gone"), 1, entry)
+        self.assertNotIn("deleted", entry, entry)
+        self.assertEqual(entry["reason"], "none", entry)
+
+
+
+class TestA10_9StateSubdirCollisionIsClosed(unittest.TestCase):
+    """A10-9 (owner 2026-10-29): the state subdirectory is now
+    ``.memory-sync`` -- a name ``normalize_slug`` can never produce (no
+    slug starts with a dot), closing K25's collision structurally. A
+    project whose own slug is "memory-sync" no longer shares a namespace
+    with the state directory."""
+
+    def test_a_project_named_memory_sync_can_no_longer_collide(self):
+        self.assertEqual(_MOD._STATE_SUBDIR, ".memory-sync")
+        self.assertFalse(_identity.normalize_slug("memory-sync").startswith("."))
+        self.assertNotEqual(_identity.normalize_slug("memory-sync"), _MOD._STATE_SUBDIR)
+
+    def test_the_state_path_lives_in_the_dotted_subdir(self):
+        path = _MOD._memory_state_path_under("/sr", "some-key", "abcd1234")
+        self.assertEqual(path, os.path.join("/sr", ".memory-sync", "some-key.abcd1234.json"))
 
 
 class TestK26ListReconciliationDeadlineBound(_WriteCase):
@@ -4152,7 +4247,7 @@ class TestK26ListReconciliationDeadlineBound(_WriteCase):
         path = self._write("f1")
         st = os.stat(path)
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key),
+            self._state_path(),
             {"cursor": 0, "reconciled": False, "files": {"f1": {
                 "mtime": st.st_mtime, "size": st.st_size,
                 "ctime": getattr(st, "st_ctime_ns", None),
@@ -4310,7 +4405,7 @@ class TestR2C11PageFullUsesRawPageLength(_WriteCase):
                 "redaction_fingerprint": _MOD._current_fingerprint(),
             }
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": entries},
+            self._state_path(), {"cursor": 0, "reconciled": True, "files": entries},
         )
         os.remove(path)
 
@@ -4422,7 +4517,7 @@ class TestR3T01ZeroRegularFilesGuardIgnoresIndeterminate(_WriteCase):
             path = self._write(slug)
             st = os.stat(path)
             _hook_state.update_state_at(
-                _MOD._memory_state_path(self.key),
+                self._state_path(),
                 lambda s, slug=slug, path=path, st=st: {
                     **s, "cursor": 0,
                     "files": {**(s.get("files") or {}), slug: {
@@ -4516,7 +4611,14 @@ class TestR3T03CursorAdvanceAndPlaceholderPersistAreCovered(_WriteCase):
         real_update = _hook_state.update_state_at
 
         def side_effect(path, mutate):
-            if mutate.__qualname__ == "_advance_cursor_only.<locals>.<lambda>":
+            # A10-8(3): a deterministic local skip's advance rides
+            # _advance_cursor_only OR _record_failed_hash (the 422 shape
+            # writes its failed marker WITH the advance) -- both are this
+            # test's subject.
+            if mutate.__qualname__ in (
+                "_advance_cursor_only.<locals>.<lambda>",
+                "_record_failed_hash.<locals>._mutate",
+            ):
                 current, _ = _hook_state.read_state_at(path)
                 return current, ["state_write_failed"]
             return real_update(path, mutate)
@@ -4741,7 +4843,7 @@ class TestR3T02PersistentStateReadFailureSelfHealsEndToEnd(_WriteCase):
     def test_an_eacces_state_file_self_heals_and_the_round_progresses(self):
         for i in range(7):
             self._write(f"f{i}")
-        path = _MOD._memory_state_path(self.key)
+        path = self._state_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("{}")
@@ -4863,7 +4965,7 @@ class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
                 "synced_at": "2026-01-01T00:00:00Z",
                 "redaction_fingerprint": fingerprint,
             }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         # Touch both files so the mtime+size fast path misses and
         # _dirty_check recomputes the whole-file hash for each -- "a"'s
         # own recompute hits a transient I/O error, "b"'s hangs.
@@ -4925,7 +5027,7 @@ class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
                 "synced_at": "2026-01-01T00:00:00Z",
                 "redaction_fingerprint": fingerprint,
             }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         os.remove(a_path)
         os.remove(b_path)
         self.backend.reply(200, _page(_row(self._ext("gone-a")))).reply(204, None)
@@ -4981,7 +5083,7 @@ class TestR4C1OneTimeFactsSurviveAnAbandonedPersist(_WriteCase):
                  created_at="2026-10-01T10:00:00.000002Z"),
         )
         _hook_state.write_state_at(
-            _MOD._memory_state_path(self.key), {"cursor": 0, "reconciled": True, "files": {}}
+            self._state_path(), {"cursor": 0, "reconciled": True, "files": {}}
         )
         self.backend.reply(200, dup_rows).reply(204, None).reply(422, {"detail": "nope"})
 
@@ -5055,7 +5157,7 @@ class TestR4C1ProductionTailRealKill(unittest.TestCase):
         subprocess.run(["git", "init", "-q", self.cwd], check=True)
         self.state_dir = os.path.join(self.tmp.name, "state")
         self.config_dir = os.path.join(self.tmp.name, "claude-config")
-        self.key, _degraded = _identity.memory_dir_key(self.cwd)
+        self.key, _degraded = _identity.memory_dir_key(self.cwd, self.config_dir)  # A10-6(4): suffixed, like the round
         self.memory_dir = os.path.join(self.config_dir, "projects", self.key, "memory")
         os.makedirs(self.memory_dir)
         self.backend = _Backend()
@@ -5194,7 +5296,7 @@ class TestR4C3MidRoundStateRebuildIsVisible(_WriteCase):
                 "synced_at": "2026-01-01T00:00:00Z",
                 "redaction_fingerprint": fingerprint,
             }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         # f1 is edited so it is this round's one dirty candidate; f2 stays
         # untouched (clean, and never revisited this round).
         self._write("f1", body="edited body")
@@ -5202,7 +5304,7 @@ class TestR4C3MidRoundStateRebuildIsVisible(_WriteCase):
             200, _page(_row(self._ext("f1"), content_hash="sha256:" + "1" * 64)),
         ).reply(*_updated("m1"))
 
-        state_path = _MOD._memory_state_path(self.key)
+        state_path = self._state_path()
         real_open = open
         read_count = {"n": 0}
 
@@ -5235,7 +5337,7 @@ class TestR4C3MidRoundStateRebuildIsVisible(_WriteCase):
         brokenness the round already knew about from its very first
         read."""
         self._write("f1")
-        state_path = _MOD._memory_state_path(self.key)
+        state_path = self._state_path()
         os.makedirs(os.path.dirname(state_path), exist_ok=True)
         with open(state_path, "w", encoding="utf-8") as fh:
             fh.write("{}")
@@ -5327,7 +5429,7 @@ class TestR4C4DecidedStatusAttribution(_WriteCase):
                          "synced_at": "2026-01-01T00:00:00Z", "redaction_fingerprint": fingerprint},
             },
         }
-        _hook_state.write_state_at(_MOD._memory_state_path(self.key), state)
+        _hook_state.write_state_at(self._state_path(), state)
         self.backend.reply(401, {"detail": "nope"})  # "gone"'s own delete-lookup fails
         self._run()
         entry = self._last_entry()
@@ -5983,7 +6085,15 @@ class TestP1NoFunctionTheWorkerReachesReadsTheEnvironment(unittest.TestCase):
         worker path finds them there."""
         reads, _ = _environment_reads_reachable_from([("memory_sync", "main")])
         in_main = {read for module, function, read, _line in reads if (module, function) == ("memory_sync", "main")}
-        self.assertLessEqual({"os.environ", "os.path.expanduser"}, in_main)
+        # A10-6(4) moved the config-dir resolution (~/.claude expanduser)
+        # into _identity.claude_config_dir -- still called BY main() on the
+        # calling thread, before the worker starts; main's own body keeps
+        # its os.environ pre-reads.
+        self.assertLessEqual({"os.environ"}, in_main)
+        self.assertTrue(
+            any(r[:2] == ("_identity", "claude_config_dir") for r in reads),
+            "main() must still resolve the config dir on the calling thread",
+        )
         self.assertIn(("_hook_state", "state_root", "os.environ"), {r[:3] for r in reads})
         self.assertIn(("_identity", "container_id", "os.environ"), {r[:3] for r in reads})
 
@@ -6065,7 +6175,7 @@ class TestF3EnvironmentReadFailureIsStillRecorded(_WriteCase):
         self.assertFalse(entry["ok"])
         self.assertIn(f"[{_MOD.HOOK}] unknown: {failure!r}", err.getvalue())
         self.assertEqual(self.requests, [], "nothing may be sent when the round's own inputs could not be read")
-        self.assertFalse(os.path.exists(_MOD._memory_state_path(self.key)))
+        self.assertFalse(os.path.exists(self._state_path()))
 
 
 class TestP2ModuleThreadCheckCoversUntrackedThreads(unittest.TestCase):

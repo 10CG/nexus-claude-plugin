@@ -475,16 +475,24 @@ _RECONCILE_MAX_BODY_BYTES = 2 * 1024 * 1024
 # session_inject's ledger scan can read this hook's own per-memory-dir-key
 # state files as that project's unreadable ledgers (reproduced; see the R1
 # report). The cluster's own fix -- a leading "." no project slug can ever
-# produce -- is NOT applied here: the owner ruling's own corollary (X1,
-# item 2) and the unchanged-items list (item 7) both give this exact path
-# literally, `${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.json`,
-# and "do not change behaviour a binding ruling covers, except as the
-# ruling says" leaves no room to rename it unilaterally. Left as `HOOK`
-# (below) on purpose, matching the ruling's literal text; the collision
-# risk is real but reported to the owner (see owner_questions), not solved
-# here. K09's new run-lock file lives in the SAME directory for the same
-# reason -- no new namespace to litigate.
-_STATE_SUBDIR = HOOK
+# A10-9 (owner 2026-10-29, superseding the note this comment replaces): the
+# state subdirectory is `.memory-sync/`, a name `normalize_slug` can never
+# produce (no slug starts with a dot) -- the K25 collision, where a project
+# whose own slug is "memory-sync" would have had the state directory read
+# as its ledger directory, is closed structurally. K09's run-lock file
+# lives in the SAME directory for the same reason -- no new namespace to
+# litigate.
+_STATE_SUBDIR = ".memory-sync"
+
+
+def _identity_digest(user_id, container_id):
+    """A10-7 option A: a stable 10-hex digest of the round's identity
+    (``user_id`` + ``container_id``), embedded in the state file NAME so a
+    changed identity starts from a fresh state instead of silently reusing
+    another identity's synced/cursor bookkeeping (K16). The separator is a
+    NUL byte so no (user_id, container_id) pair can concatenate into
+    another pair's digest."""
+    return hashlib.sha256(f"{user_id}\x00{container_id}".encode("utf-8")).hexdigest()[:10]
 
 # K24: bumped whenever _split_memory_frontmatter / _cap_body / _cap_for_wire
 # / _build_memory_metadata's own content/metadata ASSEMBLY rules change in a
@@ -851,8 +859,8 @@ def _build_memory_metadata(key, project_name, slug, frontmatter, modified, proje
 
 # ── memory-sync's own state file (X1 corollary: keyed by memory dir key) ─
 
-def _memory_state_path_under(state_root, key):
-    """``<state_root>/memory-sync/<memory dir key>.json`` -- the ROUND-SAFE
+def _memory_state_path_under(state_root, key, id_digest):
+    """``<state_root>/.memory-sync/<memory dir key>.<id digest>.json`` -- the ROUND-SAFE
     form (P1): ``state_root`` is the caller's OWN, already-resolved value
     (``_hook_state.state_root()``, called ONCE in ``main()`` before the
     worker thread starts), never re-resolved here. ``_collect`` calls
@@ -867,28 +875,26 @@ def _memory_state_path_under(state_root, key):
     that happen to share a basename cannot read and write the same state
     file -- see ``_identity.memory_dir_key``'s own docstring for the
     mass-deletion shape that keying-by-basename would otherwise
-    reproduce. The directory is ``_STATE_SUBDIR`` (``== HOOK``, i.e. the
-    literal ``"memory-sync"`` the owner ruling's own corollary gives this
-    path as) -- see that constant's own docstring (K25) for a real,
-    REPORTED-not-fixed collision this literal name has with the ledger
-    directory namespace for a project whose own slug happens to be
-    "memory-sync"."""
-    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.json")
+    reproduce. The directory is ``_STATE_SUBDIR`` (``".memory-sync"``,
+    A10-9) and the file name carries the round's identity digest (A10-7
+    option A) -- see those amendments' own notes for what each part of
+    the name prevents."""
+    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.{id_digest}.json")
 
 
-def _memory_state_path(key):
-    """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.json`` --
-    the CONVENIENCE form: resolves ``_hook_state.state_root()`` itself,
+def _memory_state_path(key, id_digest):
+    """``${NEXUS_HOOK_STATE_DIR}/.memory-sync/<memory dir key>.<id digest>.json``
+    -- the CONVENIENCE form: resolves ``_hook_state.state_root()`` itself,
     fresh, on every call. For this module's own tests and any other
     caller OUTSIDE the worker path ONLY (P1) -- ``_collect`` must never
     call this; see ``_memory_state_path_under`` above, which it calls
     instead, fed from the state root ``main()`` captured once before
     starting the worker."""
-    return _memory_state_path_under(_hook_state.state_root(), key)
+    return _memory_state_path_under(_hook_state.state_root(), key, id_digest)
 
 
-def _memory_run_lock_path_under(state_root, key):
-    """``<state_root>/memory-sync/<memory dir key>.run.lock`` -- the
+def _memory_run_lock_path_under(state_root, key, id_digest):
+    """``<state_root>/.memory-sync/<memory dir key>.<id digest>.run.lock`` -- the
     ROUND-SAFE form (P1), mirroring ``_memory_state_path_under`` above:
     ``state_root`` is the caller's own, already-resolved value, never
     re-resolved here. ``_collect`` calls THIS form.
@@ -906,16 +912,16 @@ def _memory_run_lock_path_under(state_root, key):
     each individual read-modify-write): this one is held for the WHOLE
     network-making portion of one round, which ``_locked`` is not shaped
     for and must not be repurposed to do."""
-    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.run.lock")
+    return os.path.join(state_root, _STATE_SUBDIR, f"{key}.{id_digest}.run.lock")
 
 
-def _memory_run_lock_path(key):
+def _memory_run_lock_path(key, id_digest):
     """``${NEXUS_HOOK_STATE_DIR}/memory-sync/<memory dir key>.run.lock`` --
     the CONVENIENCE form (see ``_memory_state_path``'s own docstring):
     resolves ``_hook_state.state_root()`` itself, fresh, on every call.
     For this module's own tests and any other caller OUTSIDE the worker
     path ONLY -- ``_collect`` calls ``_memory_run_lock_path_under`` instead."""
-    return _memory_run_lock_path_under(_hook_state.state_root(), key)
+    return _memory_run_lock_path_under(_hook_state.state_root(), key, id_digest)
 
 
 _NO_RUN_LOCK = -1  # sentinel: the lock could not even be ATTEMPTED; proceed unlocked
@@ -1134,6 +1140,18 @@ def _dirty_check(path, stored, fingerprint):
         and getattr(st, "st_ctime_ns", None) == stored.get("ctime")
         and not _racily_clean(stored)
     )
+    if "failed_hash" in stored and "file_hash" not in stored:
+        # A10-8(3): the last attempt on this file failed deterministically.
+        # CONTENT decides, not stat -- the failed entry has no ``synced_at``,
+        # so the racy-window discipline above cannot vouch for its recorded
+        # stat the way it can for a synced entry's. One whole-file hash per
+        # round while the bytes stay identical to the failed version
+        # (never a wire call -- the re-attempt is what the marker exists to
+        # prevent), and the file returns to the dirty set the moment its
+        # content actually changes. The fingerprint comparison below does
+        # not apply either: this version never synced under any rule.
+        current = _whole_file_hash(path)
+        return current != stored.get("failed_hash"), stored.get("failed_hash")
     if same_stat:
         file_hash = stored.get("file_hash")
         content_changed = False
@@ -1399,7 +1417,60 @@ def _advance_cursor_only(state_path, next_cursor):
     return persist_reasons
 
 
-def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_path, *, next_cursor=None, project=None):
+def _record_failed_hash(state_path, slug, file_hash, next_cursor, st):
+    """A10-8(3): persist the failed entry for ``slug`` (merged with the
+    cursor advance when one is due). Returns ``persist_reasons`` like
+    ``_advance_cursor_only``."""
+    def _mutate(s, slug=slug, file_hash=file_hash, next_cursor=next_cursor, st=st):
+        new = _merge_file_entry(s, slug, _failed_entry(st, file_hash))
+        if next_cursor is not None:
+            new["cursor"] = next_cursor
+        return new
+    return _hook_state.update_state_at(state_path, _mutate)[1]
+
+
+def _failed_entry(st, file_hash):
+    """A10-8(3): the state entry a deterministic failure leaves behind --
+    the failed version's own stat plus ``failed_hash``, and NOTHING else
+    (no synced ``file_hash``, no ``redaction_fingerprint``: this version
+    was never synced under any rule). ``_dirty_check`` treats a
+    stat-matching failed entry as clean, so the file is re-attempted (and
+    re-reported) only when it actually changes."""
+    return {
+        "mtime": st.st_mtime,
+        "size": st.st_size,
+        "ctime": getattr(st, "st_ctime_ns", None),
+        "failed_hash": file_hash,
+    }
+
+
+def _deterministic_failure(run, slug, reasons, state_path, next_cursor, file_hash, prior, st):
+    """A10-8(3) (owner 2026-10-29): a deterministic per-file failure is
+    reported ONCE per file VERSION. The state entry records the whole-file
+    hash the failure happened at (``failed_hash``); a later round meeting
+    the SAME hash stays quiet -- no tally, no ledger reason -- and
+    ``_dirty_check`` keeps the file out of the dirty set until its stat
+    changes, so a genuinely CHANGED file is attempted and reported again.
+    Returns the reasons for the caller to propagate (``[]`` when
+    suppressed)."""
+    if file_hash is not None and (prior or {}).get("failed_hash") == file_hash:
+        suppressed = []
+        _fold_persist_reasons(suppressed, _advance_cursor_only(state_path, next_cursor), run)
+        return suppressed
+    _tally_result(run, slug, reasons, None)
+
+    def _mutate(s, slug=slug, file_hash=file_hash, next_cursor=next_cursor, st=st):
+        new = _merge_file_entry(s, slug, _failed_entry(st, file_hash))
+        if next_cursor is not None:
+            new["cursor"] = next_cursor
+        return new
+
+    _, persist_reasons = _hook_state.update_state_at(state_path, _mutate)
+    _fold_persist_reasons(reasons, persist_reasons, run)
+    return reasons
+
+
+def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_path, *, next_cursor=None, project=None, prior=None):
     """Attempt to sync one memory file as a ``layer=fact`` row. Returns
     ``(reasons, aborts, calls)``. Tallies into ``run["extra"]`` as it goes
     (K08) -- see ``_tally_result``.
@@ -1489,17 +1560,31 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
     try:
         text = raw[:_MAX_DOCUMENT_CHARS].decode("utf-8")
     except UnicodeDecodeError:
-        _tally_result(run, slug, ["file_unparsable"], None)
-        reasons = ["file_unparsable"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
-        return reasons, False, 0
-
+        return _deterministic_failure(
+            run, slug, ["file_unparsable"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
+    # A10-8(1) (owner 2026-10-29): a NUL byte in the decoded body is a
+    # binary-artifact file, not text this hook may faithfully sync. It is
+    # NOT silently replaced (a mutated "memory" is worse than no memory);
+    # file_unparsable, deterministic, reported once per file version.
+    if "\x00" in text:
+        return _deterministic_failure(
+            run, slug, ["file_unparsable"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
     frontmatter, body = _split_memory_frontmatter(text)
     if frontmatter is None:  # K07: an opened but never-closed frontmatter block
-        _tally_result(run, slug, ["file_unparsable"], None)
-        reasons = ["file_unparsable"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
-        return reasons, False, 0
+        return _deterministic_failure(
+            run, slug, ["file_unparsable"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
+    # A10-8(2) (owner 2026-10-29): frontmatter and no body -- a memory file
+    # that carries nothing syncable. Its own skip class (it parsed FINE;
+    # calling it unparsable would be a lie, and synthesizing a body from
+    # the description would put words on the wire the file never said).
+    # Deterministic, reported once per file version like (1).
+    if not body.strip():
+        return _deterministic_failure(
+            run, slug, ["empty_body"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
     content, truncated = _cap_for_wire(body, _CONTENT_CAP)  # K06: capped post-redaction
     modified = frontmatter.get("modified") or _mtime_iso(st)
     metadata = _build_memory_metadata(
@@ -1527,6 +1612,16 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
     # `candidates` filter already excludes, so moving this call earlier
     # changes nothing about what a COMPLETED round reports (see this
     # module's own docstring, A9-7, and `_tally_result`'s own docstring).
+    # A10-8(3): a 422 rejection is deterministic for this file version --
+    # suppress the repeat report the same way the local parse failures do.
+    if (
+        not outcome.aborts_round
+        and set(outcome.reasons) == {"rejected_422"}
+        and file_hash is not None
+        and (prior or {}).get("failed_hash") == file_hash
+    ):
+        _fold_persist_reasons([], _advance_cursor_only(state_path, next_cursor), run)
+        return [], False, outcome.calls
     _tally_result(run, slug, reasons, outcome)
     if outcome.action in ("created", "updated", "unchanged") or "stale_local" in outcome.reasons:
         entry = {
@@ -1550,7 +1645,14 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
         # A deterministic, non-aborting outcome with no entry of its own
         # to merge the advance into (e.g. rejected_422) -- the cursor
         # still advances past it (C row: skip and advance), on its own.
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
+        # A10-8(3): when it is a pure 422 rejection, the failed_hash goes
+        # down WITH the advance so the next round can stay quiet.
+        if set(outcome.reasons) == {"rejected_422"} and file_hash is not None:
+            _fold_persist_reasons(
+                reasons, _record_failed_hash(state_path, slug, file_hash, next_cursor, st), run
+            )
+        else:
+            _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
     return reasons, False, outcome.calls
 
 
@@ -1646,7 +1748,17 @@ def _delete_file(client, key, slug, run, state_path):
         # R5-F2: see this function's own docstring -- written into `run`
         # strictly before `_tally_result` AND the blocking persist below,
         # not after this function returns to its caller.
-        run["extra"]["deleted"] = run["extra"].get("deleted", 0) + 1
+        # A10-6(2) option A (owner 2026-10-29): a confirmed deletion and a
+        # "the row was already gone" (nothing_to_do) are SEPARATE counters.
+        # Counting both as `deleted` made the abandoned-then-retried path
+        # count the same deletion twice (R6 F2: worker killed mid-persist,
+        # next round's lookup finds nothing, nothing_to_do clears the
+        # mapping and the count rose again) -- with its own key both paths
+        # are accurate.
+        if "nothing_to_do" in outcome.reasons:
+            run["extra"]["already_gone"] = run["extra"].get("already_gone", 0) + 1
+        else:
+            run["extra"]["deleted"] = run["extra"].get("deleted", 0) + 1
     _tally_result(run, slug, reasons, outcome)
     if cleared:
         _, persist_reasons = _hook_state.update_state_at(
@@ -2019,7 +2131,7 @@ def _collect(run):
     if not base_url:
         return "not_configured"  # the default for a fresh install; do nothing else
 
-    key, degraded = _identity.memory_dir_key(cwd)
+    key, degraded = _identity.memory_dir_key(cwd, run["config_dir"])
     run["key"] = key
     run["extra"]["memory_dir"] = key
     # X1-policy (TASK-007): these are fact-layer rows, and the D's fact delta
@@ -2057,7 +2169,17 @@ def _collect(run):
         # `_collect` got, but nothing wrote this key into it yet.
         run["extra"]["unresolved_files"] = sorted(indeterminate)[:5]
 
-    state_path = _memory_state_path_under(run["state_root"], key)
+    # A10-7 option A (owner 2026-10-29): the state FILENAME carries a short
+    # digest of (user_id, container_id). A changed identity therefore starts
+    # from a fresh state (full re-sync under the new identity, bulk bucket),
+    # and rows written under the old one simply read as a peer container's
+    # -- no drift detection, no container_id stored in the state, exactly
+    # the A9-11 doctrine. The user_id fold happens HERE (it only needs the
+    # already-read run["default_user_id"] and the cwd from this round's own
+    # stdin payload -- not an environment input).
+    round_user_id = run["default_user_id"] or _identity.project_slug(cwd)
+    id_digest = _identity_digest(round_user_id, run["container_id"])
+    state_path = _memory_state_path_under(run["state_root"], key, id_digest)
     state, reasons = _hook_state.read_state_at(state_path)
     run["reasons"] = reasons  # K02: the SAME list, mutated as this round goes
     # R4-C3: captured BEFORE `reasons` can grow any further below -- this is
@@ -2115,7 +2237,7 @@ def _collect(run):
         run["calls"] = 0
         return _hook_state.worst_reason(reasons)
 
-    lock_fd = _acquire_run_lock(_memory_run_lock_path_under(run["state_root"], key))
+    lock_fd = _acquire_run_lock(_memory_run_lock_path_under(run["state_root"], key, id_digest))
     if lock_fd is None:
         # K09: a concurrent SessionEnd run for this SAME memory directory
         # already holds the round lock -- both runs would otherwise start
@@ -2170,7 +2292,7 @@ def _collect(run):
         # comes from this round's own stdin payload, read above, which is
         # not an environment input P1 is about).
         token = run["token"]
-        user_id = run["default_user_id"] or _identity.project_slug(cwd)
+        user_id = round_user_id  # folded once above, next to the state path (A10-7)
         client = _ingest_client.IngestClient(
             base_url, token, user_id, run["container_id"], SOURCE_NAME,
             timeout=_HTTP_TIMEOUT_SECONDS, bulk=True, deadline=run["deadline"],
@@ -2368,6 +2490,7 @@ def _collect(run):
                 break
             r, ab, c = _sync_file(
                 client, key, aria_project, slug, local_files[slug], fingerprint, run, state_path, project=project,
+                prior=files_state.get(slug),
             )
             reasons.extend(r)
             run["calls"] += c
@@ -2399,7 +2522,7 @@ def _collect(run):
                     break
                 r, ab, c = _sync_file(
                     client, key, aria_project, slug, local_files[slug], fingerprint, run, state_path, project=project,
-                    next_cursor=i,
+                    next_cursor=i, prior=files_state.get(slug),
                 )
                 reasons.extend(r)
                 run["calls"] += c
@@ -2528,7 +2651,7 @@ def main():
             base_url=os.environ.get("NEXUS_API_URL", "").rstrip("/"),
             token=os.environ.get("NEXUS_API_TOKEN", ""),
             state_root=_hook_state.state_root(),
-            config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+            config_dir=_identity.claude_config_dir(),  # A10-6(4): the one definition
             # Raw env value (None if unset, possibly ""), not yet folded
             # with the cwd-derived fallback: `_identity.user_id`'s own `or
             # project_slug(cwd)` half needs `cwd`, which is not known until
