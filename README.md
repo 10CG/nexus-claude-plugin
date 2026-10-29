@@ -237,3 +237,10 @@ The plugin manifest is `.claude-plugin/plugin.json`. The MCP config is `.mcp.jso
 ## License
 
 MIT © 10CG
+
+## Platform support (A9-14)
+
+Native Windows (non-WSL) is **not supported**: the hooks rely on `fcntl`
+file locking. In that environment `session_inject` also cannot report
+failures — do not rely on the warm-start brief there.
+

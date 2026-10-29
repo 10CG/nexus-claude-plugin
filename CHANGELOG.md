@@ -45,6 +45,95 @@ Versions follow [Semantic Versioning](https://semver.org/).
     (nexus `scripts/replay_session_capture.py` imports it); the incremental
     reader is `read_activities_incremental`, of which it is the no-resume
     view. `_USER_AGENT` bumped to `nexus-session-capture-hook/0.5`.
+- **`SessionEnd` handoff-sync hook** (`hooks/handoff_sync.py`, change 2 TASK-005 + TASK-013):
+  ingests this project's `docs/handoff/*.md` (and the `latest.md` pointer) as
+  `session_summary` rows so the NEXT session — on any container — warm-starts
+  from them. Ownership resolution is uuid-first (A9-2/3: candidates grouped by
+  owner-container; unresolvable groups report `identity_unresolved`, never a
+  silent fallback), session attribution uses the transcript's first timestamp
+  with a synthetic-id fallback (A9-1), unstattable candidates fail the whole
+  round loudly (`pointer_unresolved`, A9-19), a symlinked `latest.md` is
+  resolved through its parent directory only (A9-23), and `skip`/`no`/`off`
+  frontmatter opts the document out while unparsable values refuse the upload
+  (`file_unparsable`, A9-5). External ids carry the Claude Code project
+  directory key as a prefix (X1), so two projects' same-named handoffs never
+  PATCH each other. No state file: container identity moves are detected and
+  reported by `session_inject` at the next startup instead (A9-11).
+- **`SessionEnd` memory-sync hook** (`hooks/memory_sync.py`, change 2 TASK-006 + A10):
+  syncs the built-in auto-memory directory (`<config>/projects/<key>/memory/*.md`)
+  to `fact` rows — value-level secret redaction (known token prefixes,
+  key-value secrets, URL userinfo, bearer tokens), whole-file dirty tracking
+  with a redaction+assembly fingerprint (A8-2/D10), per-round batches of N=5
+  with per-file cursor advance only after a 2xx, orphan reconciliation with
+  ratio guards, and pending deletes verified per-row before any DELETE.
+  A10 rulings shipped here: the state directory is `.memory-sync/` (no project
+  slug can collide with it), the state file name carries a digest of
+  `(user_id, container_id)` (a changed identity starts from a fresh state; old
+  rows read as a peer container's), the project key folds in the config
+  directory (two `CLAUDE_CONFIG_DIR` stores are two namespaces — the
+  alternating-stores ping-pong deletion is gone), a deleted row that was
+  already gone counts as `already_gone` (not `deleted`), a NUL body is
+  `file_unparsable` (never silently replaced), an empty body is the new
+  `empty_body` skip class, and deterministic per-file failures report once per
+  file version (`failed_hash`).
+- **`SessionStart` three-segment injection recipe** (`hooks/session_inject.py`, TASK-007 + A9/A10):
+  episode rows grouped by container with peer lookups when this container's
+  page has none (peers ≤ 4, own ≥ 1, newest-first, `aria.source=handoff`
+  rendered ahead with §6 truncated at a line boundary), a fact delta keyed by
+  `updated_after` with cursor paging (empty RAW page ends the scan, never a
+  filtered one), a 4000-character budget favoring episodes, project scoping on
+  every query (`project=<slug>` + per-row `metadata.project` verification, the
+  semantic segment via `metadata_filter`), at most 12 remote calls per startup,
+  the fact marker advancing only on startup after a fully-clean read,
+  `identity_changed`/`user_id` changes reported once in `systemMessage`
+  (stdout-gated persistence), failure-class ledger reasons resurfaced by the
+  A9-20 rescan (`dedup_merged` / `orphans_deleted` never stay buried), and
+  `state_write_failed` surfaced on the next startup (A10 D4/D5).
+- **Shared hook infrastructure** (change 2 TASK-001/002/003/011/012): a
+  `_hook_state` ledger (bounded per-hook JSONL with failure/skip reason
+  classification, `also_failed`, and identity-aware state files with locked
+  read-modify-write), a `_hook_runner` worker/daemon-thread skeleton with
+  self-imposed deadlines and stderr guards, an `_identity` module
+  (git-common-dir project resolution — a linked worktree answers its MAIN
+  worktree root, K31 machine-verified; container/aria identity; the
+  config-dir-composite project key), and an `_ingest_client` idempotency
+  protocol (lookup → verify → upsert/dedup-delete) shared by both write hooks,
+  with `X-Nexus-Source` attribution on every call.
+- **`UserPromptSubmit` system-content skip** (`hooks/memory_capture.py`, #48 item 2):
+  `<task-notification>` and `[SYSTEM NOTIFICATION - NOT USER INPUT]` turns are
+  harness-delivered, not the user stating a preference — skipped silently
+  (fail-open) before any classification.
+
+### Changed
+
+- **`SessionEnd` capture hook — tiered priority selection replaces the most-recent tail**
+  (`hooks/session_capture.py`, `select_activities`): the 200-activity cap now keeps
+  high-value actions (user_message / commit / run_test / create_file / edit_file /
+  delete_file) first, then `command_run` whose head is `rm` / `mv` / `cp` / `mkdir` /
+  `chmod` or `git {push,merge,rebase,reset,checkout}` / `alembic {upgrade,downgrade,revision,stamp}` /
+  `docker {push,build}` / `npm publish`, then the rest; the tier that overflows keeps
+  both ends; session order preserved. Every activity carries
+  `activity_data.internal.capture_dropped` {total, by_action, strategy}. If the
+  selector raises, the run falls back to the plain tail and the ledger records
+  `capture_tiering_degraded` — SessionStart reports the hook as failed even though
+  the activities were uploaded (10CG/nexus-claude-plugin#28).
+- **`SessionStart` injection renders `session_summary` rows** (#32 step 4, #40):
+  the aggregated layer that the two new SessionEnd hooks produce is what the
+  warm-start brief is built from — the interim client-side whitelist filter
+  (#40) is replaced by server-side layer filtering plus per-row verification.
+- **`SKILL.md` partition rewritten by purpose** (#48 item 1): the built-in
+  auto-memory (`MEMORY.md`) is what it always was — persistent across sessions
+  — and is the PRIMARY store for preferences, feedback, and project facts
+  (the memory-sync hook ingests it into Nexus automatically); Nexus serves
+  cross-container warm-start summaries, ranked cross-session retrieval, and
+  retrieval feedback. Tool names now carry their full in-session form
+  (`mcp__plugin_nexus-memory_nexus__*`, deferred — load via ToolSearch;
+  #48 item 3), maintainer-facing notes moved out of the runtime text and the
+  "planned for v7.1" promise became "not currently available" (#48 item 4).
+- **Platform note (A9-14)**: native Windows (non-WSL) is not supported — the
+  hooks rely on `fcntl` locking; there, `session_inject` also cannot report
+  failures.
+
 
 ## [0.5.0] — 2026-06-22
 
