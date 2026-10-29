@@ -153,6 +153,8 @@ class TestReasonTables(_TempStateDir):
                     "not_configured", "nothing_to_do",
                     # Amendment A4-5: the quiet half of the pointer split.
                     "no_handoff",
+                    # A10-8(2): frontmatter (or nothing) and no body.
+                    "empty_body",
                 }
             ),
         )

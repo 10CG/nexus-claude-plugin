@@ -1140,6 +1140,18 @@ def _dirty_check(path, stored, fingerprint):
         and getattr(st, "st_ctime_ns", None) == stored.get("ctime")
         and not _racily_clean(stored)
     )
+    if "failed_hash" in stored and "file_hash" not in stored:
+        # A10-8(3): the last attempt on this file failed deterministically.
+        # CONTENT decides, not stat -- the failed entry has no ``synced_at``,
+        # so the racy-window discipline above cannot vouch for its recorded
+        # stat the way it can for a synced entry's. One whole-file hash per
+        # round while the bytes stay identical to the failed version
+        # (never a wire call -- the re-attempt is what the marker exists to
+        # prevent), and the file returns to the dirty set the moment its
+        # content actually changes. The fingerprint comparison below does
+        # not apply either: this version never synced under any rule.
+        current = _whole_file_hash(path)
+        return current != stored.get("failed_hash"), stored.get("failed_hash")
     if same_stat:
         file_hash = stored.get("file_hash")
         content_changed = False
@@ -1405,7 +1417,60 @@ def _advance_cursor_only(state_path, next_cursor):
     return persist_reasons
 
 
-def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_path, *, next_cursor=None, project=None):
+def _record_failed_hash(state_path, slug, file_hash, next_cursor, st):
+    """A10-8(3): persist the failed entry for ``slug`` (merged with the
+    cursor advance when one is due). Returns ``persist_reasons`` like
+    ``_advance_cursor_only``."""
+    def _mutate(s, slug=slug, file_hash=file_hash, next_cursor=next_cursor, st=st):
+        new = _merge_file_entry(s, slug, _failed_entry(st, file_hash))
+        if next_cursor is not None:
+            new["cursor"] = next_cursor
+        return new
+    return _hook_state.update_state_at(state_path, _mutate)[1]
+
+
+def _failed_entry(st, file_hash):
+    """A10-8(3): the state entry a deterministic failure leaves behind --
+    the failed version's own stat plus ``failed_hash``, and NOTHING else
+    (no synced ``file_hash``, no ``redaction_fingerprint``: this version
+    was never synced under any rule). ``_dirty_check`` treats a
+    stat-matching failed entry as clean, so the file is re-attempted (and
+    re-reported) only when it actually changes."""
+    return {
+        "mtime": st.st_mtime,
+        "size": st.st_size,
+        "ctime": getattr(st, "st_ctime_ns", None),
+        "failed_hash": file_hash,
+    }
+
+
+def _deterministic_failure(run, slug, reasons, state_path, next_cursor, file_hash, prior, st):
+    """A10-8(3) (owner 2026-10-29): a deterministic per-file failure is
+    reported ONCE per file VERSION. The state entry records the whole-file
+    hash the failure happened at (``failed_hash``); a later round meeting
+    the SAME hash stays quiet -- no tally, no ledger reason -- and
+    ``_dirty_check`` keeps the file out of the dirty set until its stat
+    changes, so a genuinely CHANGED file is attempted and reported again.
+    Returns the reasons for the caller to propagate (``[]`` when
+    suppressed)."""
+    if file_hash is not None and (prior or {}).get("failed_hash") == file_hash:
+        suppressed = []
+        _fold_persist_reasons(suppressed, _advance_cursor_only(state_path, next_cursor), run)
+        return suppressed
+    _tally_result(run, slug, reasons, None)
+
+    def _mutate(s, slug=slug, file_hash=file_hash, next_cursor=next_cursor, st=st):
+        new = _merge_file_entry(s, slug, _failed_entry(st, file_hash))
+        if next_cursor is not None:
+            new["cursor"] = next_cursor
+        return new
+
+    _, persist_reasons = _hook_state.update_state_at(state_path, _mutate)
+    _fold_persist_reasons(reasons, persist_reasons, run)
+    return reasons
+
+
+def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_path, *, next_cursor=None, project=None, prior=None):
     """Attempt to sync one memory file as a ``layer=fact`` row. Returns
     ``(reasons, aborts, calls)``. Tallies into ``run["extra"]`` as it goes
     (K08) -- see ``_tally_result``.
@@ -1495,17 +1560,31 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
     try:
         text = raw[:_MAX_DOCUMENT_CHARS].decode("utf-8")
     except UnicodeDecodeError:
-        _tally_result(run, slug, ["file_unparsable"], None)
-        reasons = ["file_unparsable"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
-        return reasons, False, 0
-
+        return _deterministic_failure(
+            run, slug, ["file_unparsable"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
+    # A10-8(1) (owner 2026-10-29): a NUL byte in the decoded body is a
+    # binary-artifact file, not text this hook may faithfully sync. It is
+    # NOT silently replaced (a mutated "memory" is worse than no memory);
+    # file_unparsable, deterministic, reported once per file version.
+    if "\x00" in text:
+        return _deterministic_failure(
+            run, slug, ["file_unparsable"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
     frontmatter, body = _split_memory_frontmatter(text)
     if frontmatter is None:  # K07: an opened but never-closed frontmatter block
-        _tally_result(run, slug, ["file_unparsable"], None)
-        reasons = ["file_unparsable"]
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
-        return reasons, False, 0
+        return _deterministic_failure(
+            run, slug, ["file_unparsable"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
+    # A10-8(2) (owner 2026-10-29): frontmatter and no body -- a memory file
+    # that carries nothing syncable. Its own skip class (it parsed FINE;
+    # calling it unparsable would be a lie, and synthesizing a body from
+    # the description would put words on the wire the file never said).
+    # Deterministic, reported once per file version like (1).
+    if not body.strip():
+        return _deterministic_failure(
+            run, slug, ["empty_body"], state_path, next_cursor, file_hash, prior, st
+        ), False, 0
     content, truncated = _cap_for_wire(body, _CONTENT_CAP)  # K06: capped post-redaction
     modified = frontmatter.get("modified") or _mtime_iso(st)
     metadata = _build_memory_metadata(
@@ -1533,6 +1612,16 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
     # `candidates` filter already excludes, so moving this call earlier
     # changes nothing about what a COMPLETED round reports (see this
     # module's own docstring, A9-7, and `_tally_result`'s own docstring).
+    # A10-8(3): a 422 rejection is deterministic for this file version --
+    # suppress the repeat report the same way the local parse failures do.
+    if (
+        not outcome.aborts_round
+        and set(outcome.reasons) == {"rejected_422"}
+        and file_hash is not None
+        and (prior or {}).get("failed_hash") == file_hash
+    ):
+        _fold_persist_reasons([], _advance_cursor_only(state_path, next_cursor), run)
+        return [], False, outcome.calls
     _tally_result(run, slug, reasons, outcome)
     if outcome.action in ("created", "updated", "unchanged") or "stale_local" in outcome.reasons:
         entry = {
@@ -1556,7 +1645,14 @@ def _sync_file(client, key, project_name, slug, path, fingerprint, run, state_pa
         # A deterministic, non-aborting outcome with no entry of its own
         # to merge the advance into (e.g. rejected_422) -- the cursor
         # still advances past it (C row: skip and advance), on its own.
-        _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
+        # A10-8(3): when it is a pure 422 rejection, the failed_hash goes
+        # down WITH the advance so the next round can stay quiet.
+        if set(outcome.reasons) == {"rejected_422"} and file_hash is not None:
+            _fold_persist_reasons(
+                reasons, _record_failed_hash(state_path, slug, file_hash, next_cursor, st), run
+            )
+        else:
+            _fold_persist_reasons(reasons, _advance_cursor_only(state_path, next_cursor), run)
     return reasons, False, outcome.calls
 
 
@@ -1652,7 +1748,17 @@ def _delete_file(client, key, slug, run, state_path):
         # R5-F2: see this function's own docstring -- written into `run`
         # strictly before `_tally_result` AND the blocking persist below,
         # not after this function returns to its caller.
-        run["extra"]["deleted"] = run["extra"].get("deleted", 0) + 1
+        # A10-6(2) option A (owner 2026-10-29): a confirmed deletion and a
+        # "the row was already gone" (nothing_to_do) are SEPARATE counters.
+        # Counting both as `deleted` made the abandoned-then-retried path
+        # count the same deletion twice (R6 F2: worker killed mid-persist,
+        # next round's lookup finds nothing, nothing_to_do clears the
+        # mapping and the count rose again) -- with its own key both paths
+        # are accurate.
+        if "nothing_to_do" in outcome.reasons:
+            run["extra"]["already_gone"] = run["extra"].get("already_gone", 0) + 1
+        else:
+            run["extra"]["deleted"] = run["extra"].get("deleted", 0) + 1
     _tally_result(run, slug, reasons, outcome)
     if cleared:
         _, persist_reasons = _hook_state.update_state_at(
@@ -2384,6 +2490,7 @@ def _collect(run):
                 break
             r, ab, c = _sync_file(
                 client, key, aria_project, slug, local_files[slug], fingerprint, run, state_path, project=project,
+                prior=files_state.get(slug),
             )
             reasons.extend(r)
             run["calls"] += c
@@ -2415,7 +2522,7 @@ def _collect(run):
                     break
                 r, ab, c = _sync_file(
                     client, key, aria_project, slug, local_files[slug], fingerprint, run, state_path, project=project,
-                    next_cursor=i,
+                    next_cursor=i, prior=files_state.get(slug),
                 )
                 reasons.extend(r)
                 run["calls"] += c

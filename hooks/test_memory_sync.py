@@ -1629,7 +1629,15 @@ class TestSingleFileSync(_WriteCase):
         self.assertEqual(methods.count("POST"), 3, methods)
         self.assertEqual(self._last_entry()["reason"], "rejected_422")
         state = self._state()
-        self.assertNotIn("bad", state.get("files", {}))
+        # A10-8(3): the 422 file now leaves a FAILED entry (its own stat +
+        # failed_hash, nothing synced) instead of no entry at all -- that
+        # marker is what keeps the re-report and the per-round re-attempt
+        # quiet until the file changes.
+        bad_entry = state.get("files", {}).get("bad")
+        self.assertIsNotNone(bad_entry, state)
+        self.assertEqual(
+            set(bad_entry), {"mtime", "size", "ctime", "failed_hash"}, bad_entry
+        )
         self.assertIn("zzz-good", state.get("files", {}))
         self.assertIn("zzz-last", state.get("files", {}))
 
@@ -3365,7 +3373,12 @@ class TestK07UnparsableFrontmatterEndToEnd(_WriteCase):
         posts = [r["json"]["metadata"]["external_id"] for r in self.requests if r["method"] == "POST"]
         self.assertEqual(sorted(posts), sorted(self._ext(s) for s in ("a1", "a2", "a4")))
         self.assertEqual(self._last_entry()["reason"], "file_unparsable")
-        self.assertNotIn("a3", self._state().get("files", {}))
+        # A10-8(3): an unparsable file leaves a FAILED entry (stat +
+        # failed_hash, nothing synced) -- reported once per version, not
+        # re-attempted every round.
+        a3_entry = self._state().get("files", {}).get("a3")
+        self.assertIsNotNone(a3_entry, self._state())
+        self.assertEqual(set(a3_entry), {"mtime", "size", "ctime", "failed_hash"}, a3_entry)
         for slug in ("a1", "a2", "a4"):
             self.assertIn(slug, self._state().get("files", {}))
 
@@ -4146,6 +4159,65 @@ class TestK24AssemblyChangeDirtiesEndToEnd(_WriteCase):
         self.assertEqual([r["method"] for r in self.requests], ["GET", "PATCH"])
 
 
+class TestA10_8DeterministicFailures(_WriteCase):
+    """A10-8 (owner 2026-10-29): a NUL body is file_unparsable (never
+    silently replaced); an empty body is its own empty_body skip class;
+    deterministic failures are reported once per file VERSION (state
+    records failed_hash) -- and A10-6(2): an already-gone row counts its
+    own already_gone counter, not deleted."""
+
+    def test_a_nul_body_is_file_unparsable_reported_once_per_version(self):
+        self.backend.reply(200, _page())  # reconciliation: nothing ours
+        self._write("nulled", body="before\x00after")
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "file_unparsable", entry)
+        n_after_first = len(self.requests)
+        # Round 2: same bytes, same failed_hash -- quiet, zero network calls.
+        self._run()
+        entry2 = self._last_entry()
+        self.assertEqual(entry2["reason"], "none", entry2)
+        self.assertEqual(len(self.requests), n_after_first, self.requests[n_after_first:])
+        # Round 3: the file genuinely changed -- reported again.
+        _write_memory_file(self.memory_dir, "nulled", body="other\x00content")
+        self._run()
+        entry3 = self._last_entry()
+        self.assertEqual(entry3["reason"], "file_unparsable", entry3)
+
+    def test_an_empty_body_is_the_empty_body_skip_class(self):
+        self.backend.reply(200, _page())  # reconciliation: nothing ours
+        self._write("hollow", body="")
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry["reason"], "empty_body", entry)
+        n_after_first = len(self.requests)
+        self._run()
+        entry2 = self._last_entry()
+        self.assertEqual(entry2["reason"], "none", entry2)
+        self.assertEqual(len(self.requests), n_after_first)
+
+    def test_an_already_gone_row_counts_its_own_counter(self):
+        path = self._write("gone")
+        st = os.stat(path)
+        _hook_state.write_state_at(
+            self._state_path(),
+            {"cursor": 0, "reconciled": True, "files": {"gone": {
+                "mtime": st.st_mtime, "size": st.st_size,
+                "ctime": getattr(st, "st_ctime_ns", None),
+                "file_hash": _MOD._whole_file_hash(path), "synced_at": "2026-01-01T00:00:00Z",
+                "redaction_fingerprint": _MOD._current_fingerprint(),
+            }}},
+        )
+        os.remove(path)  # the directory stays present-but-empty (A10-5 releases)
+        self.backend.reply(200, _page())  # pending-delete lookup: nothing there
+        self._run()
+        entry = self._last_entry()
+        self.assertEqual(entry.get("already_gone"), 1, entry)
+        self.assertNotIn("deleted", entry, entry)
+        self.assertEqual(entry["reason"], "none", entry)
+
+
+
 class TestA10_9StateSubdirCollisionIsClosed(unittest.TestCase):
     """A10-9 (owner 2026-10-29): the state subdirectory is now
     ``.memory-sync`` -- a name ``normalize_slug`` can never produce (no
@@ -4539,7 +4611,14 @@ class TestR3T03CursorAdvanceAndPlaceholderPersistAreCovered(_WriteCase):
         real_update = _hook_state.update_state_at
 
         def side_effect(path, mutate):
-            if mutate.__qualname__ == "_advance_cursor_only.<locals>.<lambda>":
+            # A10-8(3): a deterministic local skip's advance rides
+            # _advance_cursor_only OR _record_failed_hash (the 422 shape
+            # writes its failed marker WITH the advance) -- both are this
+            # test's subject.
+            if mutate.__qualname__ in (
+                "_advance_cursor_only.<locals>.<lambda>",
+                "_record_failed_hash.<locals>._mutate",
+            ):
                 current, _ = _hook_state.read_state_at(path)
                 return current, ["state_write_failed"]
             return real_update(path, mutate)

@@ -121,6 +121,11 @@ SKIP_REASONS = frozenset(
         # default for any project that does not use aria handoffs, so it must
         # stay quiet. "Files exist but none resolved" is pointer_unresolved.
         "no_handoff",
+        # A10-8(2) (owner 2026-10-29): a memory file with frontmatter (or
+        # nothing) and no body -- parsed fine, nothing syncable. Its own
+        # skip class, reported once per file version (memory_sync records
+        # failed_hash).
+        "empty_body",
     }
 )
 
