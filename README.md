@@ -92,10 +92,10 @@ Claude Code gives all SessionEnd hooks a **shared ~1.5 s wall-clock budget**, an
 Set this in the environment `claude` starts in (shell profile, service unit, or per-invocation):
 
 ```bash
-CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=30000
+CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=60000
 ```
 
-- 30000 ms covers the measured worst case (~9 s) with headroom; the hooks' own internal deadlines (20 s work + 2 s ledger) keep a hung hook from delaying exit beyond ~22 s.
+- 60000 ms matches the hooks' declared `timeout: 60` ceiling (owner ruling 2026-10-30) and covers the measured worst case (~9 s) with wide headroom; the hooks' own internal deadlines (20 s work + 2 s ledger) keep a hung hook from delaying exit beyond ~22 s.
 - Verified end-to-end on Claude Code 2.1.312: with the var set, a real session end produced capture 130 ms + handoff-sync 1575 ms + memory-sync 7018 ms = **8723 ms total (≤ 20 s design target)**, all three ledger rows landed (#56).
 - The var must be present in `claude`'s own environment (it configures the host, not the hooks); per-project `.claude/settings.json` per-hook `timeout` declarations are the file-based alternative.
 
