@@ -4,11 +4,20 @@ The manifest is configuration, but two of its values are load-bearing in ways
 that are invisible from the file and easy to "tidy away":
 
 ``timeout`` on SessionEnd
-    Claude Code gives every SessionEnd hook a SHARED budget of 1.5 seconds
-    unless a hook declares a longer ``timeout``, in which case the budget is
-    raised to match, capped at 60. Without the field the capture hook -- whose
-    own HTTP timeout is 8 seconds -- is killed long before it can finish, and
-    nothing records that it was.
+    CORRECTED 2026-10-30 (#56, verified on Claude Code 2.1.312): the host
+    gives every SessionEnd hook a SHARED budget of ~1.5 seconds, and a
+    ``timeout`` declared in THIS plugin's hooks.json does NOT raise it
+    ("Timeouts set on plugin-provided hooks don't raise the budget" -- the
+    current hooks doc; the old wording below described the pre-correction
+    belief and was wrong for plugin hooks). Raising the budget takes a
+    settings-file per-hook ``timeout`` or the
+    ``CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`` env var (README "SessionEnd
+    hook budget"). The ``timeout: 60`` field still matters: it bounds each
+    hook individually once the budget allows it, and keeps the tested headroom
+    over the hooks' internal 20 s work deadline + 2 s ledger cap. Under the
+    default ~1.5 s budget a hook slower than the budget (memory-sync: ~7-9 s
+    in memory-rich projects) is cancelled on every real session end and, by
+    design, leaves no ledger row.
 
 ``matcher`` on SessionStart
     ``compact`` and ``clear`` also fire SessionStart. Injecting the warm-start
