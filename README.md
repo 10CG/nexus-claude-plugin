@@ -85,6 +85,20 @@ The plugin ships an `.mcp.json` at the repo root with the canonical config. Adap
 
 `user_id` is **per-call** (passed at each tool invocation) and is **not** an env var — see [SKILL.md](skills/nexus-memory/SKILL.md) for how the LLM threads user_id from the active session.
 
+### SessionEnd hook budget (required for memory-sync / handoff-sync to finish)
+
+Claude Code gives all SessionEnd hooks a **shared ~1.5 s wall-clock budget**, and a `timeout` declared in this plugin's `hooks/hooks.json` **does not raise it** (host semantics: only settings-file per-hook timeouts, or the env var below, raise the budget — see the [hooks doc](https://code.claude.com/docs/en/hooks) and [#56](https://forgejo.10cg.pub/10CG/nexus-claude-plugin/issues/56)). Without raising it, `memory-sync` (~7–9 s, 9 network calls in memory-rich projects) is cancelled on every real session end and **leaves no ledger row** — your memory files never sync.
+
+Set this in the environment `claude` starts in (shell profile, service unit, or per-invocation):
+
+```bash
+CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=30000
+```
+
+- 30000 ms covers the measured worst case (~9 s) with headroom; the hooks' own internal deadlines (20 s work + 2 s ledger) keep a hung hook from delaying exit beyond ~22 s.
+- Verified end-to-end on Claude Code 2.1.312: with the var set, a real session end produced capture 130 ms + handoff-sync 1575 ms + memory-sync 7018 ms = **8723 ms total (≤ 20 s design target)**, all three ledger rows landed (#56).
+- The var must be present in `claude`'s own environment (it configures the host, not the hooks); per-project `.claude/settings.json` per-hook `timeout` declarations are the file-based alternative.
+
 ---
 
 ## Setup wizard
