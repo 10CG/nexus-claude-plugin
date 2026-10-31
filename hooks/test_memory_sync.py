@@ -1325,11 +1325,28 @@ class TestMetadataBuilding(unittest.TestCase):
         self.assertEqual(meta["aria.project"], "nexus")
         self.assertEqual(meta["aria.memory_slug"], "my-slug")
         self.assertEqual(meta["aria.modified"], "2026-01-01T00:00:00Z")
-        self.assertNotIn("aria.memory_type", meta)
-        self.assertNotIn("aria.description", meta)
-        self.assertNotIn("aria.origin_session", meta)
+        for key in ("aria.memory_type", "aria.description", "aria.origin_session"):
+            self.assertIn(key, meta)
+            self.assertIsNone(meta[key])
+            self.assertIsNone(json.loads(json.dumps(meta))[key])
 
-    def test_optional_keys_are_included_only_when_present(self):
+    def test_explicit_none_source_values_are_json_null(self):
+        fm = {"type": None, "description": None, "originSessionId": None}
+        meta = _MOD._build_memory_metadata("k", "p", "slug", fm, "2026-01-01T00:00:00Z")
+        for key in ("aria.memory_type", "aria.description", "aria.origin_session"):
+            self.assertIn(key, meta)
+            self.assertIsNone(json.loads(json.dumps(meta))[key])
+
+    def test_present_empty_strings_and_literal_null_are_not_missing(self):
+        for value in ("", "null"):
+            with self.subTest(value=value):
+                fm = dict.fromkeys(("type", "description", "originSessionId"), value)
+                meta = _MOD._build_memory_metadata("k", "p", "slug", fm, "2026-01-01T00:00:00Z")
+                for key in ("aria.memory_type", "aria.description", "aria.origin_session"):
+                    self.assertIn(key, meta)
+                    self.assertEqual(meta[key], value)
+
+    def test_present_source_values_are_included(self):
         fm = {"type": "feedback", "description": "d", "originSessionId": "s1"}
         meta = _MOD._build_memory_metadata("k", "p", "slug", fm, "2026-01-01T00:00:00Z")
         self.assertEqual(meta["aria.memory_type"], "feedback")
@@ -1540,7 +1557,7 @@ class TestSingleFileSync(_WriteCase):
         meta = {"layer": "fact", "external_id": self._ext("f1"), "container_id": CONTAINER,
                 "content_hash": digest, "aria.memory_slug": "f1", "aria.project": "proj",
                 "aria.memory_dir": self.key, "aria.truncated": False,
-                "aria.description": "a description", "aria.memory_type": "feedback"}
+                "aria.description": "a description", "aria.memory_type": "feedback", "aria.origin_session": None}
         st = os.stat(path)
         meta["aria.modified"] = _MOD._mtime_iso(st)
         self.backend.reply(*_empty_lookup())  # orphan reconciliation
@@ -1652,6 +1669,198 @@ class TestSingleFileSync(_WriteCase):
         posts = [r for r in self.requests if r["method"] == "POST"]
         self.assertEqual(len(posts), 1, self.requests)
         self.assertEqual(self._last_entry()["reason"], "file_unparsable")
+
+
+class TestA10_11SourceMetadataSync(_WriteCase):
+    """Exercise C's real parser -> builder -> redactor -> HTTP -> state path.
+
+    All files/state live under _WriteCase's temporary directories; only the
+    scripted loopback backend sees requests. Server rows are assembled
+    independently of the builder, so an omitted source key cannot hide in
+    both the implementation and its expected row.
+    """
+
+    _OWNED = ("aria.description", "aria.memory_type", "aria.origin_session")
+    _MODIFIED = "2026-10-01T00:00:00.000Z"
+    _BODY = "Synthetic A10-11 body stays identical."
+
+    def _source(self, slug, **fields):
+        values = {"description": None, "mtype": None, "origin_session": None,
+                  "modified": self._MODIFIED, "body": self._BODY}
+        values.update(fields)
+        return self._write(slug, **values)
+
+    def _server_row(self, slug, owned):
+        digest = _ingest_client.content_hash(self._BODY)
+        meta = {"aria.memory_slug": slug, "aria.project": "proj",
+                "aria.memory_dir": self.key, "aria.modified": self._MODIFIED,
+                "aria.truncated": False, **owned}
+        row = _row(self._ext(slug), content_hash=digest, extra=meta)
+        row["content"] = self._BODY
+        return row
+
+    def _assert_null_patch(self, request):
+        self.assertEqual(request["method"], "PATCH", self.requests)
+        self.assertEqual(set(request["json"]), {"metadata"})
+        meta = request["json"]["metadata"]
+        self.assertEqual(meta["content_hash"], _ingest_client.content_hash(self._BODY))
+        for key in self._OWNED:
+            self.assertIn(key, meta)
+            self.assertIsNone(meta[key])
+
+    def _assert_readback_unchanged(self, slug, row):
+        # Model the existing server's shallow merge, then do another REAL
+        # upsert against its JSON readback: null must not be deleted or
+        # mistaken for a missing key, or this would PATCH forever.
+        self.requests.clear()
+        self.backend.reply(200, _page(row))
+        meta = _MOD._build_memory_metadata(self.key, "proj", slug, {}, self._MODIFIED)
+        meta["aria.truncated"] = False
+        client = _ingest_client.IngestClient(
+            self.backend.url, "", USER, CONTAINER, _MOD.SOURCE_NAME, bulk=True,
+        )
+        result = client.upsert("fact", self._ext(slug), self._BODY, meta,
+                               local_updated_at=self._MODIFIED, updated_key="aria.modified")
+        self.assertEqual((result.action, result.reason, result.calls), ("unchanged", "unchanged", 1))
+        self.assertEqual([r["method"] for r in self.requests], ["GET"])
+        self.assertEqual(self.backend.script, [])
+        self.requests.clear()
+        self._run()
+        self.assertEqual(self.requests, [], "normal next SessionEnd must make zero calls")
+
+    def test_removing_three_source_fields_clears_old_values_with_metadata_only_patch(self):
+        self._source("removed", description="old description", mtype="feedback", origin_session="s-old")
+        self.backend.reply(*_empty_lookup()).reply(*_empty_lookup()).reply(*_created())
+        self._run()
+        posted = self.requests[-1]["json"]
+        for key in self._OWNED:
+            self.assertTrue(posted["metadata"][key])
+        row = self._server_row("removed", posted["metadata"])
+        row["metadata"]["unrelated"] = "preserved by shallow merge"
+        self._source("removed")  # a real edit, only inside this test's temp directory
+        self.requests.clear()
+        self.backend.reply(200, _page(row)).reply(*_updated(row["memory_id"]))
+        self._run()
+        self.assertEqual([r["method"] for r in self.requests], ["GET", "PATCH"])
+        self._assert_null_patch(self.requests[-1])
+        row["metadata"].update(self.requests[-1]["json"]["metadata"])
+        self.assertEqual(row["metadata"]["unrelated"], "preserved by shallow merge")
+        self._assert_readback_unchanged("removed", row)
+
+    def _check_server_keys(self, slug, owned, expect_patch):
+        self._source(slug)
+        row = self._server_row(slug, owned)
+        self.backend.reply(*_empty_lookup()).reply(200, _page(row))
+        if expect_patch:
+            self.backend.reply(*_updated(row["memory_id"]))
+        self._run()
+        writes = [r for r in self.requests if r["method"] != "GET"]
+        if expect_patch:
+            self.assertEqual(len(writes), 1, self.requests)
+            self._assert_null_patch(writes[0])
+            row["metadata"].update(writes[0]["json"]["metadata"])
+        else:
+            self.assertEqual(writes, [])
+            self.assertEqual(self._last_entry()["reason"], "unchanged")
+        self._assert_readback_unchanged(slug, row)
+
+    def test_missing_server_keys_are_filled_once_then_converge(self):
+        self._check_server_keys("server-missing", {}, True)
+
+    def test_existing_server_null_is_unchanged_without_a_patch(self):
+        self._check_server_keys("server-null", dict.fromkeys(self._OWNED), False)
+
+    def test_missing_and_present_scalars_keep_parser_and_redactor_semantics_on_the_wire(self):
+        cases = (("missing", None, None, None),
+                 ("nonempty", "description", "feedback", "s1"),
+                 ("empty", '""', '""', '""'),
+                 ("literal-null", "null", "null", "null"),
+                 ("quoted-null", '"null"', '"null"', '"null"'))
+        for style in ("flat", "nested"):
+            for label, desc, kind, session in cases:
+                with self.subTest(style=style, source=label):
+                    slug = style + "-" + label
+                    self._source(slug, style=style, description=desc, mtype=kind, origin_session=session)
+                    if not self._state().get("reconciled"):
+                        self.backend.reply(*_empty_lookup())
+                    self.backend.reply(*_empty_lookup()).reply(*_created())
+                    self.requests.clear()
+                    self._run()
+                    post = self.requests[-1]
+                    self.assertEqual(post["method"], "POST", self.requests)
+                    expected = ("", "", "") if label == "empty" else (
+                        ("null", "null", "null") if "null" in label else (desc, kind, session)
+                    )
+                    for key, value in zip(self._OWNED, expected):
+                        self.assertIn(key, post["json"]["metadata"])
+                        self.assertEqual(post["json"]["metadata"][key], value)
+                    self.assertEqual(self.backend.script, [])
+
+    def test_present_values_still_pass_through_the_shared_redactor(self):
+        raw = "password: a10-only-synthetic-value"
+        expected, hits = _redact.redact_text(raw)
+        self.assertGreater(hits, 0, "the synthetic fixture must exercise redaction")
+        quoted = json.dumps(raw)
+        self._source("redacted", description=quoted, mtype=quoted, origin_session=quoted)
+        self.backend.reply(*_empty_lookup()).reply(*_empty_lookup()).reply(*_created())
+        self._run()
+        post = self.requests[-1]
+        self.assertEqual(post["method"], "POST", self.requests)
+        for key in self._OWNED:
+            self.assertEqual(post["json"]["metadata"][key], expected)
+        self.assertNotIn(raw, json.dumps(post["json"]))
+
+    def test_version_two_fingerprints_resync_unedited_files_in_batches_of_five(self):
+        paths = [self._source(f"v2-{i}") for i in range(6)]
+        with mock.patch.object(_MOD, "_ASSEMBLY_VERSION", 2):
+            old_fp = _MOD._current_fingerprint()
+            for i, path in enumerate(paths):
+                self._seed_synced_state(f"v2-{i}", path)
+
+        def snapshot():
+            result = []
+            for path in paths:
+                st = os.stat(path)
+                result.append((st.st_mtime_ns, st.st_ctime_ns, st.st_size, _MOD._whole_file_hash(path)))
+            return result  # reads may change atime; only source stat/hash are relevant
+
+        before = snapshot()
+        current_fp = _MOD._current_fingerprint()
+        self.assertNotEqual(current_fp, old_fp, "the deployed version must advance beyond assembly 2")
+        self.assertEqual(_MOD._ASSEMBLY_VERSION, 3)
+        self.assertEqual(_MOD._BATCH_SIZE, 5)
+        rows = [self._server_row(f"v2-{i}", dict.fromkeys(self._OWNED, "old")) for i in range(6)]
+        for first, last in ((0, 5), (5, 6)):
+            self.requests.clear()
+            for row in rows[first:last]:
+                self.backend.reply(200, _page(row)).reply(*_updated(row["memory_id"]))
+            self._run()
+            self.assertEqual([r["method"] for r in self.requests], ["GET", "PATCH"] * (last - first))
+            for request in self.requests[1::2]:
+                self._assert_null_patch(request)
+            state = self._state()["files"]
+            self.assertEqual(sum(e["redaction_fingerprint"] == current_fp for e in state.values()), last)
+            self.assertEqual(self.backend.script, [])
+        self.requests.clear()
+        self._run()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(snapshot(), before)
+
+    def test_version_two_resync_cannot_clear_a_newer_server_row(self):
+        path = self._source("stale")
+        with mock.patch.object(_MOD, "_ASSEMBLY_VERSION", 2):
+            self._seed_synced_state("stale", path)
+        row = self._server_row("stale", dict.fromkeys(self._OWNED, "newer server value"))
+        row["metadata"]["aria.modified"] = "2030-01-01T00:00:00.000Z"
+        self.backend.reply(200, _page(row))
+        self._run()
+        self.assertEqual([r["method"] for r in self.requests], ["GET"])
+        self.assertEqual(self._last_entry()["reason"], "stale_local")
+        self.assertTrue(self._last_entry()["ok"])
+        self.assertEqual(self._state()["files"]["stale"]["redaction_fingerprint"], _MOD._current_fingerprint())
+        self.requests.clear()
+        self._run()
+        self.assertEqual(self.requests, [], "stale_local remains processed, not force-overwritten")
 
 
 class TestStaleLocal(_WriteCase):
@@ -3609,7 +3818,7 @@ class TestK11FingerprintChangeDirtiesEndToEnd(_WriteCase):
             "layer": "fact", "external_id": self._ext(slug), "container_id": CONTAINER,
             "content_hash": digest, "aria.memory_slug": slug, "aria.project": "proj",
             "aria.memory_dir": self.key, "aria.truncated": False,
-            "aria.description": "a description", "aria.memory_type": "feedback",
+            "aria.description": "a description", "aria.memory_type": "feedback", "aria.origin_session": None,
             "aria.modified": _MOD._mtime_iso(st),
         }
         return _row(self._ext(slug), content_hash=digest, extra=meta)
@@ -4098,7 +4307,7 @@ class TestK22ReconciliationRegistersMatchedSlugs(_WriteCase):
             "layer": "fact", "external_id": self._ext("f1"), "container_id": CONTAINER,
             "content_hash": digest, "aria.memory_slug": "f1", "aria.project": "proj",
             "aria.memory_dir": self.key, "aria.truncated": False,
-            "aria.description": "a description", "aria.memory_type": "feedback",
+            "aria.description": "a description", "aria.memory_type": "feedback", "aria.origin_session": None,
             "aria.modified": _MOD._mtime_iso(st),
         }
         self.backend.reply(200, _page(_row(self._ext("f1"), content_hash=digest, extra=meta)))

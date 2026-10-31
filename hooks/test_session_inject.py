@@ -2761,6 +2761,137 @@ class TestRecipe(_LedgerCase):
         self.assertNotIn("carry item 79", brief)  # the whole-doc cap bites at ~1500
         self.assertLessEqual(len(brief), 4000)
 
+    def test_final_budget_includes_the_baseline_report_and_drops_whole_facts(self):
+        episodes = [_mem_row("EPISODE-KEEP", project="nexus")]
+        facts = [_fact_row("FACT-WHOLE-" + "描" * 3800, project="nexus")]
+        initial = _MOD._render(episodes, facts)
+        self.assertGreater(len(initial), 3800)  # near-cap brief before the report
+        self.assertLessEqual(len(initial), 4000)
+        _, out, _ = self._capture(_happy_queue(episodes, facts=facts))
+        payload = json.loads(out)
+        final = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(final), 4000)
+        self.assertIn("baseline", final)
+        self.assertIn("EPISODE-KEEP", final)
+        self.assertNotIn("FACT-WHOLE-", final)  # no hard-cut half fact
+        self.assertIn("baseline", payload["systemMessage"])
+        entry = self._entries()[-1]
+        self.assertEqual(entry["additional_context_chars"], len(final))
+        self.assertIs(entry["additional_context_emitted"], True)
+
+    def test_report_only_output_is_bounded_but_the_user_sees_the_full_report(self):
+        finding = "SYNTHETIC-REPORT-" + "报" * 5000
+        marks = {"session-capture": "synthetic-marker"}
+        with mock.patch.object(_MOD, "_failure_report", return_value=([finding], marks)):
+            _, out, _ = self._capture([
+                _page([]), _page([]), _page([]), {"profile": []},
+            ])
+        payload = json.loads(out)
+        final = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(final), 4000)
+        self.assertIn("truncated", final)
+        self.assertIn(finding, payload["systemMessage"])
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertEqual(state["reported"], marks)
+        self.assertEqual(self._entries()[-1]["additional_context_chars"], len(final))
+
+    def test_no_output_records_zero_not_a_rendered_length(self):
+        with mock.patch.dict(os.environ, {"NEXUS_API_URL": ""}):
+            _, out, _ = self._capture([])
+        self.assertEqual(out, "")
+        entry = self._entries()[-1]
+        self.assertEqual(entry["additional_context_chars"], 0)
+        self.assertIs(entry["additional_context_emitted"], False)
+        self.assertIsNone(entry["episode_first_page_count"])
+        self.assertIsNone(entry["episode_first_tier_count"])
+        self.assertIs(entry["episode_lookup_complete"], False)
+
+    def test_failed_stdout_records_unknown_length_and_keeps_the_old_report_mark(self):
+        finding = "synthetic failure report"
+        marks = {"session-capture": "new-marker"}
+
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("synthetic closed reader")
+
+        with mock.patch.object(_MOD, "_failure_report", return_value=([finding], marks)), \
+                mock.patch.object(urllib.request, "urlopen", _UrlopenCapture(
+                    _happy_queue([_mem_row("ep", project="nexus")]))), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": self.cwd}))), \
+                mock.patch.object(sys, "stdout", Broken()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            _MOD.main()
+        entry = self._entries()[-1]
+        self.assertIsNone(entry["additional_context_chars"])
+        self.assertIs(entry["additional_context_emitted"], False)
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertNotEqual(state.get("reported"), marks)
+
+    def test_branch_hit_has_measured_first_page_and_no_project_fallback(self):
+        self._capture(_happy_queue([_mem_row("branch-hit", project="nexus")]))
+        entry = self._entries()[-1]
+        self.assertEqual(entry["episode_first_page_count"], 1)
+        self.assertEqual(entry["episode_first_tier_count"], 1)
+        self.assertIs(entry["episode_project_fallback"], False)
+        self.assertIs(entry["episode_lookup_complete"], True)
+        self.assertEqual(entry["tier"], 1)
+
+    def test_empty_branch_then_project_hit_does_not_hide_first_page_zero(self):
+        self._capture([
+            _page([]), _page([_mem_row("fallback", branch="other", project="nexus")]),
+            _page([]), {"profile": []},
+        ])
+        entry = self._entries()[-1]
+        self.assertEqual(entry["episode_first_page_count"], 0)
+        self.assertEqual(entry["episode_first_tier_count"], 0)
+        self.assertIs(entry["episode_project_fallback"], True)
+        self.assertIs(entry["episode_lookup_complete"], True)
+        self.assertEqual(entry["tier"], 2)
+
+    def test_peer_lookup_hit_is_separate_from_an_empty_first_branch_page(self):
+        _hook_state.update_state("session-inject", self.cwd, lambda st: {
+            **st, "seen_containers": ["peer-a"],
+        })
+        self._capture([
+            _page([]), _page([_mem_row("peer-hit", container_id="peer-a", project="nexus")]),
+            _page([]), {"profile": []},
+        ])
+        entry = self._entries()[-1]
+        self.assertEqual(entry["episode_first_page_count"], 0)
+        self.assertEqual(entry["episode_first_tier_count"], 1)
+        self.assertIs(entry["episode_project_fallback"], False)
+        self.assertEqual(entry["tier"], 1)
+
+    def test_no_branch_is_not_misreported_as_an_empty_branch_query(self):
+        with mock.patch.object(_MOD, "_current_branch", return_value=None):
+            self._capture(_happy_queue([_mem_row("project-hit", project="nexus")]))
+        entry = self._entries()[-1]
+        self.assertIsNone(entry["episode_first_page_count"])
+        self.assertIsNone(entry["episode_first_tier_count"])
+        self.assertIs(entry["episode_lookup_complete"], True)
+        self.assertEqual(entry["tier"], 2)
+
+    def test_episode_query_failure_is_unknown_not_zero_hits(self):
+        other_segments = _UrlopenCapture([
+            _page([_fact_row("SURVIVING-FACT", project="nexus")]),
+            _page([]), {"profile": []},
+        ])
+
+        def fail_episode(request, **kwargs):
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)
+            if params.get("layer") == ["session_summary"]:
+                raise urllib.error.URLError("synthetic transport failure")
+            return other_segments(request, **kwargs)
+
+        out, _ = self._main(fail_episode)
+        self.assertIn("SURVIVING-FACT", out)  # the fact segment's independent try ran
+        entry = self._entries()[-1]
+        self.assertEqual(entry["reason"], "http_error")
+        self.assertIsNone(entry["episode_first_page_count"])
+        self.assertIsNone(entry["episode_first_tier_count"])
+        self.assertIs(entry["episode_lookup_complete"], False)
+        self.assertIsNone(entry["tier"])
+
     def test_the_brief_stays_within_the_budget_and_facts_go_first(self):
         long_desc = "描" * 600
         facts = [_fact_row(long_desc, row_id=f"f{i}", project="nexus",
@@ -2879,6 +3010,32 @@ class TestStateWriteFailureLands(_LedgerCase):
         self.assertEqual(entry["reason"], "unknown")
         self.assertFalse(entry["ok"])
         self.assertTrue(entry["state_read_unknown"])
+
+
+class TestA10_11DescriptionFallback(_LedgerCase):
+    """C's explicit null clears a description, not the fact's D injection."""
+
+    def test_missing_null_empty_and_blank_descriptions_render_only_first_300_body_chars(self):
+        self._patch(mock.patch.object(
+            _identity, "project_key", return_value=("nexus", _identity.PROJECT_SOURCE_ENV),
+        ))
+        facts = []
+        expected = []
+        for label, description in (("missing", None), ("null", None), ("empty", ""), ("blank", " \t ")):
+            row = _fact_row(description, row_id=label, project="nexus")
+            if label == "missing":
+                row["metadata"].pop("aria.description")
+            row["content"] = f"FALLBACK-{label}-" + "正文" * 160 + "TAIL-MUST-NOT-RENDER"
+            facts.append(row)
+            expected.append(row["content"][:300])
+        out, _ = self._main(_UrlopenCapture(_happy_queue(
+            [_mem_row("synthetic episode", project="nexus")], facts=facts,
+        )))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        rendered = [line.split("] ", 1)[1] for line in brief.splitlines() if "FALLBACK-" in line]
+        self.assertCountEqual(rendered, expected)
+        self.assertNotIn("TAIL-MUST-NOT-RENDER", brief)
+        self.assertLessEqual(len(brief), 4000)
 
 
 if __name__ == "__main__":

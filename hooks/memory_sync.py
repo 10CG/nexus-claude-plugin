@@ -500,7 +500,7 @@ def _identity_digest(user_id, container_id):
 # wire -- same reasoning as _redact.py's own fingerprint (A8-2), folded into
 # the SAME fingerprint so a rule change amortises back over every
 # already-synced file exactly once, not only when _redact.py itself changes.
-_ASSEMBLY_VERSION = 2
+_ASSEMBLY_VERSION = 3  # A10-11: absent source metadata now explicitly clears old values
 
 
 # ── on-disk memory directory ─────────────────────────────────────────────
@@ -833,14 +833,21 @@ def _current_fingerprint():
 
 
 def _build_memory_metadata(key, project_name, slug, frontmatter, modified, project=None):
-    """§3.3 + X1's two added keys for this row. A source key that is absent
-    from ``frontmatter`` is simply omitted (PATCH is a shallow merge, §4):
-    sending nothing for a key leaves the stored value alone."""
+    """§3.3 + X1's two added keys; A10-11 source-state semantics.
+
+    Always send the three owned source keys: an absent field becomes JSON
+    null, clearing a previous value while retaining the key under the
+    server's shallow merge. Present values (including empty strings and
+    literal "null") keep the existing parser/redactor semantics.
+    """
     metadata = {
         "aria.memory_slug": slug,
         "aria.modified": modified,
         "aria.memory_dir": key,  # X1
         "aria.project": project_name,  # X1
+        "aria.memory_type": frontmatter.get("type"),
+        "aria.description": frontmatter.get("description"),
+        "aria.origin_session": frontmatter.get("originSessionId"),
     }
     # X1-policy (TASK-007): the provenance `project` key (the backend's
     # allowlisted filter key), alongside the older aria.project. Without it
@@ -848,12 +855,6 @@ def _build_memory_metadata(key, project_name, slug, frontmatter, modified, proje
     # filter_suspect in their own project. Only written when derivable.
     if project:
         metadata["project"] = project
-    if frontmatter.get("type"):
-        metadata["aria.memory_type"] = frontmatter["type"]
-    if frontmatter.get("description"):
-        metadata["aria.description"] = frontmatter["description"]
-    if frontmatter.get("originSessionId"):
-        metadata["aria.origin_session"] = frontmatter["originSessionId"]
     return metadata
 
 
