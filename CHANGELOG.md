@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-10-31
+
 ### Fixed
 - **Memory-file source metadata clearing** (change-2 A10-11): always send
   `aria.description`, `aria.memory_type`, and `aria.origin_session`; absent
