@@ -101,7 +101,7 @@ CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=60000
 
 ---
 
-## SessionStart output budget (Unreleased)
+## SessionStart output budget (0.6.1)
 
 The final `hookSpecificOutput.additionalContext` is limited to **4000 Unicode
 characters**, including baseline/identity/failure-report text and separators.
@@ -131,7 +131,7 @@ render budget. Confirm actual emitted content for injection acceptance; total
 `episodes`/`facts`/`semantic` counts alone do not prove first-page hits. Do not
 mix older ledgers lacking these fields into a new measurement window as zeros.
 
-## Memory-file source metadata (Unreleased)
+## Memory-file source metadata (0.6.1)
 
 `memory-sync` always sends its three owned source fields:
 
@@ -159,7 +159,8 @@ index rebuilding. Successful resyncs converge to zero remote calls next run.
 Clearing `description` does **not** hide the fact: `session-inject` still falls
 back to the first 300 body characters for missing, null, empty, or whitespace-only
 descriptions, subject to its existing item and final output budgets. These changes
-are unreleased; installed plugin caches are not updated by a working-tree edit.
+ship in 0.6.1; upgrade the installed plugin and start a fresh session to apply
+them. A working-tree edit alone does not update installed plugin caches.
 
 ## Setup wizard
 
