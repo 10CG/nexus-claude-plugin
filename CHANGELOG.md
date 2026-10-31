@@ -10,6 +10,22 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Memory-file source metadata clearing** (change-2 A10-11): always send
+  `aria.description`, `aria.memory_type`, and `aria.origin_session`; absent
+  source fields become JSON null, replacing old values while retaining keys.
+  Preserve present empty strings, literal `"null"`, and existing parser/redactor
+  behavior. Assembly version 2 → 3 resyncs unedited files through normal batches
+  of at most five without clearing state or bypassing `stale_local`. An unchanged
+  body hash produces a metadata-only PATCH (no re-embedding or sentence-index
+  rebuild), then converges. D keeps its first-300-body-characters fallback for
+  missing/null/empty/blank descriptions; clearing one does not hide the fact.
+- **SessionStart final output budget** (change-2 TASK-009): the 4000-character
+  limit covers the final `additionalContext`, including baseline/identity/failure
+  reports, not just the memory renderer. Reserve report space before dropping
+  whole fact items and then episode tail items; keep the full report in
+  `systemMessage`. The startup ledger records final emitted length (unknown on
+  a failed write) and branch-page / peer-completed / project-fallback results,
+  so an empty first page is not inferred from total hits or `tier=null`.
 - **SessionEnd budget erratum in the manifest's load-bearing notes** (`hooks/hooks.json` description + `hooks/test_hooks_json.py` docstring): the old text claimed a plugin-declared `timeout` raises Claude Code's shared ~1.5 s SessionEnd budget — the host only honors budget-raising declarations from **settings files** ("Timeouts set on plugin-provided hooks don't raise the budget", current hooks doc). On the default budget `memory-sync` (~7–9 s, 9 network calls in memory-rich projects) is cancelled on every real session end and, by design, leaves no ledger row — workflow C never completed in a real session on the default budget ([#56](https://forgejo.10cg.pub/10CG/nexus-claude-plugin/issues/56), verified on Claude Code 2.1.312 with a same-session controlled experiment).
 
 ### Documented

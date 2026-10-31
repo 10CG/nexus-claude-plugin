@@ -101,6 +101,66 @@ CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=60000
 
 ---
 
+## SessionStart output budget (Unreleased)
+
+The final `hookSpecificOutput.additionalContext` is limited to **4000 Unicode
+characters**, including baseline/identity/failure-report text and separators.
+Reports reserve space before memory items: whole fact items are dropped first,
+then episode tail items. An oversized report's context copy is marked truncated;
+the complete report still appears in `systemMessage`, so successful delivery can
+acknowledge it without silently consuming unseen report text.
+
+The `session-inject` ledger adds:
+
+- `additional_context_chars`: final field length after a complete stdout write
+  and flush; `0` for deliberate silence, `null` when writing failed or was partial.
+- `additional_context_emitted`: whether the complete output was written/flushed.
+- `episode_first_page_count`: verified rows in the initial **branch-scoped**
+  episode page, before peer look-ups; `null` when unavailable/not attempted.
+- `episode_first_tier_count`: selected same-branch rows after peer look-ups,
+  before project fallback; `null` when that stage did not complete.
+- `episode_project_fallback`: whether a branch-empty result triggered the
+  project-scoped retry. A branchless initial query is not a fallback.
+- `episode_lookup_complete`: whether the episode recipe completed. Failure is
+  not equivalent to an empty result; use this and the hook reason when reading
+  the counts. `tier` is `1` for a branch hit, `2` for a project-only hit, and
+  `null` for no selected episode or an incomplete lookup.
+
+These are query-stage counts, not proof that an episode survived the final
+render budget. Confirm actual emitted content for injection acceptance; total
+`episodes`/`facts`/`semantic` counts alone do not prove first-page hits. Do not
+mix older ledgers lacking these fields into a new measurement window as zeros.
+
+## Memory-file source metadata (Unreleased)
+
+`memory-sync` always sends its three owned source fields:
+
+| Frontmatter field | Stored metadata key |
+|-------------------|---------------------|
+| `description` | `aria.description` |
+| `type` | `aria.memory_type` |
+| `originSessionId` | `aria.origin_session` |
+
+Removing a field sends **JSON null**, overwriting its previous value while
+retaining the metadata key. This is not physical key deletion and does not
+change the backend's general shallow-merge PATCH semantics. Present empty
+strings stay empty; the existing parser reads a source scalar `null` (quoted
+or unquoted) as the literal string `"null"`, not JSON null. All present values
+still pass through the shared redactor.
+
+Assembly version **2 → 3** marks already-synced, unedited files dirty so normal
+SessionEnd runs can resync them, at most **5 files per run**. Do not clear state,
+forge file modification times, or force a bulk rewrite. `stale_local` continues
+to refuse overwriting a newer server copy and marks that local version processed;
+those rows are not promised an automatic overwrite. With an unchanged body hash,
+only metadata is PATCHed: content is omitted, avoiding re-embedding and sentence
+index rebuilding. Successful resyncs converge to zero remote calls next run.
+
+Clearing `description` does **not** hide the fact: `session-inject` still falls
+back to the first 300 body characters for missing, null, empty, or whitespace-only
+descriptions, subject to its existing item and final output budgets. These changes
+are unreleased; installed plugin caches are not updated by a working-tree edit.
+
 ## Setup wizard
 
 If you're installing for the first time:

@@ -562,7 +562,10 @@ def _episode_segment(base_url, token, user_id, branch, project, own_container, s
             run, layer="session_summary", branch=branch, project=project,
         )
 
+    branch_scoped = branch is not None
     kept = page({}, _EPISODE_TIMEOUT_SECONDS)
+    if branch_scoped:
+        run["extra"]["episode_first_page_count"] = len(kept)
     picked, peers = _pick_episodes(kept, own_container)
     if not peers:
         # Grouping can only reorder rows the page already returned; a peer
@@ -577,8 +580,11 @@ def _episode_segment(base_url, token, user_id, branch, project, own_container, s
             picked.extend(peer_rows[:_PEER_ROWS_PER_GROUP])
         if remembered and not any(_row_container(r) != own_container for r in picked):
             run["extra"]["peer_absent"] = 1
+    if branch_scoped:
+        run["extra"]["episode_first_tier_count"] = len(picked)
     if not picked and branch is not None:
         # Project-level retry: same rules, no branch scope.
+        run["extra"]["episode_project_fallback"] = True
         branch = None
         kept = page({}, _SMALL_CALL_TIMEOUT_SECONDS)
         picked, peers = _pick_episodes(kept, own_container)
@@ -597,6 +603,8 @@ def _episode_segment(base_url, token, user_id, branch, project, own_container, s
         _row_container(r) for r in kept
         if _row_container(r) != own_container and _row_container(r) != "?"
     ]
+    run["extra"]["episode_lookup_complete"] = True
+    run["extra"]["tier"] = (1 if branch is not None else 2) if picked else None
     return picked, peers_seen
 
 
@@ -890,14 +898,25 @@ def _fact_line(row):
     return f"  • [{_row_container(row)} · {_age_row(row)}] {desc.strip()}"
 
 
-def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET):
+def _bounded_report(text, budget=_BRIEF_CHAR_BUDGET):
+    """The full report also rides systemMessage; bound only its context copy."""
+    text = text.encode("utf-8", "replace").decode("utf-8")
+    if len(text) <= budget:
+        return text
+    marker = "…[truncated; full report in systemMessage]"
+    return text[:max(0, budget - len(marker))] + marker[:budget]
+
+
+def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET, *, prefix=""):
     """Assemble the brief: handoff episode groups (A9-10) ahead of plain
     episode lines (grouped episodes, then semantic rows -- the caller already
     ordered them), then the fact delta.
 
-    The budget is episode-priority: drop fact items first (whole items), then
-    episode lines from the tail. Returns None when nothing survives.
+    The budget includes the report prefix: drop fact items first (whole
+    items), then episode lines from the tail. A report survives even when no
+    memory item fits; without either channel there is nothing to emit.
     """
+    prefix = _bounded_report(prefix, budget)
     header = "Nexus project memory (cross-container warm-start):"
 
     # Split the handoff rows into per-container groups; within each group the
@@ -929,6 +948,8 @@ def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET):
             parts.append("Facts since last session:")
             parts.extend(fls)
         text = "\n".join(parts)
+        if prefix:
+            text = f"{prefix}\n\n{text}"
         return text.encode("utf-8", "replace").decode("utf-8")
 
     text = assemble(episode_lines, fact_lines)
@@ -939,7 +960,7 @@ def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET):
         episode_lines.pop()  # the episode tail goes last
         text = assemble(episode_lines, fact_lines)
     if not episode_lines and not fact_lines:
-        return None  # a bare header is not a brief
+        return prefix or None  # no bare memory header
     return text
 
 
@@ -1121,9 +1142,12 @@ def _collect(run):
 
     run["extra"].update(
         episodes=len(episode_rows), facts=len(fact_rows), semantic=len(semantic_rows),
-        project=project, tier=None,
+        project=project,
     )
-    brief = _render(episode_rows + semantic_rows, fact_rows)
+    # Main re-renders these completed rows once the report prefix is known,
+    # preserving whole-item priority under the FINAL output budget.
+    run["render_rows"] = (episode_rows + semantic_rows, fact_rows)
+    brief = _render(*run["render_rows"])
 
     # Reason precedence: a hard failure of any segment (the FIRST specific
     # reason wins -- rate_limited / timeout carry more signal than a blanket
@@ -1346,7 +1370,14 @@ def main():
     else:
         run_stdin_error = None
     run = {
-        "cwd": None, "calls": 0, "extra": {}, "report": [], "marks": None,
+        "cwd": None, "calls": 0,
+        "extra": {
+            "additional_context_chars": 0, "additional_context_emitted": False,
+            "episode_first_page_count": None, "episode_first_tier_count": None,
+            "episode_project_fallback": False, "episode_lookup_complete": False,
+            "tier": None,
+        },
+        "report": [], "marks": None,
         "notes": [], "stdout_ok": False,
         "payload_raw": payload_raw,
         "base_url": os.environ.get("NEXUS_API_URL", "").rstrip("/"),
@@ -1431,7 +1462,10 @@ def main():
         headline = "; ".join(findings)
         where = _hook_state.project_dir(run["cwd"] or os.getcwd()) if _hook_state else "?"
         context_line = f"[nexus-memory] Hook failures since last session: {headline}. Ledgers: {where}"
-        brief = context_line if not brief else f"{context_line}\n\n{brief}"
+        if brief and run.get("render_rows") is not None:
+            brief = _render(*run["render_rows"], prefix=context_line)
+        else:
+            brief = _bounded_report(context_line if not brief else f"{context_line}\n\n{brief}")
 
     if brief:
         output = {
@@ -1445,9 +1479,16 @@ def main():
         # Before the ledger, not after: nothing below this line may cost the
         # session its injection.
         try:
-            sys.stdout.write(json.dumps(output, ensure_ascii=False))
+            # A failed/partial write has unknown delivered length, not zero
+            # and not the length of a string we only PREPARED to emit.
+            run["extra"]["additional_context_chars"] = None
+            encoded = json.dumps(output, ensure_ascii=False)
+            if sys.stdout.write(encoded) != len(encoded):
+                raise OSError("incomplete hook output write")
             sys.stdout.flush()
             run["stdout_ok"] = True  # A9-11: only now may the state persist
+            run["extra"]["additional_context_chars"] = len(brief)
+            run["extra"]["additional_context_emitted"] = True
         except Exception as exc:
             reason = "unknown"
             diagnostics.append(("could not write the brief", exc))
