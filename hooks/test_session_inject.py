@@ -2779,6 +2779,101 @@ class TestRecipe(_LedgerCase):
         self.assertEqual(entry["additional_context_chars"], len(final))
         self.assertIs(entry["additional_context_emitted"], True)
 
+    def _semantic_budget_fixture(self):
+        episodes = []
+        for i, container in enumerate(("dev-claude-308", "peer-a")):
+            body = (f"# EPISODE-{i}\n\n## §6 Next session\n\n"
+                    + (f"carry-{i}-" + "e" * 60 + "\n") * 30)
+            content, reason = _HANDOFF._build_content(body)
+            self.assertIsNone(reason)
+            episodes.append(_mem_row(
+                content, row_id=f"ep-{i}", container_id=container,
+                **{"aria.source": "handoff"}))
+        facts = [_fact_row("OLD-FACT-UPDATED-" + "描" * 500)]
+        semantic = [_mem_row(
+            f"OPTIONAL-{i}-" + "s" * 300, row_id=f"sem-{i}", layer="semantic"
+        ) for i in range(5)]
+        # The deterministic segments fit together. It is ONLY the optional
+        # segment that forces eviction, not an impossible fact fixture.
+        deterministic = _MOD._render(episodes, facts)
+        self.assertIn("OLD-FACT-UPDATED-", deterministic)
+        self.assertGreater(len(deterministic), 3300)
+        self.assertLess(len(deterministic), 3800)
+        return episodes, facts, semantic
+
+    def _assert_fact_survives_optional_semantic(self, *, with_report):
+        episodes, facts, semantic = self._semantic_budget_fixture()
+        if not with_report:
+            _hook_state.update_state("session-inject", self.cwd, lambda st: {
+                **st, _MOD._FACT_MARKER_KEY: "2026-10-24T07:00:00Z",
+                _MOD._FACT_MARKER_USER_KEY: "nexus",
+            })
+        _, out, _ = self._capture(
+            _happy_queue(episodes, facts=facts, semantic={"profile": semantic}),
+            stdin_text=json.dumps({"cwd": self.cwd, "source": "startup"}))
+        payload = json.loads(out)
+        brief = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual("systemMessage" in payload, with_report)
+        if with_report:
+            self.assertIn("baseline", brief)
+        fact_lines = [line for line in brief.splitlines()
+                      if line.startswith("  • [peer-a ·") and "OLD-FACT-UPDATED-" in line]
+        self.assertEqual(fact_lines, [_MOD._fact_line(facts[0])])
+        self.assertIn("Facts since last session:", brief)
+        for i in range(2):
+            self.assertIn(f"EPISODE-{i}", brief)
+            self.assertIn(f"carry-{i}-", brief)
+        self.assertLessEqual(len(brief), 4000)
+        self.assertNotIn("OPTIONAL-4-", brief)
+        entry = self._entries()[-1]
+        self.assertIs(entry["ok"], True)
+        self.assertEqual(entry["additional_context_chars"], len(brief))
+        self.assertEqual((entry["episodes"], entry["facts"], entry["semantic"]), (2, 1, 5))
+        state, _ = _hook_state.read_state("session-inject", self.cwd)
+        self.assertIn(_MOD._FACT_MARKER_KEY, state)
+
+    def test_optional_semantic_cannot_evict_a_fitting_old_fact_without_report(self):
+        self._assert_fact_survives_optional_semantic(with_report=False)
+
+    def test_optional_semantic_cannot_evict_a_fitting_old_fact_with_report(self):
+        self._assert_fact_survives_optional_semantic(with_report=True)
+
+    def test_optional_semantic_still_renders_when_all_segments_fit(self):
+        _, out, _ = self._capture(_happy_queue(
+            [_mem_row("DETERMINISTIC-EPISODE")],
+            facts=[_fact_row("DETERMINISTIC-FACT")],
+            semantic={"profile": [_mem_row("OPTIONAL-SEMANTIC", layer="semantic")]}))
+        brief = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("DETERMINISTIC-EPISODE", brief)
+        self.assertIn("DETERMINISTIC-FACT", brief)
+        self.assertIn("OPTIONAL-SEMANTIC", brief)
+        self.assertLess(brief.index("DETERMINISTIC-EPISODE"), brief.index("OPTIONAL-SEMANTIC"))
+        self.assertLess(brief.index("OPTIONAL-SEMANTIC"), brief.index("Facts since last session:"))
+        self.assertLessEqual(len(brief), 4000)
+
+    def test_semantic_handoff_keeps_its_carry_with_and_without_report(self):
+        body = ("# SEMANTIC-HANDOFF\n\n## §6 Next session\n\n"
+                + "synthetic-padding\n" * 26 + "CARRY-AT-END\n")
+        content, reason = _HANDOFF._build_content(body)
+        self.assertIsNone(reason)
+        semantic = _mem_row(content, row_id="semantic-handoff", container_id="peer-a",
+                            branch="other", **{"aria.source": "handoff"})
+        for with_report in (False, True):
+            with self.subTest(with_report=with_report):
+                marker = None if with_report else "2026-10-24T07:00:00Z"
+                _hook_state.update_state("session-inject", self.cwd, lambda st: {
+                    **st, _MOD._FACT_MARKER_KEY: marker,
+                    _MOD._FACT_MARKER_USER_KEY: "nexus",
+                })
+                _, out, _ = self._capture(_happy_queue(
+                    [_mem_row("EPISODE-KEEP")], semantic={"profile": [semantic]}))
+                payload = json.loads(out)
+                brief = payload["hookSpecificOutput"]["additionalContext"]
+                self.assertEqual("systemMessage" in payload, with_report)
+                self.assertIn("CARRY-AT-END", brief)
+                self.assertIn("EPISODE-KEEP", brief)
+                self.assertLessEqual(len(brief), 4000)
+
     def test_report_only_output_is_bounded_but_the_user_sees_the_full_report(self):
         finding = "SYNTHETIC-REPORT-" + "报" * 5000
         marks = {"session-capture": "synthetic-marker"}
@@ -2905,6 +3000,104 @@ class TestRecipe(_LedgerCase):
         self.assertIn("Facts since last session:", brief)  # facts still present
 
 
+
+
+class TestSemanticBudget(unittest.TestCase):
+    """Optional retrieval keeps its own priority even on final re-render."""
+
+    def test_exact_boundary_drops_only_the_last_whole_optional_row(self):
+        episode = _mem_row("EPISODE-KEEP")
+        fact = _fact_row("FACT-KEEP")
+        semantic = [_mem_row(f"OPTIONAL-{i}", layer="semantic") for i in range(2)]
+        prefix = "SYNTHETIC-REPORT"
+        full = _MOD._render([episode], [fact], prefix=prefix, semantic_rows=semantic)
+        exact = _MOD._render([episode], [fact], budget=len(full), prefix=prefix,
+                             semantic_rows=semantic)
+        self.assertEqual(exact, full)
+        clipped = _MOD._render([episode], [fact], budget=len(full) - 1, prefix=prefix,
+                               semantic_rows=semantic)
+        expected = _MOD._render([episode], [fact], prefix=prefix,
+                                semantic_rows=semantic[:1])
+        self.assertEqual(clipped, expected)
+        self.assertIn("FACT-KEEP", clipped)
+        self.assertIn(_MOD._episode_line(semantic[0]), clipped)
+        self.assertNotIn("OPTIONAL-1", clipped)
+
+    def test_optional_only_output_is_not_mistaken_for_an_empty_brief(self):
+        semantic = [_mem_row("OPTIONAL-ONLY", layer="semantic")]
+        brief = _MOD._render([], [], semantic_rows=semantic)
+        self.assertEqual(brief.splitlines()[-1], _MOD._episode_line(semantic[0]))
+        self.assertNotIn("Facts since last session:", brief)
+
+    def test_no_optional_item_fits_returns_only_the_report_or_silence(self):
+        semantic = [_mem_row("OPTIONAL-WHOLE-" + "s" * 300, layer="semantic")]
+        for prefix in ("", "SYNTHETIC-REPORT"):
+            with self.subTest(prefix=prefix):
+                brief = _MOD._render([], [], budget=80, prefix=prefix, semantic_rows=semantic)
+                self.assertEqual(brief, prefix or None)
+
+    def test_shared_container_handoffs_keep_one_newest_full_body_across_sources(self):
+        deterministic = _handoff_row(
+            "ep", "peer-a", "2026-10-23T07:00:00Z", title="deterministic older",
+            created_at="2026-10-23T08:00:00Z")
+        optional = _handoff_row(
+            "sem", "peer-a", "2026-10-24T07:00:00Z", title="optional newest",
+            created_at="2026-10-24T08:00:00Z")
+        brief = _MOD._render([deterministic], [], semantic_rows=[optional])
+        self.assertIn("do optional newest", brief)
+        self.assertIn("deterministic older", brief)
+        self.assertNotIn("do deterministic older", brief)
+
+    def test_evicted_optional_handoff_promotes_the_remaining_episode(self):
+        deterministic = _handoff_row(
+            "ep", "peer-a", "2026-10-23T07:00:00Z", title="deterministic older",
+            created_at="2026-10-23T08:00:00Z")
+        optional = _handoff_row(
+            "sem", "peer-a", "2026-10-24T07:00:00Z", title="optional newest",
+            created_at="2026-10-24T08:00:00Z")
+        optional["content"] = optional["content"].replace(
+            "do optional newest", "do optional newest\n" + "carry optional\n" * 80)
+        facts = [_fact_row("FACT-KEEP")]
+        expected = _MOD._render([deterministic], facts)
+        brief = _MOD._render([deterministic], facts, budget=len(expected),
+                             semantic_rows=[optional])
+        self.assertEqual(brief, expected)
+        self.assertIn("do deterministic older", brief)
+        self.assertIn("FACT-KEEP", brief)
+        self.assertNotIn("optional newest", brief)
+
+    def test_optional_eviction_follows_rendered_order_not_retrieval_order(self):
+        plain = _mem_row("OPTIONAL-PLAIN", layer="semantic")
+        handoff = _handoff_row(
+            "sem", "peer-a", "2026-10-24T07:00:00Z", title="optional handoff",
+            created_at="2026-10-24T08:00:00Z")
+        full = _MOD._render([], [], semantic_rows=[plain, handoff])
+        brief = _MOD._render([], [], budget=len(full) - 1, semantic_rows=[plain, handoff])
+        self.assertIn("do optional handoff", brief)
+        self.assertNotIn("OPTIONAL-PLAIN", brief)
+
+    def test_fact_eviction_preserves_the_newest_item_not_the_oldest(self):
+        episodes = [_mem_row("EPISODE-KEEP")]
+        facts = [_fact_row("NEW-FACT"), _fact_row("OLD-FACT", row_id="older")]
+        full = _MOD._render(episodes, facts)
+        brief = _MOD._render(episodes, facts, budget=len(full) - 1)
+        self.assertEqual(brief, _MOD._render(episodes, facts[:1]))
+
+    def test_episode_eviction_preserves_the_head_not_the_tail(self):
+        episodes = [_mem_row("EPISODE-HEAD"), _mem_row("EPISODE-TAIL", row_id="tail")]
+        full = _MOD._render(episodes, [])
+        brief = _MOD._render(episodes, [], budget=len(full) - 1)
+        self.assertEqual(brief, _MOD._render(episodes[:1], []))
+
+    def test_tiny_budgets_never_emit_a_bare_memory_header(self):
+        for budget in (0, 1, 20, 50):
+            for prefix in ("", "SYNTHETIC-REPORT-" + "r" * 100):
+                with self.subTest(budget=budget, prefix=bool(prefix)):
+                    brief = _MOD._render([_mem_row("EPISODE-WHOLE")],
+                                         [_fact_row("FACT-WHOLE")], budget=budget,
+                                         prefix=prefix, semantic_rows=[_mem_row("OPTIONAL-WHOLE")])
+                    self.assertLessEqual(len(brief or ""), budget)
+                    self.assertEqual(brief, _MOD._bounded_report(prefix, budget) or None)
 
 
 # ════════════════════════════════════════════════════════════════════════════════

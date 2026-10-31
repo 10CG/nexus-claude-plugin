@@ -64,8 +64,9 @@ Design contract (proposal nexus-replace-claude-mem workflow A + §6):
   - The three-state profile contract (nexus#613): ``profile: null`` PLUS
     ``errors.profile`` is a semantic-layer failure (reported); ``[]`` is an
     honest "nothing matched"; ``null`` without errors means not requested.
-  - The whole brief is <= 4000 chars: episode-priority -- fact items are
-    dropped whole first, then the episode tail goes.
+  - The whole brief is <= 4000 chars, including the report prefix: drop
+    optional semantic rows first, then fact items, then the episode tail.
+    All three are dropped whole; optional rows never evict a fitting fact.
   - HTTP headers MUST include a User-Agent (SPIKE #8: requests through the CF
     proxy with no UA are blocked by CF 1010 Bot Fight Mode), plus X-API-Key,
     Content-Type, and X-Nexus-Source: sessionstart-hook/<plugin version>.
@@ -256,7 +257,7 @@ _FACT_MAX_PAGES = 5             # beyond this: fact_delta_truncated
 _FACT_DIAL_BACK_MINUTES = 10    # covers stamp-then-commit rows and clock skew
 _FACT_RENDER_LIMIT = 10         # M, ordered by aria.modified desc
 _BASELINE_DAYS = 7              # first run / state loss / user change
-_BRIEF_CHAR_BUDGET = 4000       # episode-priority; facts dropped item-wise first
+_BRIEF_CHAR_BUDGET = 4000       # drop semantic, then facts, then the episode tail
 _HANDOFF_RENDER_CHARS = 1500    # latest handoff per container, line-boundary cap
 
 # session-inject's own state keys, next to `reported` / `container_id`:
@@ -907,43 +908,49 @@ def _bounded_report(text, budget=_BRIEF_CHAR_BUDGET):
     return text[:max(0, budget - len(marker))] + marker[:budget]
 
 
-def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET, *, prefix=""):
-    """Assemble the brief: handoff episode groups (A9-10) ahead of plain
-    episode lines (grouped episodes, then semantic rows -- the caller already
-    ordered them), then the fact delta.
-
-    The budget includes the report prefix: drop fact items first (whole
-    items), then episode lines from the tail. A report survives even when no
-    memory item fits; without either channel there is nothing to emit.
-    """
-    prefix = _bounded_report(prefix, budget)
-    header = "Nexus project memory (cross-container warm-start):"
-
-    # Split the handoff rows into per-container groups; within each group the
-    # newest row (by aria.updated_at) renders fully, older ones one title line.
-    handoff = [r for r in episode_rows if (r.get("metadata") or {}).get("aria.source") == "handoff"]
-    plain = [r for r in episode_rows if (r.get("metadata") or {}).get("aria.source") != "handoff"]
+def _render_episode_items(episode_rows, semantic_rows):
+    """Return (optional, source index, text), retaining shared handoff groups."""
+    rows = ([(False, i, row) for i, row in enumerate(episode_rows)]
+            + [(True, i, row) for i, row in enumerate(semantic_rows)])
+    # Both query sources can return handoffs. Per container, only the newest
+    # retained handoff (by aria.updated_at) renders fully, older ones one title.
     groups = {}
-    for row in handoff:
-        groups.setdefault(_row_container(row), []).append(row)
-    handoff_lines = []
+    plain = []
+    for item in rows:
+        row = item[2]
+        if (row.get("metadata") or {}).get("aria.source") == "handoff":
+            groups.setdefault(_row_container(row), []).append(item)
+        else:
+            plain.append(item)
+    lines = []
     for container in groups:
-        ordered = sorted(groups[container], key=_handoff_time, reverse=True)
-        for pos, row in enumerate(ordered):
+        ordered = sorted(groups[container], key=lambda item: _handoff_time(item[2]), reverse=True)
+        for pos, (optional, index, row) in enumerate(ordered):
             meta = row.get("metadata") or {}
             branch = meta.get("branch") if isinstance(meta.get("branch"), str) and meta.get("branch") else "?"
             bracket = f"[{container} · {_age_row(row)} · {branch}]"
             title, body = _render_handoff_row(row)
-            if pos == 0:
-                handoff_lines.append(f"  • {bracket} {title}\n{body}")
-            else:
-                handoff_lines.append(f"  • {bracket} {title}")
+            text = f"  • {bracket} {title}\n{body}" if pos == 0 else f"  • {bracket} {title}"
+            lines.append((optional, index, text))
+    return lines + [(optional, index, _episode_line(row)) for optional, index, row in plain]
 
-    episode_lines = handoff_lines + [_episode_line(r) for r in plain]
+
+def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET, *, prefix="", semantic_rows=()):
+    """Keep handoff groups (A9-10) ahead of plain rows, then the fact delta.
+
+    The budget includes the report prefix. Drop whole semantic items first,
+    then facts, then the episode tail: optional retrieval must not evict a
+    fitting fact delta. A report survives even when no memory item fits;
+    without either channel there is nothing to emit.
+    """
+    prefix = _bounded_report(prefix, budget)
+    header = "Nexus project memory (cross-container warm-start):"
+    semantic_rows = list(semantic_rows)
+    items = _render_episode_items(episode_rows, semantic_rows)
     fact_lines = [_fact_line(r) for r in fact_rows]
 
     def assemble(els, fls):
-        parts = [header] + els
+        parts = [header] + [text for _optional, _index, text in els]
         if fls:
             parts.append("Facts since last session:")
             parts.extend(fls)
@@ -952,14 +959,21 @@ def _render(episode_rows, fact_rows, budget=_BRIEF_CHAR_BUDGET, *, prefix=""):
             text = f"{prefix}\n\n{text}"
         return text.encode("utf-8", "replace").decode("utf-8")
 
-    text = assemble(episode_lines, fact_lines)
+    text = assemble(items, fact_lines)
+    while len(text) > budget and semantic_rows:
+        index = next(index for optional, index, _text in reversed(items) if optional)
+        semantic_rows.pop(index)  # the last OPTIONAL rendered item, not an episode
+        # Removing a newest optional handoff may promote a deterministic one.
+        # Recompute its full body before deciding whether any fact must go.
+        items = _render_episode_items(episode_rows, semantic_rows)
+        text = assemble(items, fact_lines)
     while len(text) > budget and fact_lines:
         fact_lines.pop()  # whole items only, newest-preserved order
-        text = assemble(episode_lines, fact_lines)
-    while len(text) > budget and episode_lines:
-        episode_lines.pop()  # the episode tail goes last
-        text = assemble(episode_lines, fact_lines)
-    if not episode_lines and not fact_lines:
+        text = assemble(items, fact_lines)
+    while len(text) > budget and items:
+        items.pop()  # the episode tail goes last
+        text = assemble(items, fact_lines)
+    if not items and not fact_lines:
         return prefix or None  # no bare memory header
     return text
 
@@ -1146,8 +1160,10 @@ def _collect(run):
     )
     # Main re-renders these completed rows once the report prefix is known,
     # preserving whole-item priority under the FINAL output budget.
-    run["render_rows"] = (episode_rows + semantic_rows, fact_rows)
-    brief = _render(*run["render_rows"])
+    run["render_rows"] = {
+        "episode_rows": episode_rows, "fact_rows": fact_rows, "semantic_rows": semantic_rows,
+    }
+    brief = _render(**run["render_rows"])
 
     # Reason precedence: a hard failure of any segment (the FIRST specific
     # reason wins -- rate_limited / timeout carry more signal than a blanket
@@ -1463,7 +1479,7 @@ def main():
         where = _hook_state.project_dir(run["cwd"] or os.getcwd()) if _hook_state else "?"
         context_line = f"[nexus-memory] Hook failures since last session: {headline}. Ledgers: {where}"
         if brief and run.get("render_rows") is not None:
-            brief = _render(*run["render_rows"], prefix=context_line)
+            brief = _render(**run["render_rows"], prefix=context_line)
         else:
             brief = _bounded_report(context_line if not brief else f"{context_line}\n\n{brief}")
 
