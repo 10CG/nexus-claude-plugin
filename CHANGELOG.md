@@ -9,6 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **SessionStart fact visibility under optional semantic pressure** (change-2
+  TASK-009): keep retrieval sources separate for budgeting, dropping whole
+  optional semantic items before facts and only then the episode tail, including
+  report-prefix re-rendering. Handoffs from either source retain shared
+  per-container grouping; removing a newest optional handoff re-renders the
+  remaining newest handoff in full before trimming facts. The 4000-character
+  final limit, report delivery and marker rules are unchanged. This is not yet
+  released; 0.6.1's installed old-fact acceptance failure remains historical FAIL.
+
 ## [0.6.1] — 2026-10-31
 
 ### Fixed

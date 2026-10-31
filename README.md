@@ -101,14 +101,23 @@ CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=60000
 
 ---
 
-## SessionStart output budget (0.6.1)
+## SessionStart output budget (0.6.1 baseline; unreleased correction)
 
 The final `hookSpecificOutput.additionalContext` is limited to **4000 Unicode
 characters**, including baseline/identity/failure-report text and separators.
-Reports reserve space before memory items: whole fact items are dropped first,
-then episode tail items. An oversized report's context copy is marked truncated;
-the complete report still appears in `systemMessage`, so successful delivery can
-acknowledge it without silently consuming unseen report text.
+Reports reserve space before memory items. An oversized report's context copy is
+marked truncated; the complete report still appears in `systemMessage`, so
+successful delivery can acknowledge it without consuming unseen report text.
+
+**Unreleased correction:** optional semantic retrieval no longer shares the
+episode-priority budget. Drop whole optional semantic items first, then whole
+fact items, then the episode tail. This prevents optional matches from hiding a
+fact delta that fits with the deterministic episodes; it does not guarantee every
+fact fits. Handoffs from either query source still share per-container grouping
+and the newest-full-body rule. If an optional newest handoff is removed, the
+remaining newest handoff is rendered fully before budgeting facts. Installed
+0.6.1 does not yet contain this correction; its old-fact visibility failure is
+preserved in the parent project's TASK-009 acceptance evidence.
 
 The `session-inject` ledger adds:
 
